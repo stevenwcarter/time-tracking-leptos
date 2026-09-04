@@ -6,6 +6,7 @@
 //! changes nothing outside this directory. See spec §6.
 
 pub mod codec;
+pub mod envelope;
 pub mod hook;
 #[cfg(feature = "hydrate")]
 pub mod local;
