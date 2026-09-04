@@ -131,16 +131,10 @@ mod tests {
     /// once is sufficient and avoids pulling in a runtime just for tests.
     fn futures_lite_block_on<T>(fut: impl Future<Output = T>) -> T {
         use std::pin::pin;
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        use std::task::{Context, Poll, Waker};
 
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(
-            |_| RawWaker::new(std::ptr::null(), &VTABLE),
-            |_| {},
-            |_| {},
-            |_| {},
-        );
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        match pin!(fut).poll(&mut Context::from_waker(&waker)) {
+        let waker = Waker::noop();
+        match pin!(fut).poll(&mut Context::from_waker(waker)) {
             Poll::Ready(v) => v,
             Poll::Pending => panic!("ssr storage futures must complete immediately"),
         }

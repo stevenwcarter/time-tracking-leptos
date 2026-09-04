@@ -18,9 +18,12 @@ path = "src/main.rs"
 leptos = { version = "0.8", features = ["nightly"] }
 leptos_router = { version = "0.8", features = ["nightly"] }
 leptos_meta = "0.8"
-serde = { version = "1.0.219", features = ["derive"] }
+serde = "1.0.219"
 serde_json = "1.0"
 thiserror = "2.0"
+# Pinned rev, not a version range: v0.2.0 changes parse_time_tracking_data's
+# signature from 1 argument to 3, so an unpinned manifest would silently
+# break the build on a fresh checkout.
 time-tracking-parser = { git = "https://github.com/stevenwcarter/time-tracking-parser", rev = "cf34921b9a0b92001d949d353bf65146f3aa27b1" }
 
 # Hydrate-only (wasm).
@@ -38,8 +41,6 @@ web-sys = { version = "0.3.77", optional = true, features = [
 axum = { version = "0.8", optional = true }
 leptos_axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
-tower = { version = "0.5", features = ["util"], optional = true }
-tower-http = { version = "0.6", features = ["fs", "compression-gzip"], optional = true }
 
 [features]
 default = []
@@ -57,8 +58,6 @@ ssr = [
   "dep:leptos_axum",
   "dep:axum",
   "dep:tokio",
-  "dep:tower",
-  "dep:tower-http",
 ]
 
 [profile.release]
