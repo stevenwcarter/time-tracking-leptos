@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 pub mod app;
+pub mod auth_ctx;
 pub mod clipboard;
 pub mod components;
 pub mod date;

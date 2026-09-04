@@ -1,21 +1,36 @@
+use chrono::NaiveDate;
+use leptos::either::Either;
 use leptos::prelude::*;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::components::{Route, Router, Routes};
+use leptos_router::hooks::use_params_map;
 use leptos_router::path;
 
+use crate::auth_ctx::{AuthCtx, USER_META, initial_user};
+use crate::components::account_page::AccountPage;
+use crate::components::header::AppHeader;
+use crate::components::import_banner::ImportBanner;
 use crate::components::time_display::TimeDisplay;
 use crate::components::time_entry_area::TimeEntryArea;
+use crate::components::week_view::WeekView;
+use crate::date::parse_iso;
+use crate::storage::StorageKey;
 use crate::storage::hook::use_persistent;
-use crate::storage::{Backend, StorageKey};
 
 /// The SSR document shell. `HydrationScripts` injects the wasm loader.
 pub fn shell(options: LeptosOptions) -> impl IntoView {
+    // Carried into the browser so the client's first render can reach the
+    // same conclusion the server did, without a cookie or a round trip.
+    // See `auth_ctx::initial_user`.
+    let user = initial_user();
+
     view! {
         <!DOCTYPE html>
         <html lang="en">
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                {user.map(|email| view! { <meta name=USER_META content=email/> })}
                 <link rel="icon" href="/favicon.ico"/>
                 <AutoReload options=options.clone()/>
                 <HydrationScripts options/>
@@ -31,33 +46,106 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+    provide_context(AuthCtx {
+        user: RwSignal::new(initial_user()),
+    });
 
     view! {
         <Stylesheet id="leptos" href="/pkg/time-tracking-leptos.css"/>
         <Title text="Time Tracker"/>
         <Router>
             <Routes fallback=NotFound>
-                <Route path=path!("/") view=HomePage/>
+                <Route path=path!("/") view=TodayRedirect/>
+                <Route path=path!("/account") view=AccountPage/>
+                <Route path=path!("/week/:date") view=WeekView/>
+                <Route path=path!("/:date") view=DayPage/>
             </Routes>
         </Router>
     }
 }
 
+/// `/` — the canonical entry point, which does not name a date.
+///
+/// The server cannot resolve "today": it does not know the visitor's
+/// timezone, and guessing is wrong for somebody near midnight every single
+/// day. So it renders the chrome with an empty date slot, and the browser
+/// replaces the URL with its own local date once hydrated. A deep link to
+/// `/2026-09-04` skips all of this, because there the date is knowable
+/// server-side (spec section 8.1).
 #[component]
-fn HomePage() -> impl IntoView {
-    // `StorageKey::TimeEntry` now carries the day being viewed, and
-    // `use_persistent` takes it (and the backend) as signals so it can
-    // re-read when either changes. Task 19 rewrites this component to
-    // derive the day from the route and the backend from an auth context;
-    // a fixed date and a constant `Local` backend are placeholders that
-    // compile on every target until then.
-    let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
-    let key = Signal::derive(move || StorageKey::TimeEntry(today));
-    let entry = use_persistent(key, Signal::from(Backend::Local));
+fn TodayRedirect() -> impl IntoView {
+    #[cfg(feature = "hydrate")]
+    {
+        use leptos_router::NavigateOptions;
+        use leptos_router::hooks::use_navigate;
+
+        use crate::date::{to_iso, today_local};
+
+        let navigate = use_navigate();
+        Effect::new(move |_| {
+            navigate(
+                &format!("/{}", to_iso(today_local())),
+                NavigateOptions {
+                    replace: true,
+                    ..Default::default()
+                },
+            );
+        });
+    }
 
     view! {
         <div class="min-h-screen bg-gray-50">
+            <AppHeader date=None/>
+        </div>
+    }
+}
+
+/// `/:date` — the day view.
+#[component]
+fn DayPage() -> impl IntoView {
+    let params = use_params_map();
+    let parsed =
+        Signal::derive(move || params.with(|p| p.get("date").and_then(|raw| parse_iso(&raw))));
+
+    view! {
+        {move || match parsed.get() {
+            // A single path segment that is not a date. The route pattern
+            // cannot express "date-shaped", so the check lives here.
+            None => Either::Left(view! { <NotFound/> }),
+            Some(date) => Either::Right(view! { <DayView date=date/> }),
+        }}
+    }
+}
+
+/// The day being viewed, and the entry that belongs to it.
+///
+/// `date` is taken by value and folded into a constant signal rather than
+/// derived from the route params. This is safe not because `leptos_router`
+/// remounts `DayPage` on a date change — it doesn't; navigating between two
+/// `/:date` URLs matches the same route id, and the router updates the
+/// params signal on the *same* instance rather than tearing it down. The
+/// remount happens one layer down instead: `DayPage`'s `{move || match
+/// parsed.get() { .. } }` is itself a reactive closure, and calling
+/// `view! { <DayView date=date/> }` inside it re-invokes this function on
+/// every date change, in a scope that is disposed and recreated each time
+/// (`RenderEffect` wraps each run in `Owner::with_cleanup`). So every date
+/// gets a fresh `DayView` instance — and a fresh, independent
+/// `use_persistent` — even though the outer route never remounts. If a
+/// future change hoists the `match` out of a reactive closure (so `DayView`
+/// itself stops being re-invoked per date), `key` must derive from the
+/// params signal instead — `use_persistent` is already reactive and would
+/// pick that up with no other changes.
+#[component]
+fn DayView(date: NaiveDate) -> impl IntoView {
+    let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
+    let key = Signal::derive(move || StorageKey::TimeEntry(date));
+    let entry = use_persistent(key, auth.backend());
+
+    view! {
+        <div class="min-h-screen bg-gray-50">
+            <AppHeader date=Some(date)/>
             <div class="w-full max-w-7xl mx-auto px-4 py-8">
+                <ImportBanner/>
                 <div class="flex flex-col md:flex-row gap-6 w-full">
                     <TimeEntryArea entry=entry/>
                     <TimeDisplay entry=entry/>
@@ -78,25 +166,43 @@ fn NotFound() -> impl IntoView {
 
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
+    use leptos_router::location::RequestUrl;
+
     use super::*;
+    use crate::session::SessionClaims;
+    use crate::test_support::app_ctx_with_claims;
 
     /// Renders `App` exactly as the server would.
     ///
     /// `leptos_axum`'s handler provides the requested path as a `RequestUrl`
-    /// context before rendering (see `leptos_axum::render_app_to_stream`);
-    /// `<Router>` panics without it. We do the same for `"/"`, the only
-    /// route this app defines, so the tree built here matches production.
-    fn render_app() -> String {
-        use leptos::prelude::*;
-        use leptos_router::location::RequestUrl;
-
+    /// before rendering and `<Router>` panics without it, so we do the same.
+    /// When `signed_in_as` is `Some`, an `AppCtx` carrying verified claims is
+    /// provided too — which is what production does for a request arriving
+    /// with a valid session cookie.
+    ///
+    /// Still synchronous (`.to_html()`), still providing neither
+    /// `ServerMetaContext` nor `ResponseOptions`. Both remain harmless while
+    /// the app has no `Resource`s or `<Suspense>` boundaries; see CLAUDE.md.
+    fn render_at(path: &str, signed_in_as: Option<&str>) -> String {
         let runtime = Owner::new();
-        let html = runtime.with(|| {
-            provide_context(RequestUrl::new("/"));
+        let path = path.to_string();
+        let claims = signed_in_as.map(|email| SessionClaims {
+            email: email.to_string(),
+            epoch: 0,
+        });
+        let html = runtime.with(move || {
+            provide_context(RequestUrl::new(&path));
+            if let Some(claims) = claims {
+                provide_context(app_ctx_with_claims(Some(claims)));
+            }
             view! { <App/> }.to_html()
         });
         runtime.cleanup();
         html
+    }
+
+    fn render_app() -> String {
+        render_at("/2026-09-04", None)
     }
 
     #[test]
@@ -115,28 +221,87 @@ mod tests {
         );
     }
 
-    /// Pins spec invariant I2. The server cannot know whether the user has
-    /// saved data, so it must not render any conclusion that depends on it.
+    /// Pins spec invariant I2 of the migration design. The server cannot know
+    /// whether the user has saved data, so it must not render any conclusion
+    /// that depends on it.
     #[test]
     fn ssr_omits_loaded_state() {
         let html = render_app();
         assert!(
             !html.contains("No projects found"),
             "server rendered the empty state it cannot know; returning users \
-             would see it flash before their data loads (spec §5)"
+             would see it flash before their data loads"
         );
-        assert!(
-            !html.contains("hours)"),
-            "server rendered a computed total; the summary must be blank \
-             until localStorage is read (spec §5)"
-        );
+        assert!(!html.contains("hours)"), "server rendered a computed total");
         assert!(
             !html.contains("No dead time"),
-            "server rendered a dead-time conclusion (spec §5)"
+            "server rendered a dead-time conclusion"
         );
     }
 
-    /// Pins spec invariant I4 for the one element whose SSR shape is subtle.
+    /// Pins invariant I1, and this is the case that would otherwise regress
+    /// silently. For a signed-in visitor the server *could* read the entry
+    /// row — it has the user and the date. It must not. Phase 2 encrypts
+    /// bodies client-side, so a server render of entry content is not a
+    /// performance win to be added later; it is a design the encryption
+    /// cannot coexist with.
+    #[test]
+    fn ssr_omits_entry_content_even_when_signed_in() {
+        let html = render_at("/2026-09-04", Some("alice@example.com"));
+        assert!(
+            !html.contains("No projects found"),
+            "server rendered loaded state for a signed-in user"
+        );
+        assert!(
+            !html.contains("hours)"),
+            "server rendered a computed total for a signed-in user"
+        );
+        assert!(
+            html.contains("<textarea") && html.contains("></textarea>"),
+            "the SSR'd textarea must still be empty for a signed-in user"
+        );
+    }
+
+    /// The other half of the same decision: auth state *is* server-rendered,
+    /// because the cookie is right there and a flash of "Sign in" on every
+    /// reload is worse than the alternative.
+    #[test]
+    fn ssr_renders_the_signed_in_identity() {
+        let html = render_at("/2026-09-04", Some("alice@example.com"));
+        assert!(
+            html.contains("alice"),
+            "the signed-in identity must be server-rendered, or a returning \
+             user sees 'Sign in' flash before their account appears"
+        );
+    }
+
+    #[test]
+    fn ssr_renders_sign_in_when_signed_out() {
+        let html = render_at("/2026-09-04", None);
+        assert!(
+            html.contains("Sign in"),
+            "signed-out header must offer sign-in"
+        );
+    }
+
+    /// `/` cannot name a date, so it must render none rather than guess.
+    #[test]
+    fn root_route_renders_no_date() {
+        let html = render_at("/", None);
+        assert!(
+            !html.contains("2026"),
+            "`/` must not render a specific date — the server does not know \
+             the visitor's timezone (spec section 8.1)"
+        );
+    }
+
+    #[test]
+    fn a_non_date_segment_renders_not_found() {
+        let html = render_at("/not-a-date", None);
+        assert!(html.contains("Page not found"));
+    }
+
+    /// Pins invariant I4 for the one element whose SSR shape is subtle.
     #[test]
     fn ssr_textarea_is_empty() {
         let html = render_app();

@@ -41,22 +41,27 @@ async fn favicon_is_not_shadowed_by_the_date_route() {
 }
 
 /// Exercises `leptos_routes_handler`'s own `Extension<AppCtx>` extraction and
-/// `provide_context` wiring — the behaviour this task actually delivers.
+/// `provide_context` wiring — the behaviour this test actually delivers.
 /// `/favicon.ico` above is served by the `ROOT_ASSETS` static handler and
-/// never reaches this path; `/` is the only live route that does, until
-/// Task 19 adds `/{date}`.
+/// never reaches this path.
+///
+/// `/` renders `TodayRedirect`, not the day view: the server does not know
+/// the visitor's timezone, so it cannot resolve "today" and leaves the date
+/// slot for the browser to fill in after hydration (see `app::TodayRedirect`,
+/// spec §8.1). It still goes through the same handler and `AppCtx` wiring as
+/// every other route, so this asserts on the chrome that route renders
+/// instead of the day view's.
 #[tokio::test]
 async fn home_route_renders_through_the_leptos_handler() {
     let (status, body) = get("/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("Time Entry"),
-        "/ did not render the home page through leptos_routes_handler"
+        body.contains("Sign in"),
+        "/ did not render through leptos_routes_handler"
     );
 }
 
 #[tokio::test]
-#[ignore = "enabled by Task 19"]
 async fn account_route_beats_the_date_route() {
     let (status, body) = get("/account").await;
     assert_eq!(status, StatusCode::OK);
@@ -67,7 +72,6 @@ async fn account_route_beats_the_date_route() {
 }
 
 #[tokio::test]
-#[ignore = "enabled by Task 19"]
 async fn a_real_date_renders_the_day_view() {
     let (status, body) = get("/2026-09-04").await;
     assert_eq!(status, StatusCode::OK);
@@ -78,7 +82,6 @@ async fn a_real_date_renders_the_day_view() {
 }
 
 #[tokio::test]
-#[ignore = "enabled by Task 19"]
 async fn a_non_date_segment_is_not_found() {
     let (_, body) = get("/definitely-not-a-date").await;
     assert!(

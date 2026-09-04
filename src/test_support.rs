@@ -9,6 +9,8 @@
 //! mailer it serves from, so a test can seed rows directly, drive them over
 //! HTTP, and inspect captured mail; [`signed_in_as`] builds on it to mint a
 //! real session cookie without sending mail or consuming a magic link.
+//! [`app_ctx_with_claims`] skips the router and the pool wiring entirely,
+//! for SSR-only tests that just need an `AppCtx` to `provide_context`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -113,6 +115,19 @@ pub async fn app_with_magic_link(email: &str) -> (Router, String, email::Mailer)
     let ctx = AppCtx::new(pool, mailer.clone());
 
     (router_with_ctx(ctx), token, mailer)
+}
+
+/// Builds an `AppCtx` with `claims` already attached, over a fresh in-memory
+/// pool and a capture mailer — no router, no request.
+///
+/// For SSR tests that render `App` directly (`Owner::new().with(...)`) and
+/// need to assert on what a signed-in (or signed-out) render looks like,
+/// without going through `router_with_ctx` or a real request at all.
+pub fn app_ctx_with_claims(claims: Option<session::SessionClaims>) -> AppCtx {
+    ensure_env_defaults();
+    let pool = db::test_pool();
+    let mailer = email::Mailer::capture();
+    AppCtx::new(pool, mailer).with_session(claims, None)
 }
 
 /// A router paired with the exact pool and mailer it serves from.
