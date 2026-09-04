@@ -120,7 +120,10 @@ mod tests {
 
     #[test]
     fn ssr_writes_are_noops() {
-        assert_eq!(futures_lite_block_on(store(StorageKey::TimeEntry, "x")), Ok(()));
+        assert_eq!(
+            futures_lite_block_on(store(StorageKey::TimeEntry, "x")),
+            Ok(())
+        );
         assert_eq!(futures_lite_block_on(clear(StorageKey::TimeEntry)), Ok(()));
     }
 

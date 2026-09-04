@@ -52,6 +52,9 @@ mod tests {
         // A bare, un-JSON-encoded value is not something either build wrote;
         // surfacing it as an error beats silently returning garbage.
         let result = decode::<String>("11:45-12:15 code1");
-        assert!(result.is_err(), "bare text must not decode as a stored value");
+        assert!(
+            result.is_err(),
+            "bare text must not decode as a stored value"
+        );
     }
 }

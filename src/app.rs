@@ -95,11 +95,11 @@ mod tests {
     fn ssr_renders_chrome() {
         let html = render_app();
         assert!(html.contains("Time Entry"), "entry pane heading missing");
-        assert!(html.contains("Time Summary"), "summary pane heading missing");
         assert!(
-            html.contains("How to use this tool"),
-            "help toggle missing"
+            html.contains("Time Summary"),
+            "summary pane heading missing"
         );
+        assert!(html.contains("How to use this tool"), "help toggle missing");
         assert!(
             html.contains("11:45-12:15 code1"),
             "help sample block missing — it must be in the SSR'd HTML, not \
