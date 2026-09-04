@@ -5,10 +5,11 @@ A simple time tracking app built with [Leptos](https://leptos.dev/) and [Tailwin
 ## Development
 
 Requires the pinned nightly toolchain (installed automatically from
-`rust-toolchain.toml`) and [cargo-leptos](https://github.com/leptos-rs/cargo-leptos):
+`rust-toolchain.toml`) and [cargo-leptos](https://github.com/leptos-rs/cargo-leptos),
+pinned to the same version the `Dockerfile` builds with:
 
 ```bash
-cargo install --locked cargo-leptos
+cargo install --locked cargo-leptos --version 0.3.7
 ```
 
 Then:

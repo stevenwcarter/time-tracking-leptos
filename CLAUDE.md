@@ -63,8 +63,10 @@ would need revisiting.
 
 - Edition 2024; nightly toolchain pinned by `rust-toolchain.toml`.
 - Branch polymorphism uses `Either`/`EitherOf3`, never `.into_any()`.
-- Tailwind v4 CSS-first: tokens and `@source` live in `style/tailwind.css`.
-  There is no `tailwind.config.js` and no npm step.
+- Tailwind v4 CSS-first: `@source` lives in `style/tailwind.css`, which pulls
+  in Tailwind's default palette/scale — there is no `@theme` block, so no
+  custom design tokens are defined, just one custom utility (`.value-slot`)
+  in `@layer components`. There is no `tailwind.config.js` and no npm step.
 - Storage key strings are a compatibility surface — changing one orphans
   existing users' saved data.
 

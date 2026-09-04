@@ -52,7 +52,7 @@ migration. See §9.
 | `src/main.rs` | 275 | `dioxus::launch` + all 9 components | Rewritten: server bootstrap; components move to `src/components/` |
 | `src/lib.rs` | 2 | Two `pub mod` lines | Rewritten: feature-partitioned module tree + `hydrate()` |
 | `src/hooks_composed.rs` | 65 | `use_persistent` — signal + `gloo_storage::LocalStorage` | Replaced by `src/storage/` (§6) |
-| `src/clipboard.rs` | 20 | `web_sys` clipboard write | Kept, cfg-gated to `hydrate` |
+| `src/clipboard.rs` | 20 | `web_sys` clipboard write | Rewritten: `async fn(&str)` becomes `fn(String)`, cfg-gated to `hydrate` |
 | `assets/tailwind.css` | 19 KB | npm-compiled Tailwind output | Deleted — cargo-leptos generates `/pkg/*.css` |
 | `tailwind.css` | 2 | v4 CSS-first source | Moves to `style/tailwind.css` |
 | `package.json` / `package-lock.json` | — | `@tailwindcss/cli` devDep | Deleted — cargo-leptos drives Tailwind |
@@ -76,9 +76,11 @@ both `wasm32-unknown-unknown` and the host — the pinned rev `cf34921` stays).
 toggle), `TimeDisplay` (owns the derived memos), and `ProjectItem` (clipboard
 side effect).
 
-One component is **added**: `SummarySkeleton`, the pre-load branch required by
-the hydration contract in §5. It renders the summary panel's chrome with blank
-value slots and no empty-state message.
+Two components are **added**, the pair the hydration contract in §5 requires
+to branch on `Persistent`'s tri-state: `SummarySkeleton`, the pre-load branch,
+rendering the summary panel's chrome with blank value slots and no
+empty-state message; and `SummaryBody`, the loaded branch, wrapping the
+existing presentational components once a value is available.
 
 ## 4. Target architecture
 
@@ -118,9 +120,13 @@ time-tracking-leptos/
 ### Routing
 
 One route. `path!("/")` → `HomePage`. No wildcard route, so none of the
-`/{*path}` traps apply — but `/pkg` is still mounted via `nest_service` **before**
-the Leptos routes, because `file_and_error_handler` as fallback can still shadow
-it.
+`/{*path}` traps apply, and `/pkg` needs no `nest_service` mount: the code
+uses only `.fallback(leptos_axum::file_and_error_handler)` (see `src/main.rs`),
+with no `nest_service` at all, and this is correct. `leptos_router` 0.8.15
+comments out its synthetic wildcard fallback route (`flat_router.rs`, upstream
+note: "causes overlapping route issues on Axum"), so `.leptos_routes()`
+registers no route that could shadow the fallback. Verified empirically:
+`GET /pkg/time-tracking-leptos.css` → `200 text/css`.
 
 This migration defines zero `#[server]` functions. No explicit server-fn route
 is needed either: `.leptos_routes()` already registers the server-fn handler, so
@@ -214,6 +220,15 @@ output cleanly, so none of the Suspense marker-alignment hazards apply.
    `<textarea></textarea>` and the client attaches the binding to the same empty
    element. This is consistent by construction, in both the `None` and
    `Some("")` cases.
+4. **Keystrokes typed before hydration completes are discarded.** The server
+   ships a fully interactive-*looking* `<textarea>` before the ~440 KB wasm
+   bundle has loaded, and hydration writes `prop:value` unconditionally when
+   it attaches — so any text typed or pasted in that window is overwritten
+   the moment hydration runs. No *persisted* data is lost (the load `Effect`
+   writes the signal directly, not through `Persistent::set`), but the
+   keystrokes themselves are. This was not a path that existed in the Dioxus
+   build, where no `<textarea>` existed until the wasm bundle had already
+   loaded.
 
 **Why this is also the right end state.** Once notes are encrypted with a
 passkey-derived key (`TODO.md`), the server *cannot* render the summary at any
@@ -236,6 +251,12 @@ gets a pinning test in §8, *not* a prose assurance):
   no projects, so the `Some("")` branch is well-defined.
 - **I4.** No component's *rendered output* differs between `ssr` and `hydrate`
   cfg. Only side effects (clipboard, storage) are cfg-gated.
+
+The three `loaded_value` tests (§8) pin the None/Some("")-collapse function
+itself, but nothing pins that `use_persistent` still *calls* it — a refactor
+that inlined a different collapse there would leave all three green.
+Closing that gap would need a Leptos runtime to exercise `use_persistent` in
+place, which §8 deliberately excludes.
 
 ## 6. The storage seam
 
