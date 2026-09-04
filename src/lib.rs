@@ -9,6 +9,8 @@ pub mod storage;
 #[cfg(feature = "ssr")]
 pub mod db;
 #[cfg(feature = "ssr")]
+pub mod rate_limit;
+#[cfg(feature = "ssr")]
 pub mod schema;
 #[cfg(feature = "ssr")]
 pub mod session;
