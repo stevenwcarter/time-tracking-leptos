@@ -43,8 +43,13 @@ mod ssr_helpers {
     /// through here rather than trusting `ctx.claims` directly.
     pub fn require_user() -> Result<(AppCtx, User), ServerFnError> {
         let ctx = require_ctx()?;
-        let claims = ctx.claims.clone().ok_or_else(|| server_err("Not signed in"))?;
-        let mut conn = ctx.conn().map_err(log_and_fail("conn", "Internal server error"))?;
+        let claims = ctx
+            .claims
+            .clone()
+            .ok_or_else(|| server_err("Not signed in"))?;
+        let mut conn = ctx
+            .conn()
+            .map_err(log_and_fail("conn", "Internal server error"))?;
         let found = user::find_by_email(&mut conn, &claims.email)
             .map_err(log_and_fail("find_by_email", "Internal server error"))?
             .ok_or_else(|| server_err("Not signed in"))?;

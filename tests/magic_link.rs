@@ -184,19 +184,36 @@ async fn a_replayed_link_mails_a_fresh_one_that_signs_in() {
 
 /// Pins invariant I5. An attacker must not be able to tell a registered
 /// address from an unregistered one, or a rate-limited request from an
-/// accepted one, by anything in the response.
+/// accepted one, by anything in the response. Additionally asserts that the
+/// logic actually ran — a valid address results in a captured message.
 #[tokio::test]
 async fn request_magic_link_responds_identically_for_every_outcome() {
-    let app = time_tracking_leptos::test_support::router().await;
+    let app = time_tracking_leptos::test_support::TestApp::new().await;
 
-    async fn post(app: axum::Router, email: &str) -> (StatusCode, String) {
-        let res = app
+    // Register one address so the two cases genuinely differ server-side.
+    time_tracking_leptos::test_support::signed_in_as(&app, "known@example.com").await;
+
+    /// Helper to post request_link and get the raw response (status + body).
+    async fn post_link(router: axum::Router, email: &str) -> (StatusCode, String) {
+        let body = format!(
+            "email={}",
+            email
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect::<String>()
+        );
+        let res = router
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/session/request_link")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
                     .expect("request"),
             )
             .await
@@ -205,15 +222,12 @@ async fn request_magic_link_responds_identically_for_every_outcome() {
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
             .expect("body");
-        (status, String::from_utf8_lossy(&bytes).to_string())
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    // Register one address so the two cases genuinely differ server-side.
-    time_tracking_leptos::test_support::seed_user(&app, "known@example.com").await;
-
-    let known = post(app.clone(), "known@example.com").await;
-    let unknown = post(app.clone(), "nobody@example.com").await;
-    let malformed = post(app.clone(), "not-an-address").await;
+    let known = post_link(app.router.clone(), "known@example.com").await;
+    let unknown = post_link(app.router.clone(), "nobody@example.com").await;
+    let malformed = post_link(app.router.clone(), "not-an-address").await;
     assert_eq!(
         known, unknown,
         "known and unknown addresses must be indistinguishable"
@@ -225,11 +239,20 @@ async fn request_magic_link_responds_identically_for_every_outcome() {
 
     // Exhaust the bucket; the over-quota response must still match.
     for _ in 0..10 {
-        let _ = post(app.clone(), "known@example.com").await;
+        let _ = post_link(app.router.clone(), "known@example.com").await;
     }
     assert_eq!(
-        post(app, "known@example.com").await,
+        post_link(app.router.clone(), "known@example.com").await,
         known,
         "rate-limited must look the same"
     );
+
+    // Assert that a valid address produced a captured message — the request
+    // actually reached the logic, not just failed at deserialization.
+    let sent = wait_for_captured(&app.mailer).await;
+    assert!(
+        !sent.is_empty(),
+        "a valid email must produce a captured message"
+    );
+    assert_eq!(sent[0].to, "known@example.com");
 }

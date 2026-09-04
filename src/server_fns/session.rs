@@ -42,7 +42,10 @@ pub async fn request_magic_link(email: String) -> Result<(), ServerFnError> {
         return Ok(());
     };
 
-    let ip = ctx.client_ip.clone().unwrap_or_else(|| "unknown".to_string());
+    let ip = ctx
+        .client_ip
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
     if !rate_limit::check_ip(&ip) || !rate_limit::check_email(&normalized) {
         tracing::debug!("magic-link request over quota");
         return Ok(());
@@ -50,7 +53,9 @@ pub async fn request_magic_link(email: String) -> Result<(), ServerFnError> {
 
     let ttl = magic_link::ttl();
     let token = {
-        let mut conn = ctx.conn().map_err(super::log_and_fail("conn", "Internal server error"))?;
+        let mut conn = ctx
+            .conn()
+            .map_err(super::log_and_fail("conn", "Internal server error"))?;
         match magic_link::mint(&mut conn, &normalized, ttl) {
             Ok(t) => t,
             Err(e) => {
@@ -100,7 +105,9 @@ pub async fn sign_out_everywhere() -> Result<(), ServerFnError> {
     use crate::session::COOKIE_NAME;
 
     let (ctx, me) = super::require_user()?;
-    let mut conn = ctx.conn().map_err(super::log_and_fail("conn", "Internal server error"))?;
+    let mut conn = ctx
+        .conn()
+        .map_err(super::log_and_fail("conn", "Internal server error"))?;
     user::bump_epoch(&mut conn, me.id)
         .map_err(super::log_and_fail("bump_epoch", "Internal server error"))?;
     set_cookie(cookie::http_only(COOKIE_NAME, "", 0));
