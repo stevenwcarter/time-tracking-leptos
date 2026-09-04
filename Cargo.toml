@@ -6,6 +6,9 @@ edition = "2024"
 publish = false
 default-run = "time-tracking-leptos"
 
+[package.metadata.cargo-machete]
+ignored = ["libsqlite3-sys"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -25,22 +28,72 @@ thiserror = "2.0"
 # signature from 1 argument to 3, so an unpinned manifest would silently
 # break the build on a fresh checkout.
 time-tracking-parser = { git = "https://github.com/stevenwcarter/time-tracking-parser", rev = "cf34921b9a0b92001d949d353bf65146f3aa27b1" }
+chrono = { version = "0.4", default-features = false, features = [
+  "clock", "std", "serde", "wasmbind",
+] }
 
 # Hydrate-only (wasm).
 console_error_panic_hook = { version = "0.1", optional = true }
 wasm-bindgen = { version = "0.2.100", optional = true }
 wasm-bindgen-futures = { version = "0.4.50", optional = true }
+js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3.77", optional = true, features = [
   "Clipboard",
   "Navigator",
   "Storage",
   "Window",
+  "Document",
+  "Element",
+  "HtmlElement",
+  "History",
+  "Location",
+  "AuthenticationExtensionsClientInputs",
+  "AuthenticatorAssertionResponse",
+  "AuthenticatorAttestationResponse",
+  "AuthenticatorResponse",
+  "CredentialCreationOptions",
+  "CredentialRequestOptions",
+  "CredentialsContainer",
+  "PublicKeyCredential",
+  "PublicKeyCredentialCreationOptions",
+  "PublicKeyCredentialDescriptor",
+  "PublicKeyCredentialRequestOptions",
 ] }
 
 # SSR-only (server binary).
 axum = { version = "0.8", optional = true }
+axum-extra = { version = "0.12", features = ["cookie"], optional = true }
+cookie = { version = "0.18", optional = true }
 leptos_axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
+diesel = { version = "2.2", default-features = false, features = [
+  "sqlite", "r2d2", "chrono", "returning_clauses_for_sqlite_3_35",
+], optional = true }
+diesel_migrations = { version = "2.2", features = ["sqlite"], optional = true }
+# -sys crate pinned so the static SQLite is bundled (no system libsqlite3) and
+# stays under diesel's `<0.38.0` ceiling. Consumed only through diesel, never
+# named in our source — which is why cargo-machete cannot see it.
+libsqlite3-sys = { version = "0.37", features = ["bundled"], optional = true }
+lettre = { version = "0.11", default-features = false, features = [
+  "smtp-transport", "tokio1-rustls-tls", "builder",
+], optional = true }
+ring = { version = "0.17", optional = true }
+base64 = { version = "0.22", optional = true }
+hex = { version = "0.4", optional = true }
+uuid = { version = "1", features = ["v7"], optional = true }
+anyhow = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+dotenvy = { version = "0.15", optional = true }
+webauthn-rs = { version = "0.6.1-dev", features = [
+  "danger-allow-state-serialisation", "conditional-ui",
+], optional = true }
+webauthn-rs-proto = { version = "0.6.1-dev", optional = true }
+
+[dev-dependencies]
+webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false, features = [
+  "softpasskey",
+] }
 
 [features]
 default = []
@@ -49,6 +102,7 @@ hydrate = [
   "dep:console_error_panic_hook",
   "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
+  "dep:js-sys",
   "dep:web-sys",
 ]
 ssr = [
@@ -57,7 +111,23 @@ ssr = [
   "leptos_router/ssr",
   "dep:leptos_axum",
   "dep:axum",
+  "dep:axum-extra",
+  "dep:cookie",
   "dep:tokio",
+  "dep:diesel",
+  "dep:diesel_migrations",
+  "dep:libsqlite3-sys",
+  "dep:lettre",
+  "dep:ring",
+  "dep:base64",
+  "dep:hex",
+  "dep:uuid",
+  "dep:anyhow",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+  "dep:dotenvy",
+  "dep:webauthn-rs",
+  "dep:webauthn-rs-proto",
 ]
 
 [profile.release]
