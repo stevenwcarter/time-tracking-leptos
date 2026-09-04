@@ -14,7 +14,11 @@
 pub mod codec;
 pub mod envelope;
 pub mod hook;
-#[cfg(feature = "hydrate")]
+// `test` as well as `hydrate`: `local`'s decision logic (`resolve_load`,
+// `should_clear_legacy`, `dates_from_keys`) is pure and host-tested, since
+// there is no wasm test runner in this project. Only the `web_sys` calls
+// inside `local` stay gated to `hydrate` alone.
+#[cfg(any(feature = "hydrate", test))]
 pub mod local;
 #[cfg(feature = "hydrate")]
 pub mod remote;
