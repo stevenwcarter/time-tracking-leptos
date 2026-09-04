@@ -248,6 +248,17 @@ mod tests {
     #[test]
     fn ssr_omits_entry_content_even_when_signed_in() {
         let html = render_at("/2026-09-04", Some("alice@example.com"));
+        // Proves the signed-in branch actually ran, so the assertions below
+        // cannot pass vacuously against a render that quietly stayed on the
+        // signed-out path (which renders "Sign in" and never "alice").
+        // Self-contained rather than leaning on `ssr_renders_the_signed_in_identity`
+        // to establish this: that test could be deleted or renamed without
+        // this one failing, silently un-guarding invariant I1.
+        assert!(
+            html.contains("alice"),
+            "this render must actually be the signed-in one, or the \
+             assertions below prove nothing about a signed-in user"
+        );
         assert!(
             !html.contains("No projects found"),
             "server rendered loaded state for a signed-in user"

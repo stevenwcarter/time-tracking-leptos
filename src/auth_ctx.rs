@@ -75,3 +75,39 @@ pub fn initial_user() -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `backend()` is the one thing standing between a signed-in user's
+    /// entries and the server versus a signed-out user's `localStorage`. It
+    /// is called exactly once (`app.rs`'s `DayView`), and nothing else in
+    /// the suite exercises its output: the SSR tests only ever see
+    /// `Persistent`'s synchronous `None` regardless of backend, so an
+    /// inverted condition here would not fail a single existing test — it
+    /// would just silently send the wrong users' data to the wrong place.
+    #[test]
+    fn signed_out_backend_is_local() {
+        let runtime = Owner::new();
+        runtime.with(|| {
+            let auth = AuthCtx {
+                user: RwSignal::new(None),
+            };
+            assert_eq!(auth.backend().get_untracked(), Backend::Local);
+        });
+        runtime.cleanup();
+    }
+
+    #[test]
+    fn signed_in_backend_is_remote() {
+        let runtime = Owner::new();
+        runtime.with(|| {
+            let auth = AuthCtx {
+                user: RwSignal::new(Some("alice@example.com".to_string())),
+            };
+            assert_eq!(auth.backend().get_untracked(), Backend::Remote);
+        });
+        runtime.cleanup();
+    }
+}
