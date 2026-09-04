@@ -3,6 +3,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod components;
+pub mod date;
 pub mod storage;
 
 #[cfg(feature = "ssr")]
