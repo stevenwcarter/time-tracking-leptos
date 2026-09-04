@@ -67,3 +67,75 @@ fn NotFound() -> impl IntoView {
         </main>
     }
 }
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::*;
+
+    /// Renders `App` exactly as the server would.
+    ///
+    /// `leptos_axum`'s handler provides the requested path as a `RequestUrl`
+    /// context before rendering (see `leptos_axum::render_app_to_stream`);
+    /// `<Router>` panics without it. We do the same for `"/"`, the only
+    /// route this app defines, so the tree built here matches production.
+    fn render_app() -> String {
+        use leptos::prelude::*;
+        use leptos_router::location::RequestUrl;
+
+        let runtime = Owner::new();
+        let html = runtime.with(|| {
+            provide_context(RequestUrl::new("/"));
+            view! { <App/> }.to_html()
+        });
+        runtime.cleanup();
+        html
+    }
+
+    #[test]
+    fn ssr_renders_chrome() {
+        let html = render_app();
+        assert!(html.contains("Time Entry"), "entry pane heading missing");
+        assert!(html.contains("Time Summary"), "summary pane heading missing");
+        assert!(
+            html.contains("How to use this tool"),
+            "help toggle missing"
+        );
+        assert!(
+            html.contains("11:45-12:15 code1"),
+            "help sample block missing — it must be in the SSR'd HTML, not \
+             mounted client-side, or hydration sees a different node count"
+        );
+    }
+
+    /// Pins spec invariant I2. The server cannot know whether the user has
+    /// saved data, so it must not render any conclusion that depends on it.
+    #[test]
+    fn ssr_omits_loaded_state() {
+        let html = render_app();
+        assert!(
+            !html.contains("No projects found"),
+            "server rendered the empty state it cannot know; returning users \
+             would see it flash before their data loads (spec §5)"
+        );
+        assert!(
+            !html.contains("hours)"),
+            "server rendered a computed total; the summary must be blank \
+             until localStorage is read (spec §5)"
+        );
+        assert!(
+            !html.contains("No dead time"),
+            "server rendered a dead-time conclusion (spec §5)"
+        );
+    }
+
+    /// Pins spec invariant I4 for the one element whose SSR shape is subtle.
+    #[test]
+    fn ssr_textarea_is_empty() {
+        let html = render_app();
+        assert!(
+            html.contains("<textarea") && html.contains("></textarea>"),
+            "the SSR'd textarea must have no text content, so the hydrate-side \
+             prop:value binding attaches to a matching node"
+        );
+    }
+}
