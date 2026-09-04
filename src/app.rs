@@ -5,8 +5,8 @@ use leptos_router::path;
 
 use crate::components::time_display::TimeDisplay;
 use crate::components::time_entry_area::TimeEntryArea;
-use crate::storage::StorageKey;
 use crate::storage::hook::use_persistent;
+use crate::storage::{Backend, StorageKey};
 
 /// The SSR document shell. `HydrationScripts` injects the wasm loader.
 pub fn shell(options: LeptosOptions) -> impl IntoView {
@@ -45,11 +45,15 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn HomePage() -> impl IntoView {
-    // `StorageKey::TimeEntry` now carries the day being viewed. Task 19
-    // rewrites this component to take that day from the route; a fixed date
-    // is a placeholder that compiles on every target until then.
+    // `StorageKey::TimeEntry` now carries the day being viewed, and
+    // `use_persistent` takes it (and the backend) as signals so it can
+    // re-read when either changes. Task 19 rewrites this component to
+    // derive the day from the route and the backend from an auth context;
+    // a fixed date and a constant `Local` backend are placeholders that
+    // compile on every target until then.
     let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
-    let entry = use_persistent(StorageKey::TimeEntry(today));
+    let key = Signal::derive(move || StorageKey::TimeEntry(today));
+    let entry = use_persistent(key, Signal::from(Backend::Local));
 
     view! {
         <div class="min-h-screen bg-gray-50">

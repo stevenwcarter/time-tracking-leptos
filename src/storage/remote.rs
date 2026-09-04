@@ -1,33 +1,48 @@
-//! Server-backed storage, reached from the browser via server functions.
+//! Server-backed storage, used when signed in.
 //!
-//! Stub — Task 17 owns this file and replaces every function below with a
-//! real call into the entry server functions. Kept minimal here only so
-//! `storage::mod` compiles and its `Backend::Remote` path exists to test
-//! against.
+//! A thin adapter over the entry server functions. It moves envelope strings
+//! and never inspects them — the server does not either (spec section 9.1).
 
 use chrono::NaiveDate;
+use leptos::prelude::ServerFnError;
 
-use super::{StorageError, StorageKey};
+use super::{StorageError, StorageKey, envelope};
+use crate::date::{parse_iso, to_iso};
+use crate::server_fns::entries;
 
-/// Stub. Task 17 replaces this with a server-function call.
-pub async fn load(_key: StorageKey) -> Result<Option<String>, StorageError> {
-    Ok(None)
+fn server_error(e: ServerFnError) -> StorageError {
+    StorageError::Server(e.to_string())
 }
 
-/// Stub. Task 17 replaces this with a server-function call.
-pub async fn store(_key: StorageKey, _value: &str) -> Result<(), StorageError> {
-    Ok(())
+pub async fn load(key: StorageKey) -> Result<Option<String>, StorageError> {
+    entries::entry_load(to_iso(key.date()))
+        .await
+        .map_err(server_error)
 }
 
-/// Stub. Task 17 replaces this with a server-function call.
-pub async fn clear(_key: StorageKey) -> Result<(), StorageError> {
-    Ok(())
+pub async fn store(key: StorageKey, envelope: &str) -> Result<(), StorageError> {
+    entries::entry_save(to_iso(key.date()), envelope.to_string())
+        .await
+        .map_err(server_error)
 }
 
-/// Stub. Task 17 replaces this with a server-function call.
+/// Clearing a day writes an empty envelope rather than deleting the row.
+///
+/// "Cleared" and "never written" are the same thing to the reader, and an
+/// empty row keeps the day's `updated_at` meaningful. It also means clear
+/// and save take the same path, so there is one less server fn to authorize.
+pub async fn clear(key: StorageKey) -> Result<(), StorageError> {
+    store(key, &envelope::wrap("")).await
+}
+
 pub async fn dates_with_entries(
-    _from: NaiveDate,
-    _to: NaiveDate,
+    from: NaiveDate,
+    to: NaiveDate,
 ) -> Result<Vec<NaiveDate>, StorageError> {
-    Ok(Vec::new())
+    Ok(entries::entry_dates_in_range(to_iso(from), to_iso(to))
+        .await
+        .map_err(server_error)?
+        .iter()
+        .filter_map(|s| parse_iso(s))
+        .collect())
 }
