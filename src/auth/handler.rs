@@ -68,7 +68,7 @@ fn reissue(ctx: &AppCtx, conn: &mut DbConn, email: &str) -> Response {
     let ttl = magic_link::ttl();
     let minted = magic_link::mint(conn, email, ttl);
 
-    let body = match minted {
+    let (status, body) = match minted {
         Ok(token) => {
             let url = format!("{}/magic/{token}", email::site_base_url());
             let (text, html) = email::magic_link_email(&url, ttl.num_seconds());
@@ -87,21 +87,26 @@ fn reissue(ctx: &AppCtx, conn: &mut DbConn, email: &str) -> Response {
                     tracing::error!("reissued magic-link email failed: {e:?}");
                 }
             });
-            page(
+            let body = page(
                 "Check your email",
                 &format!(
                     "That link had already been used or had expired, so we've sent a \
                      fresh one to <strong>{}</strong>.",
-                    email::mask(email)
+                    escape_html(&email::mask(email))
                 ),
-            )
+            );
+            (StatusCode::OK, body)
         }
         Err(e) => {
             tracing::error!("could not reissue magic link: {e:?}");
-            page(
+            // A failure here is a database outage, not a user mistake — it
+            // must not read as an ordinary 200 in metrics/logs, or an outage
+            // on this path would never trigger an alert.
+            let body = page(
                 "Please try again",
                 "We couldn't send a new link. Go back and request one.",
-            )
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, body)
         }
     };
 
@@ -112,7 +117,27 @@ fn reissue(ctx: &AppCtx, conn: &mut DbConn, email: &str) -> Response {
             .parse()
             .expect("static content type"),
     );
-    (StatusCode::OK, headers, body).into_response()
+    (status, headers, body).into_response()
+}
+
+/// Escapes the five HTML-significant characters. `page()`'s callers
+/// interpolate untrusted values (an email address's domain is user-supplied
+/// and `normalize_email` does not reject markup in it) alongside deliberate
+/// markup like `<strong>`, so only the untrusted value is passed through
+/// this — never the whole assembled body.
+fn escape_html(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 /// A standalone page. This route runs outside the Leptos app, so it carries

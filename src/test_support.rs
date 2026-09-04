@@ -139,9 +139,12 @@ async fn seed_user_handler(Extension(ctx): Extension<AppCtx>, email: String) -> 
 /// from — not a separate one, or the handler's `consume` call would find no
 /// such row.
 ///
-/// Returns the router and the raw token, ready to embed in a
-/// `/magic/{token}` request in a test.
-pub async fn app_with_magic_link(email: &str) -> (Router, String) {
+/// Returns the router, the raw token, and the capture mailer the router's
+/// context holds — cloning a `Mailer::Capture` shares the same underlying
+/// `Arc<Mutex<..>>`, so a test can call `.captured()` on the returned handle
+/// to read back whatever the router sent, including from a `tokio::spawn`ed
+/// send.
+pub async fn app_with_magic_link(email: &str) -> (Router, String, email::Mailer) {
     ensure_env_defaults();
 
     let pool = db::test_pool();
@@ -149,9 +152,10 @@ pub async fn app_with_magic_link(email: &str) -> (Router, String) {
         let mut conn = pool.get().expect("checkout database connection");
         auth::magic_link::mint(&mut conn, email, auth::magic_link::ttl()).expect("mint token")
     };
-    let ctx = AppCtx::new(pool, email::Mailer::capture());
+    let mailer = email::Mailer::capture();
+    let ctx = AppCtx::new(pool, mailer.clone());
 
-    (router_with_ctx(ctx), token)
+    (router_with_ctx(ctx), token, mailer)
 }
 
 /// The router-assembly logic shared by [`router`] and [`app_with_magic_link`],

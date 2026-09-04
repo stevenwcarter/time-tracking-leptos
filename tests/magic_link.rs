@@ -8,7 +8,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn a_valid_link_sets_a_session_cookie_and_redirects() {
-    let (app, token) =
+    let (app, token, _mailer) =
         time_tracking_leptos::test_support::app_with_magic_link("alice@example.com").await;
     let res = app
         .oneshot(
@@ -39,7 +39,7 @@ async fn a_valid_link_sets_a_session_cookie_and_redirects() {
 
 #[tokio::test]
 async fn replaying_a_link_does_not_sign_in() {
-    let (app, token) =
+    let (app, token, _mailer) =
         time_tracking_leptos::test_support::app_with_magic_link("alice@example.com").await;
     let first = app
         .clone()
@@ -75,7 +75,7 @@ async fn replaying_a_link_does_not_sign_in() {
 
 #[tokio::test]
 async fn an_unknown_token_is_a_404_with_no_cookie() {
-    let (app, _) =
+    let (app, _, _mailer) =
         time_tracking_leptos::test_support::app_with_magic_link("alice@example.com").await;
     let res = app
         .oneshot(
@@ -88,6 +88,98 @@ async fn an_unknown_token_is_a_404_with_no_cookie() {
         .expect("response");
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
     assert!(res.headers().get(header::SET_COOKIE).is_none());
+}
+
+/// Waits for the `tokio::spawn`ed reissue send to land in the capture
+/// mailer, so this test doesn't race the response against the send it
+/// deliberately does not await.
+async fn wait_for_captured(
+    mailer: &time_tracking_leptos::email::Mailer,
+) -> Vec<time_tracking_leptos::email::OutboundEmail> {
+    for _ in 0..100 {
+        let sent = mailer.captured();
+        if !sent.is_empty() {
+            return sent;
+        }
+        tokio::task::yield_now().await;
+    }
+    mailer.captured()
+}
+
+/// The whole point of the `Stale` branch: replaying a used link must be
+/// self-service recovery, not a dead end. This is the positive twin of
+/// `replaying_a_link_does_not_sign_in`, which only pins the negative half
+/// (no cookie).
+#[tokio::test]
+async fn a_replayed_link_mails_a_fresh_one_that_signs_in() {
+    let (app, token, mailer) =
+        time_tracking_leptos::test_support::app_with_magic_link("alice@example.com").await;
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/magic/{token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        first.status(),
+        StatusCode::SEE_OTHER,
+        "first click signs in"
+    );
+
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/magic/{token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        second.status(),
+        StatusCode::OK,
+        "replay renders the reissue page"
+    );
+
+    let sent = wait_for_captured(&mailer).await;
+    assert_eq!(sent.len(), 1, "exactly one reissued email must be sent");
+    assert_eq!(
+        sent[0].to, "alice@example.com",
+        "must mail the stored address"
+    );
+
+    let new_token = sent[0]
+        .text
+        .split("/magic/")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("reissued email must carry a fresh link");
+    assert_ne!(new_token, token, "the reissued link must be a fresh token");
+
+    let signed_in = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/magic/{new_token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        signed_in.status(),
+        StatusCode::SEE_OTHER,
+        "the reissued link must itself sign in"
+    );
+    assert!(
+        signed_in.headers().get(header::SET_COOKIE).is_some(),
+        "the reissued link must set a session cookie"
+    );
 }
 
 /// Pins invariant I5. An attacker must not be able to tell a registered
@@ -110,7 +202,9 @@ async fn request_magic_link_responds_identically_for_every_outcome() {
             .await
             .expect("response");
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.expect("body");
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .expect("body");
         (status, String::from_utf8_lossy(&bytes).to_string())
     }
 
@@ -120,12 +214,22 @@ async fn request_magic_link_responds_identically_for_every_outcome() {
     let known = post(app.clone(), "known@example.com").await;
     let unknown = post(app.clone(), "nobody@example.com").await;
     let malformed = post(app.clone(), "not-an-address").await;
-    assert_eq!(known, unknown, "known and unknown addresses must be indistinguishable");
-    assert_eq!(known, malformed, "a malformed address must look the same too");
+    assert_eq!(
+        known, unknown,
+        "known and unknown addresses must be indistinguishable"
+    );
+    assert_eq!(
+        known, malformed,
+        "a malformed address must look the same too"
+    );
 
     // Exhaust the bucket; the over-quota response must still match.
     for _ in 0..10 {
         let _ = post(app.clone(), "known@example.com").await;
     }
-    assert_eq!(post(app, "known@example.com").await, known, "rate-limited must look the same");
+    assert_eq!(
+        post(app, "known@example.com").await,
+        known,
+        "rate-limited must look the same"
+    );
 }
