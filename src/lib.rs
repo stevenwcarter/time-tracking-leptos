@@ -7,7 +7,11 @@ pub mod date;
 pub mod storage;
 
 #[cfg(feature = "ssr")]
+pub mod auth;
+#[cfg(feature = "ssr")]
 pub mod db;
+#[cfg(feature = "ssr")]
+pub mod entries;
 #[cfg(feature = "ssr")]
 pub mod rate_limit;
 #[cfg(feature = "ssr")]
