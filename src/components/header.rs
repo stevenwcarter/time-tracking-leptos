@@ -1,34 +1,41 @@
-//! Placeholder header.
+//! The slim application header: title, date control, account slot.
 //!
-//! Task 20 replaces this with the real navigation shell (date picker,
-//! week/account links). This stub exists only so `App` compiles and this
-//! task's own SSR tests — which assert on "Sign in" versus the signed-in
-//! identity — have real chrome to assert against. The auth check here is
-//! real; only the layout around it is a placeholder.
+//! Layout is fixed by a user decision made from visual mockups: one row,
+//! title left, date centre, account right (option B). Not open for
+//! redesign here.
 
 use chrono::NaiveDate;
 use leptos::prelude::*;
+use leptos_router::components::A;
 
-use crate::auth_ctx::AuthCtx;
-use crate::date::format_long;
+use crate::components::account_menu::AccountMenu;
+use crate::components::calendar::DatePicker;
 
-/// The page header: the date being viewed (when there is one) and the
-/// signed-in identity, or a sign-in prompt.
+/// The page header, shown on every route.
 #[component]
-pub fn AppHeader(date: Option<NaiveDate>) -> impl IntoView {
-    let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
-    let identity = move || {
-        if auth.is_signed_in() {
-            auth.user.get().unwrap_or_default()
-        } else {
-            "Sign in".to_string()
-        }
-    };
-
+pub fn AppHeader(
+    /// `None` on `/`, where the server cannot know the date yet.
+    date: Option<NaiveDate>,
+) -> impl IntoView {
     view! {
-        <header class="flex items-center justify-between p-4 bg-white border-b border-gray-200">
-            <span class="text-sm text-gray-500">{date.map(format_long).unwrap_or_default()}</span>
-            <span class="text-sm font-medium text-gray-700">{identity}</span>
+        <header class="bg-white border-b border-gray-200">
+            <div class="w-full max-w-7xl mx-auto px-4 h-14 flex items-center gap-4">
+                <A
+                    href="/"
+                    attr:class="text-sm font-bold text-gray-900 tracking-wide no-underline shrink-0"
+                >
+                    "Time Tracker"
+                </A>
+                <div class="flex-1 flex justify-center min-w-0">
+                    // Absent rather than empty on `/`: the slot renders no
+                    // date because none is known, and the client fills the
+                    // URL in after hydration.
+                    {date.map(|date| view! { <DatePicker date=date/> })}
+                </div>
+                <div class="shrink-0">
+                    <AccountMenu/>
+                </div>
+            </div>
         </header>
     }
 }
