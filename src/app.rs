@@ -3,6 +3,11 @@ use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 
+use crate::components::time_display::TimeDisplay;
+use crate::components::time_entry_area::TimeEntryArea;
+use crate::storage::StorageKey;
+use crate::storage::hook::use_persistent;
+
 /// The SSR document shell. `HydrationScripts` injects the wasm loader.
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -40,7 +45,18 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn HomePage() -> impl IntoView {
-    view! { <p>"Leptos is running."</p> }
+    let entry = use_persistent(StorageKey::TimeEntry);
+
+    view! {
+        <div class="min-h-screen bg-gray-50">
+            <div class="w-full max-w-7xl mx-auto px-4 py-8">
+                <div class="flex flex-col md:flex-row gap-6 w-full">
+                    <TimeEntryArea entry=entry/>
+                    <TimeDisplay entry=entry/>
+                </div>
+            </div>
+        </div>
+    }
 }
 
 #[component]
