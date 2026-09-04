@@ -5,11 +5,13 @@
 //! that actually serves traffic rather than a copy of it that could drift.
 //! [`app_with_magic_link`] builds the same router around a test pool a
 //! caller can mint tokens against directly, for tests that need to drive
-//! `/magic/{token}`.
+//! `/magic/{token}`. [`seed_user`] registers an address against an
+//! already-built router's own pool, for tests that need a user to exist
+//! without driving any auth flow at all.
 
 use axum::body::Body;
 use axum::extract::{Extension, State};
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, middleware};
@@ -18,6 +20,7 @@ use leptos_axum::{
     LeptosRoutes, generate_route_list, handle_server_fns_with_context,
     render_app_to_stream_with_context,
 };
+use tower::ServiceExt;
 
 use crate::app::{App, shell};
 use crate::context::AppCtx;
@@ -83,6 +86,54 @@ pub async fn router() -> Router {
     router_with_ctx(ctx)
 }
 
+/// Creates a user row directly, without minting or consuming a magic link —
+/// so a test can register an address with no mail sent and no token to
+/// thread through.
+///
+/// Dispatches an in-process request to `app`'s own debug-only seed route
+/// (see [`seed_user_handler`]) rather than opening a second connection: a
+/// fresh `db::build_pool()` call would open its own private `:memory:`
+/// database, sharing nothing with the one `app` already holds, and `tests/`
+/// is a separate crate that cannot reach a `#[cfg(test)]` item in the
+/// library to get at it directly.
+pub async fn seed_user(app: &Router, email: &str) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__test_support__/seed_user")
+                .body(Body::from(email.to_string()))
+                .expect("seed_user request"),
+        )
+        .await
+        .expect("seed_user response");
+    assert!(
+        res.status().is_success(),
+        "seed_user failed with status {}",
+        res.status()
+    );
+}
+
+/// Handler backing [`seed_user`]. Registered only in debug builds — the same
+/// `cfg!(debug_assertions)` split `session::session_key` and
+/// `cookie::http_only` already use to keep dev/test-only behaviour out of a
+/// release binary — so it never reaches a `cargo leptos build --release`
+/// image.
+#[cfg(debug_assertions)]
+async fn seed_user_handler(Extension(ctx): Extension<AppCtx>, email: String) -> StatusCode {
+    match ctx
+        .conn()
+        .and_then(|mut conn| auth::user::find_or_create(&mut conn, &email))
+    {
+        Ok(_) => StatusCode::OK,
+        Err(e) => {
+            tracing::error!("seed_user failed: {e:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
 /// Builds a router with a `Mailer::capture()` and a magic-link token already
 /// minted for `email`, against the exact pool the returned router serves
 /// from — not a separate one, or the handler's `consume` call would find no
@@ -114,6 +165,10 @@ fn router_with_ctx(ctx: AppCtx) -> Router {
     let static_handler = leptos_axum::file_and_error_handler::<LeptosOptions, _>(shell);
     let mut app =
         Router::<LeptosOptions>::new().route("/magic/{token}", get(auth::handler::consume));
+    #[cfg(debug_assertions)]
+    {
+        app = app.route("/__test_support__/seed_user", post(seed_user_handler));
+    }
     for path in ROOT_ASSETS {
         app = app.route(path, get(static_handler.clone()));
     }

@@ -89,3 +89,43 @@ async fn an_unknown_token_is_a_404_with_no_cookie() {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
     assert!(res.headers().get(header::SET_COOKIE).is_none());
 }
+
+/// Pins invariant I5. An attacker must not be able to tell a registered
+/// address from an unregistered one, or a rate-limited request from an
+/// accepted one, by anything in the response.
+#[tokio::test]
+async fn request_magic_link_responds_identically_for_every_outcome() {
+    let app = time_tracking_leptos::test_support::router().await;
+
+    async fn post(app: axum::Router, email: &str) -> (StatusCode, String) {
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/request_link")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.expect("body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    // Register one address so the two cases genuinely differ server-side.
+    time_tracking_leptos::test_support::seed_user(&app, "known@example.com").await;
+
+    let known = post(app.clone(), "known@example.com").await;
+    let unknown = post(app.clone(), "nobody@example.com").await;
+    let malformed = post(app.clone(), "not-an-address").await;
+    assert_eq!(known, unknown, "known and unknown addresses must be indistinguishable");
+    assert_eq!(known, malformed, "a malformed address must look the same too");
+
+    // Exhaust the bucket; the over-quota response must still match.
+    for _ in 0..10 {
+        let _ = post(app.clone(), "known@example.com").await;
+    }
+    assert_eq!(post(app, "known@example.com").await, known, "rate-limited must look the same");
+}

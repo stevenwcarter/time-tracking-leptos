@@ -89,15 +89,20 @@ webauthn-rs = { version = "0.6.1-dev", features = [
   "danger-allow-state-serialisation", "conditional-ui",
 ], optional = true }
 webauthn-rs-proto = { version = "0.6.1-dev", optional = true }
+# `oneshot`, used by `test_support::seed_user` to reach a running router's
+# own database (see that function's doc comment) and by the integration
+# tests. A regular dependency rather than dev-only: `test_support` is part
+# of the library, not `#[cfg(test)]` — `tests/` is a separate crate and
+# cannot see `#[cfg(test)]` items. Axum pulls tower in transitively but does
+# not re-export it, and `oneshot` needs its "util" feature explicitly.
+tower = { version = "0.5", default-features = false, features = [
+  "util",
+], optional = true }
 
 [dev-dependencies]
 webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false, features = [
   "softpasskey",
 ] }
-# `oneshot` for the route-order integration test; axum pulls tower in
-# transitively but does not re-export it, and `oneshot` needs its "util"
-# feature explicitly.
-tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [features]
 default = []
@@ -132,6 +137,7 @@ ssr = [
   "dep:dotenvy",
   "dep:webauthn-rs",
   "dep:webauthn-rs-proto",
+  "dep:tower",
 ]
 
 [profile.release]
