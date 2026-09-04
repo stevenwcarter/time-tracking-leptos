@@ -7,6 +7,11 @@ pub mod date;
 pub mod dto;
 pub mod server_fns;
 pub mod storage;
+// `test` as well as `hydrate`, same split as `storage::local`: `friendly_error`
+// is pure and host-tested since there is no wasm test runner in this project.
+// Only the `web_sys` ceremony wrapper inside stays gated to `hydrate` alone.
+#[cfg(any(feature = "hydrate", test))]
+pub mod webauthn_browser;
 
 #[cfg(feature = "ssr")]
 pub mod auth;
