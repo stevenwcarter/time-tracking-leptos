@@ -1,4 +1,18 @@
+# Guard types actually returned by Leptos 0.8 (`reactive_graph`) signal
+# accessors, replacing the Dioxus-era `generational_box` types (removed from
+# the dependency graph entirely — clippy silently ignores unresolvable paths
+# here, so a stale path is worse than no config at all).
+#
+# Known gap: `RwSignal::write()`/`write_untracked()` — the ergonomic,
+# commonly-used write accessors — return `impl UntrackableGuard`/
+# `impl DerefMut`, an opaque `impl Trait` return type declared by the trait
+# itself. Clippy can only match a concretely named type, so no path can catch
+# those calls; only `try_write_untracked()`, whose `RwSignal` impl narrows
+# the trait's opaque return to the named `UntrackedWriteGuard` (see its
+# `#[allow(refining_impl_trait)]`), is visible to this lint. Verified against
+# reactive_graph 0.2.14 by holding each guard across an `.await` and
+# confirming clippy fired (or, for `write()`, confirming it silently did not).
 await-holding-invalid-types = [
-  { path = "generational_box::GenerationalRef", reason = "Reads should not be held over an await point. This will cause any writes to fail while the await is pending since the read borrow is still active." },
-  { path = "generational_box::GenerationalRefMut", reason = "Writes should not be held over an await point. This will cause any reads or writes to fail while the await is pending since the write borrow is still active." },
+  { path = "reactive_graph::signal::guards::ReadGuard", reason = "Reads should not be held over an await point. This will cause any writes to fail while the await is pending since the read borrow is still active." },
+  { path = "reactive_graph::signal::guards::UntrackedWriteGuard", reason = "Writes should not be held over an await point. This will cause any reads or writes to fail while the await is pending since the write borrow is still active." },
 ]
