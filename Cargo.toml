@@ -21,7 +21,7 @@ leptos_meta = "0.8"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-time-tracking-parser = { git = "https://github.com/stevenwcarter/time-tracking-parser" }
+time-tracking-parser = { git = "https://github.com/stevenwcarter/time-tracking-parser", rev = "cf34921b9a0b92001d949d353bf65146f3aa27b1" }
 
 # Hydrate-only (wasm).
 console_error_panic_hook = { version = "0.1", optional = true }
