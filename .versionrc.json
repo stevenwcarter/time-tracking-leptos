@@ -34,6 +34,6 @@
     }
   ],
   "header": "Here are some recent changes:",
-  "commitUrlFormat": "https://github.com/stevenwcarter/time-tracking-dioxus/commits/{{hash}}",
-  "compareUrlFormat": "https://github.com/stevenwcarter/time-tracking-dioxus/compare/{{previousTag}}...{{currentTag}}"
+  "commitUrlFormat": "https://github.com/stevenwcarter/time-tracking-leptos/commits/{{hash}}",
+  "compareUrlFormat": "https://github.com/stevenwcarter/time-tracking-leptos/compare/{{previousTag}}...{{currentTag}}"
 }
