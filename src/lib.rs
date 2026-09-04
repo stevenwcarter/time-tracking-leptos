@@ -10,6 +10,8 @@ pub mod storage;
 pub mod db;
 #[cfg(feature = "ssr")]
 pub mod schema;
+#[cfg(feature = "ssr")]
+pub mod session;
 
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
