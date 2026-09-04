@@ -19,6 +19,7 @@
 //! know, and returning users see a flash of "No projects found" before their
 //! data appears.
 
+use leptos::logging::error;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -44,7 +45,12 @@ impl Persistent {
         let key = self.key;
         spawn_local(async move {
             // A failed write must not break the UI; the in-memory value stands.
-            let _ = store(key, &value).await;
+            // But it must not be silent either — Safari private browsing and a
+            // quota-exceeded `setItem` both throw, and the user would otherwise
+            // lose data with nothing in the console to explain why.
+            if let Err(err) = store(key, &value).await {
+                error!("failed to persist value for {key:?}: {err}");
+            }
         });
     }
 
@@ -58,8 +64,16 @@ impl Persistent {
 ///
 /// Both "nothing stored" and "the read failed" become loaded-and-empty:
 /// leaving the value unloaded on error would strand the UI blank forever.
+/// A read failure is still logged before being collapsed, so a corrupt
+/// stored value doesn't silently masquerade as "nothing saved".
 fn loaded_value(read: Result<Option<String>, StorageError>) -> String {
-    read.ok().flatten().unwrap_or_default()
+    match read {
+        Ok(value) => value.unwrap_or_default(),
+        Err(err) => {
+            error!("failed to load persisted value, treating as empty: {err}");
+            String::new()
+        }
+    }
 }
 
 /// Reads `key` from storage after hydration, exposing the tri-state above.
