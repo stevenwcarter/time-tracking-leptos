@@ -1,0 +1,1 @@
+- [ ] Explore whether we can create a passkey from _javascript_ and use that to encrypt/decrypt their notes somehow. It's not very secure, but it might be secure enough without requiring password protection. (or some other method you can think of to enable client-side encryption easily, with minimal friction to a user)
