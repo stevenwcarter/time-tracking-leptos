@@ -1,1 +1,3 @@
-//! View components. Real implementations land in Tasks 10-13.
+//! View components.
+
+pub mod summary;
