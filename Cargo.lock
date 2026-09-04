@@ -3685,6 +3685,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time-tracking-parser",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

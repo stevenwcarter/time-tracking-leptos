@@ -94,6 +94,10 @@ webauthn-rs-proto = { version = "0.6.1-dev", optional = true }
 webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false, features = [
   "softpasskey",
 ] }
+# `oneshot` for the route-order integration test; axum pulls tower in
+# transitively but does not re-export it, and `oneshot` needs its "util"
+# feature explicitly.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [features]
 default = []

@@ -1,39 +1,37 @@
 #![recursion_limit = "512"]
 
 #[cfg(feature = "ssr")]
-#[tokio::main]
-async fn main() {
-    use axum::Router;
-    use leptos::logging::log;
+mod server_main {
     use leptos::prelude::*;
-    use leptos_axum::{LeptosRoutes, generate_route_list};
-    use time_tracking_leptos::app::{App, shell};
 
-    let conf = get_configuration(None).expect("failed to read Leptos configuration");
-    let leptos_options = conf.leptos_options;
-    let addr = leptos_options.site_addr;
-    let routes = generate_route_list(App);
+    pub async fn run() {
+        dotenvy::dotenv().ok();
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let app = Router::<LeptosOptions>::new()
-        .leptos_routes(&leptos_options, routes, {
-            let leptos_options = leptos_options.clone();
-            move || shell(leptos_options.clone())
-        })
-        // Serves everything under `site-root`, including /pkg/*.css and the
-        // wasm bundle. Safe as a fallback because the app mounts no wildcard
-        // route that could shadow it.
-        .fallback(leptos_axum::file_and_error_handler::<LeptosOptions, _>(
-            shell,
-        ))
-        .with_state(leptos_options);
+        let conf = get_configuration(None).expect("failed to read Leptos configuration");
+        let addr = conf.leptos_options.site_addr;
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind listen address");
-    log!("listening on http://{addr}");
-    axum::serve(listener, app.into_make_service())
+        let app = time_tracking_leptos::test_support::router().await;
+
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .expect("failed to bind listen address");
+        tracing::info!("listening on http://{addr}");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
         .await
         .expect("server error");
+    }
+}
+
+#[cfg(feature = "ssr")]
+#[tokio::main]
+async fn main() {
+    server_main::run().await;
 }
 
 #[cfg(not(feature = "ssr"))]

@@ -9,7 +9,11 @@ pub mod storage;
 #[cfg(feature = "ssr")]
 pub mod auth;
 #[cfg(feature = "ssr")]
+pub mod context;
+#[cfg(feature = "ssr")]
 pub mod db;
+#[cfg(feature = "ssr")]
+pub mod email;
 #[cfg(feature = "ssr")]
 pub mod entries;
 #[cfg(feature = "ssr")]
@@ -22,6 +26,12 @@ pub mod schema;
 pub mod server;
 #[cfg(feature = "ssr")]
 pub mod session;
+/// Router construction shared by `main` and the integration tests.
+///
+/// Not `#[cfg(test)]`: `tests/` is a separate crate and cannot see
+/// `#[cfg(test)]` items. Gated on `ssr` so it never reaches wasm.
+#[cfg(feature = "ssr")]
+pub mod test_support;
 
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
