@@ -27,7 +27,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ secrets.docker_registry }}/time-tracking-leptos
+            ${{ secrets.DOCKER_REGISTRY }}/time-tracking-leptos
           tags: |
             type=ref,event=branch
             type=ref,event=pr
