@@ -2020,7 +2020,7 @@ dependencies = [
 [[package]]
 name = "time-tracking-parser"
 version = "0.1.0"
-source = "git+https://github.com/stevenwcarter/time-tracking-parser#cf34921b9a0b92001d949d353bf65146f3aa27b1"
+source = "git+https://github.com/stevenwcarter/time-tracking-parser?rev=cf34921b9a0b92001d949d353bf65146f3aa27b1#cf34921b9a0b92001d949d353bf65146f3aa27b1"
 dependencies = [
  "serde",
  "serde_json",
