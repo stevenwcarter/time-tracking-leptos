@@ -49,6 +49,33 @@ pub fn friendly_error(raw: String) -> String {
     }
 }
 
+/// The decision behind [`browser::prf_enabled`], pulled out so it is
+/// host-testable: takes the JSON-stringified result of
+/// `getClientExtensionResults()` rather than a live `JsValue`.
+///
+/// Every step is fallible-safe: malformed JSON, a missing `prf` key, a
+/// missing `enabled` field, or a non-boolean value must all read as "no PRF
+/// support", never panic — misreading this as `false` just means a fallback
+/// path; misreading it as `true` (or panicking) would break the ceremony.
+///
+/// Note the mechanism differs from the live `Reflect`-based check this
+/// replaced, even though the outcome does not: `Reflect::get` on a JS value
+/// that lacks a `prf` key returns `undefined`, and a *further* `Reflect::get`
+/// on `undefined` throws — so the old code's `false` for "no `prf` key" came
+/// from an error path. Here, `serde_json`'s `Value::get` returns `None` for
+/// a missing key directly. Both collapse to `false`, but they are not the
+/// same mechanism; don't read this as a line-for-line port of the old chain.
+pub(crate) fn prf_enabled_from_json(extension_results_json: &str) -> bool {
+    let Ok(results) = serde_json::from_str::<serde_json::Value>(extension_results_json) else {
+        return false;
+    };
+    results
+        .get("prf")
+        .and_then(|prf| prf.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 #[cfg(feature = "hydrate")]
 mod browser {
     use std::fmt;
@@ -154,11 +181,10 @@ mod browser {
     /// answer; phase 2 derives an encryption key from PRF output on
     /// credentials where this was true (spec section 9.3).
     ///
-    /// Every step is fallible-safe: a missing `getClientExtensionResults`
-    /// method, a missing `prf` key, a missing `enabled` field, or a
-    /// non-boolean value must all read as "no PRF support", never panic —
-    /// misreading this as `false` just means a fallback path; misreading it
-    /// as `true` (or panicking) would break the ceremony.
+    /// Only "can we reach the results at all" lives here — a missing
+    /// `getClientExtensionResults` method or a throwing call both read as
+    /// "no PRF support" and never panic. The actual `prf.enabled` decision
+    /// is [`super::prf_enabled_from_json`], which is host-tested.
     fn prf_enabled(cred: &JsValue) -> bool {
         let Ok(get_results) = method(cred, "getClientExtensionResults") else {
             return false;
@@ -166,11 +192,7 @@ mod browser {
         let Ok(results) = get_results.call0(cred) else {
             return false;
         };
-        Reflect::get(&results, &"prf".into())
-            .ok()
-            .and_then(|prf| Reflect::get(&prf, &"enabled".into()).ok())
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+        super::prf_enabled_from_json(&stringify(&results))
     }
 
     /// Enrols a credential. Returns its JSON and whether PRF is available.
@@ -191,7 +213,7 @@ pub use browser::{WebauthnUserError, authenticate, register};
 
 #[cfg(test)]
 mod tests {
-    use super::friendly_error;
+    use super::{friendly_error, prf_enabled_from_json};
 
     #[test]
     fn cancellation_is_named_plainly() {
@@ -238,5 +260,37 @@ mod tests {
             friendly_error("TypeError: Cannot read properties of undefined".into()),
             "Couldn't complete that passkey step. Please try again."
         );
+    }
+
+    /// The one shape that must read as PRF-capable.
+    #[test]
+    fn prf_enabled_true_is_read_through() {
+        assert!(prf_enabled_from_json(r#"{"prf":{"enabled":true}}"#));
+    }
+
+    /// No `prf` key at all — an authenticator that never got asked, or
+    /// doesn't support the extension.
+    #[test]
+    fn prf_absent_is_not_capable() {
+        assert!(!prf_enabled_from_json("{}"));
+    }
+
+    /// `prf` present but empty — the authenticator answered without an
+    /// `enabled` field.
+    #[test]
+    fn prf_enabled_field_absent_is_not_capable() {
+        assert!(!prf_enabled_from_json(r#"{"prf":{}}"#));
+    }
+
+    /// `enabled` present but not a boolean must not be read as truthy.
+    #[test]
+    fn prf_enabled_non_boolean_is_not_capable() {
+        assert!(!prf_enabled_from_json(r#"{"prf":{"enabled":"true"}}"#));
+    }
+
+    /// Not valid JSON at all — must not panic.
+    #[test]
+    fn malformed_json_is_not_capable() {
+        assert!(!prf_enabled_from_json("not json"));
     }
 }
