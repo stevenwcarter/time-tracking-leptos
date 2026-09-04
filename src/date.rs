@@ -85,8 +85,14 @@ mod tests {
     #[test]
     fn rejects_non_dates() {
         for junk in [
-            "", "account", "favicon.ico", "2026-13-01", "2026-02-30",
-            "2026-9-4", "20260904", "2026-09-04T00:00:00",
+            "",
+            "account",
+            "favicon.ico",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-9-4",
+            "20260904",
+            "2026-09-04T00:00:00",
         ] {
             assert_eq!(parse_iso(junk), None, "{junk:?} must not parse");
         }
@@ -121,7 +127,10 @@ mod tests {
     #[test]
     fn month_bounds_cover_the_whole_month() {
         assert_eq!(month_bounds(d(2026, 9, 4)), (d(2026, 9, 1), d(2026, 9, 30)));
-        assert_eq!(month_bounds(d(2026, 12, 9)), (d(2026, 12, 1), d(2026, 12, 31)));
+        assert_eq!(
+            month_bounds(d(2026, 12, 9)),
+            (d(2026, 12, 1), d(2026, 12, 31))
+        );
         // February in a leap year — the case a naive "day 28" gets wrong.
         assert_eq!(month_bounds(d(2028, 2, 5)), (d(2028, 2, 1), d(2028, 2, 29)));
     }

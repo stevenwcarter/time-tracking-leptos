@@ -77,7 +77,9 @@ pub fn find_or_create(conn: &mut DbConn, email: &str) -> Result<User> {
                 created_at: Utc::now().naive_utc(),
             })
             .execute(conn)?;
-        user::table.filter(user::email.eq(&normalized)).first::<User>(conn)
+        user::table
+            .filter(user::email.eq(&normalized))
+            .first::<User>(conn)
     })
     .context("find or create user")
 }
@@ -106,7 +108,14 @@ mod tests {
 
     #[test]
     fn rejects_impossible_addresses() {
-        for junk in ["", "   ", "no-at-sign", "@nolocal.com", "trailing@", "a b@c.com"] {
+        for junk in [
+            "",
+            "   ",
+            "no-at-sign",
+            "@nolocal.com",
+            "trailing@",
+            "a b@c.com",
+        ] {
             assert_eq!(normalize_email(junk), None, "{junk:?} must be rejected");
         }
     }
@@ -138,7 +147,9 @@ mod tests {
         let pool = test_pool();
         let mut conn = pool.get().expect("checkout");
         assert_eq!(
-            find_or_create(&mut conn, "alice@example.com").expect("create").session_epoch,
+            find_or_create(&mut conn, "alice@example.com")
+                .expect("create")
+                .session_epoch,
             0
         );
     }
@@ -147,7 +158,11 @@ mod tests {
     fn find_by_email_misses_cleanly() {
         let pool = test_pool();
         let mut conn = pool.get().expect("checkout");
-        assert!(find_by_email(&mut conn, "nobody@example.com").expect("query").is_none());
+        assert!(
+            find_by_email(&mut conn, "nobody@example.com")
+                .expect("query")
+                .is_none()
+        );
     }
 
     /// Bumping the epoch is how "sign out everywhere" works: every issued
@@ -160,7 +175,9 @@ mod tests {
         let u = find_or_create(&mut conn, "alice@example.com").expect("create");
         bump_epoch(&mut conn, u.id).expect("bump");
         bump_epoch(&mut conn, u.id).expect("bump");
-        let after = find_by_email(&mut conn, "alice@example.com").expect("query").expect("exists");
+        let after = find_by_email(&mut conn, "alice@example.com")
+            .expect("query")
+            .expect("exists");
         assert_eq!(after.session_epoch, 2);
     }
 }

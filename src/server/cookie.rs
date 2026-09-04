@@ -6,7 +6,11 @@
 
 /// Builds an `HttpOnly; SameSite=Lax` cookie header scoped to `Path=/`.
 pub fn http_only(name: &str, value: &str, max_age: i64) -> String {
-    let secure = if cfg!(debug_assertions) { "" } else { "; Secure" };
+    let secure = if cfg!(debug_assertions) {
+        ""
+    } else {
+        "; Secure"
+    };
     format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax{secure}; Max-Age={max_age}")
 }
 
@@ -17,14 +21,21 @@ mod tests {
     /// `Secure` is build-mode dependent, so assert it against the same cfg
     /// the helper uses rather than hardcoding one build's answer.
     fn secure_suffix() -> &'static str {
-        if cfg!(debug_assertions) { "" } else { "; Secure" }
+        if cfg!(debug_assertions) {
+            ""
+        } else {
+            "; Secure"
+        }
     }
 
     #[test]
     fn sets_a_session_cookie() {
         assert_eq!(
             http_only("tt_session", "abc", 2_592_000),
-            format!("tt_session=abc; Path=/; HttpOnly; SameSite=Lax{}; Max-Age=2592000", secure_suffix())
+            format!(
+                "tt_session=abc; Path=/; HttpOnly; SameSite=Lax{}; Max-Age=2592000",
+                secure_suffix()
+            )
         );
     }
 
@@ -32,7 +43,10 @@ mod tests {
     fn clears_with_an_empty_value_and_zero_age() {
         assert_eq!(
             http_only("tt_session", "", 0),
-            format!("tt_session=; Path=/; HttpOnly; SameSite=Lax{}; Max-Age=0", secure_suffix())
+            format!(
+                "tt_session=; Path=/; HttpOnly; SameSite=Lax{}; Max-Age=0",
+                secure_suffix()
+            )
         );
     }
 }

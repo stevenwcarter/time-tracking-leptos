@@ -41,7 +41,9 @@ impl PasskeyRow {
 
     /// The label to show, falling back to a date-derived default.
     pub fn display_name(&self) -> String {
-        self.name.clone().unwrap_or_else(|| default_name(self.created_at))
+        self.name
+            .clone()
+            .unwrap_or_else(|| default_name(self.created_at))
     }
 }
 
@@ -287,7 +289,9 @@ mod tests {
         assert!(!rename_for_user(&mut conn, row_id, mallory, Some("pwned")).expect("rename"));
         assert!(rename_for_user(&mut conn, row_id, alice, Some("Laptop")).expect("rename"));
         assert_eq!(
-            list_by_user(&mut conn, alice).expect("list")[0].name.as_deref(),
+            list_by_user(&mut conn, alice).expect("list")[0]
+                .name
+                .as_deref(),
             Some("Laptop")
         );
     }

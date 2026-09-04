@@ -98,7 +98,10 @@ mod tests {
 
     #[test]
     fn malformed_json_is_an_error() {
-        assert!(matches!(unwrap("not json"), Err(EnvelopeError::Malformed(_))));
+        assert!(matches!(
+            unwrap("not json"),
+            Err(EnvelopeError::Malformed(_))
+        ));
     }
 
     /// An empty body is a real, meaningful state (`Some("")` in the hook's

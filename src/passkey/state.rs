@@ -46,13 +46,24 @@ pub enum PasskeyState {
 
 impl PasskeyState {
     pub fn reg(subject: String, reg: PasskeyRegistration) -> Self {
-        Self::Reg { subject, reg, expires_at: now_secs() + MAX_AGE_SECONDS }
+        Self::Reg {
+            subject,
+            reg,
+            expires_at: now_secs() + MAX_AGE_SECONDS,
+        }
     }
     pub fn auth(subject: String, auth: PasskeyAuthentication) -> Self {
-        Self::Auth { subject, auth, expires_at: now_secs() + MAX_AGE_SECONDS }
+        Self::Auth {
+            subject,
+            auth,
+            expires_at: now_secs() + MAX_AGE_SECONDS,
+        }
     }
     pub fn discoverable(auth: DiscoverableAuthentication) -> Self {
-        Self::DiscoverableAuth { auth, expires_at: now_secs() + MAX_AGE_SECONDS }
+        Self::DiscoverableAuth {
+            auth,
+            expires_at: now_secs() + MAX_AGE_SECONDS,
+        }
     }
     fn expires_at(&self) -> i64 {
         match self {
@@ -102,8 +113,7 @@ pub fn decode(raw: &str) -> Result<PasskeyState> {
     }
     let (body, sig) = bytes.split_at(bytes.len() - SIG_LEN);
     hmac::verify(&key(), body, sig).map_err(|_| anyhow!("ceremony state signature invalid"))?;
-    let state: PasskeyState =
-        serde_json::from_slice(body).context("deserialize ceremony state")?;
+    let state: PasskeyState = serde_json::from_slice(body).context("deserialize ceremony state")?;
     if state.expires_at() < now_secs() {
         bail!("ceremony state expired");
     }
@@ -155,7 +165,9 @@ mod tests {
     fn rejects_a_tampered_payload() {
         let (subject, reg) = a_registration();
         let encoded = encode(&PasskeyState::reg(subject, reg)).expect("encode");
-        let mut bytes = URL_SAFE_NO_PAD.decode(encoded.as_bytes()).expect("decode b64");
+        let mut bytes = URL_SAFE_NO_PAD
+            .decode(encoded.as_bytes())
+            .expect("decode b64");
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xff;
         assert!(decode(&URL_SAFE_NO_PAD.encode(&bytes)).is_err());

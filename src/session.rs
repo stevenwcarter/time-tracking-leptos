@@ -255,7 +255,9 @@ mod tests {
         let now = 1_788_000_000;
         let tok = issued_at("alice@example.com", 41, now);
         assert_eq!(
-            verify_at(&tok, now + 60, KEY.as_bytes()).expect("valid").epoch,
+            verify_at(&tok, now + 60, KEY.as_bytes())
+                .expect("valid")
+                .epoch,
             41
         );
     }

@@ -91,7 +91,10 @@ pub fn entries_in_range(
         .select((time_entry::entry_date, time_entry::body))
         .load(conn)
         .context("select entries in range")?;
-    Ok(rows.into_iter().filter_map(|(d, b)| parse_iso(&d).map(|d| (d, b))).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|(d, b)| parse_iso(&d).map(|d| (d, b)))
+        .collect())
 }
 
 #[cfg(all(test, feature = "ssr"))]
@@ -141,7 +144,12 @@ mod tests {
             load(&mut conn, uid, d(2026, 9, 4)).expect("load"),
             Some("second".to_string())
         );
-        assert_eq!(dates_in_range(&mut conn, uid, d(2026, 9, 1), d(2026, 9, 30)).expect("range").len(), 1);
+        assert_eq!(
+            dates_in_range(&mut conn, uid, d(2026, 9, 1), d(2026, 9, 30))
+                .expect("range")
+                .len(),
+            1
+        );
     }
 
     /// Range bounds are inclusive on both ends. An exclusive upper bound
@@ -152,11 +160,18 @@ mod tests {
         let mut conn = pool.get().expect("checkout");
         let uid = user_id(&mut conn, "alice@example.com");
         for day in [31, 1, 2, 6, 7] {
-            let date = if day == 31 { d(2026, 8, 31) } else { d(2026, 9, day) };
+            let date = if day == 31 {
+                d(2026, 8, 31)
+            } else {
+                d(2026, 9, day)
+            };
             save(&mut conn, uid, date, "x").expect("save");
         }
         let got = dates_in_range(&mut conn, uid, d(2026, 8, 31), d(2026, 9, 6)).expect("range");
-        assert_eq!(got, vec![d(2026, 8, 31), d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 6)]);
+        assert_eq!(
+            got,
+            vec![d(2026, 8, 31), d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 6)]
+        );
     }
 
     #[test]
@@ -168,8 +183,11 @@ mod tests {
             save(&mut conn, uid, date, "x").expect("save");
         }
         let got = dates_in_range(&mut conn, uid, d(2026, 9, 1), d(2026, 9, 30)).expect("range");
-        assert_eq!(got, vec![d(2026, 9, 2), d(2026, 9, 9), d(2026, 9, 10), d(2026, 9, 30)],
-            "TEXT dates must sort chronologically, not 10 before 2");
+        assert_eq!(
+            got,
+            vec![d(2026, 9, 2), d(2026, 9, 9), d(2026, 9, 10), d(2026, 9, 30)],
+            "TEXT dates must sort chronologically, not 10 before 2"
+        );
     }
 
     #[test]
@@ -181,7 +199,10 @@ mod tests {
         save(&mut conn, uid, d(2026, 9, 3), "three").expect("save");
         assert_eq!(
             entries_in_range(&mut conn, uid, d(2026, 9, 1), d(2026, 9, 7)).expect("range"),
-            vec![(d(2026, 9, 1), "one".to_string()), (d(2026, 9, 3), "three".to_string())]
+            vec![
+                (d(2026, 9, 1), "one".to_string()),
+                (d(2026, 9, 3), "three".to_string())
+            ]
         );
     }
 
@@ -196,8 +217,16 @@ mod tests {
         save(&mut conn, alice, d(2026, 9, 4), "alice-secret").expect("save");
 
         assert_eq!(load(&mut conn, mallory, d(2026, 9, 4)).expect("load"), None);
-        assert!(dates_in_range(&mut conn, mallory, d(2026, 1, 1), d(2026, 12, 31)).expect("range").is_empty());
-        assert!(entries_in_range(&mut conn, mallory, d(2026, 1, 1), d(2026, 12, 31)).expect("range").is_empty());
+        assert!(
+            dates_in_range(&mut conn, mallory, d(2026, 1, 1), d(2026, 12, 31))
+                .expect("range")
+                .is_empty()
+        );
+        assert!(
+            entries_in_range(&mut conn, mallory, d(2026, 1, 1), d(2026, 12, 31))
+                .expect("range")
+                .is_empty()
+        );
     }
 
     /// A write by one user must not overwrite another's row for the same day.
@@ -209,7 +238,10 @@ mod tests {
         let mallory = user_id(&mut conn, "mallory@example.com");
         save(&mut conn, alice, d(2026, 9, 4), "alice-body").expect("save");
         save(&mut conn, mallory, d(2026, 9, 4), "mallory-body").expect("save");
-        assert_eq!(load(&mut conn, alice, d(2026, 9, 4)).expect("load"), Some("alice-body".to_string()));
+        assert_eq!(
+            load(&mut conn, alice, d(2026, 9, 4)).expect("load"),
+            Some("alice-body".to_string())
+        );
     }
 
     /// Deleting a user must take their entries with them, which only works
@@ -221,7 +253,13 @@ mod tests {
         let mut conn = pool.get().expect("checkout");
         let uid = user_id(&mut conn, "alice@example.com");
         save(&mut conn, uid, d(2026, 9, 4), "x").expect("save");
-        diesel::delete(user_table::table.find(uid)).execute(&mut conn).expect("delete user");
-        assert!(entries_in_range(&mut conn, uid, d(2026, 1, 1), d(2026, 12, 31)).expect("range").is_empty());
+        diesel::delete(user_table::table.find(uid))
+            .execute(&mut conn)
+            .expect("delete user");
+        assert!(
+            entries_in_range(&mut conn, uid, d(2026, 1, 1), d(2026, 12, 31))
+                .expect("range")
+                .is_empty()
+        );
     }
 }
