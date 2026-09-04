@@ -122,9 +122,9 @@ One route. `path!("/")` → `HomePage`. No wildcard route, so none of the
 the Leptos routes, because `file_and_error_handler` as fallback can still shadow
 it.
 
-Server-function endpoints are mounted at `/api/{*fn_name}` even though this
-migration defines zero `#[server]` functions. It is three lines now versus a
-router change later.
+This migration defines zero `#[server]` functions. No explicit server-fn route
+is needed either: `.leptos_routes()` already registers the server-fn handler, so
+adding the first `#[server]` fn later requires no router change.
 
 ### Render mode
 
