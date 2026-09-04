@@ -13,9 +13,13 @@ pub mod db;
 #[cfg(feature = "ssr")]
 pub mod entries;
 #[cfg(feature = "ssr")]
+pub mod passkey;
+#[cfg(feature = "ssr")]
 pub mod rate_limit;
 #[cfg(feature = "ssr")]
 pub mod schema;
+#[cfg(feature = "ssr")]
+pub mod server;
 #[cfg(feature = "ssr")]
 pub mod session;
 
