@@ -40,6 +40,21 @@ async fn favicon_is_not_shadowed_by_the_date_route() {
     );
 }
 
+/// Exercises `leptos_routes_handler`'s own `Extension<AppCtx>` extraction and
+/// `provide_context` wiring — the behaviour this task actually delivers.
+/// `/favicon.ico` above is served by the `ROOT_ASSETS` static handler and
+/// never reaches this path; `/` is the only live route that does, until
+/// Task 19 adds `/{date}`.
+#[tokio::test]
+async fn home_route_renders_through_the_leptos_handler() {
+    let (status, body) = get("/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Time Entry"),
+        "/ did not render the home page through leptos_routes_handler"
+    );
+}
+
 #[tokio::test]
 #[ignore = "enabled by Task 19"]
 async fn account_route_beats_the_date_route() {
