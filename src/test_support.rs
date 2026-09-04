@@ -148,7 +148,6 @@ impl TestApp {
     pub fn anonymous(&self) -> SessionClient {
         SessionClient {
             router: self.router.clone(),
-            cookie: None,
             extra_cookies: RefCell::new(HashMap::new()),
         }
     }
@@ -170,8 +169,7 @@ pub async fn signed_in_as(app: &TestApp, email: &str) -> SessionClient {
     let token = session::issue(&user.email, user.session_epoch);
     SessionClient {
         router: app.router.clone(),
-        cookie: Some(format!("{}={token}", session::COOKIE_NAME)),
-        extra_cookies: RefCell::new(HashMap::new()),
+        extra_cookies: RefCell::new(HashMap::from([(session::COOKIE_NAME.to_string(), token)])),
     }
 }
 
@@ -180,19 +178,23 @@ pub async fn signed_in_as(app: &TestApp, email: &str) -> SessionClient {
 /// router — including the session middleware and `require_user` — rather
 /// than calling repository functions directly.
 ///
-/// `extra_cookies` holds whatever short-lived cookies a response has set
-/// (the WebAuthn ceremony state cookie, chiefly) so a follow-up call on the
-/// same client carries them back, the way a browser's cookie jar would. It
-/// is a `RefCell`, not a plain field, so `call` can update it from `&self` —
-/// every server-fn method here reads like a stateless request even though
-/// this one piece of it is not. `#[derive(Clone)]` still snapshots it by
-/// value (a `RefCell<T>` clones `T`, it does not share it), which is what
-/// keeps `clone_session` modeling an independent second device rather than
-/// a second handle onto the same one.
+/// `extra_cookies` is a single keyed jar for *every* cookie this client
+/// holds, session cookie included — not just the short-lived ones a
+/// ceremony sets. Keying by name is what makes a cookie a client already
+/// holds get *replaced* rather than duplicated when a response reissues it
+/// (`passkey_login_finish` reissues the session cookie on a passkey
+/// sign-in); two "one main cookie plus extras" fields would let a reissued
+/// session cookie sit alongside the original and both get sent, which is
+/// exactly the bug this design avoids. It is a `RefCell`, not a plain
+/// field, so `call` can update it from `&self` — every server-fn method
+/// here reads like a stateless request even though this one piece of it is
+/// not. `#[derive(Clone)]` still snapshots it by value (a `RefCell<T>`
+/// clones `T`, it does not share it), which is what keeps `clone_session`
+/// modeling an independent second device rather than a second handle onto
+/// the same one.
 #[derive(Clone)]
 pub struct SessionClient {
     router: Router,
-    cookie: Option<String>,
     extra_cookies: RefCell<HashMap<String, String>>,
 }
 
@@ -333,21 +335,20 @@ impl SessionClient {
         }
     }
 
-    /// The `Cookie:` request header value: the long-lived session cookie (if
-    /// any) plus every short-lived cookie a previous response set.
+    /// The `Cookie:` request header value: every cookie in the jar, session
+    /// cookie included — see the `extra_cookies` doc comment on why there is
+    /// only one jar rather than a session cookie plus extras.
     fn cookie_header(&self) -> Option<String> {
-        let extra = self
-            .extra_cookies
-            .borrow()
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>();
-        let all = self.cookie.iter().cloned().chain(extra).collect::<Vec<_>>();
-        if all.is_empty() {
-            None
-        } else {
-            Some(all.join("; "))
+        let jar = self.extra_cookies.borrow();
+        if jar.is_empty() {
+            return None;
         }
+        Some(
+            jar.iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     }
 
     /// Records every `Set-Cookie` a response sent, so the next call on this
@@ -416,4 +417,52 @@ fn router_with_ctx(ctx: AppCtx) -> Router {
     .layer(middleware::from_fn(auth::middleware::attach))
     .layer(Extension(ctx))
     .with_state(leptos_options)
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use axum::http::HeaderValue;
+
+    use super::*;
+
+    /// A client that already holds a session cookie, without building a
+    /// whole `TestApp` — `cookie_header`/`absorb_set_cookies` never touch
+    /// `router`.
+    fn client_with_session(token: &str) -> SessionClient {
+        SessionClient {
+            router: Router::new(),
+            extra_cookies: RefCell::new(HashMap::from([(
+                session::COOKIE_NAME.to_string(),
+                token.to_string(),
+            )])),
+        }
+    }
+
+    /// `passkey_login_finish` reissues the session cookie on a passkey
+    /// sign-in; a client that already held one must send exactly the new
+    /// value, not both.
+    #[test]
+    fn a_reissued_session_cookie_replaces_rather_than_accumulates() {
+        let client = client_with_session("OLD");
+
+        let mut set_cookie = header::HeaderMap::new();
+        set_cookie.append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&format!("{}=NEW; Path=/; HttpOnly", session::COOKIE_NAME))
+                .expect("header value"),
+        );
+        client.absorb_set_cookies(&set_cookie);
+
+        let sent = client.cookie_header().expect("a cookie header");
+        let name_eq = format!("{}=", session::COOKIE_NAME);
+        assert_eq!(
+            sent.matches(&name_eq).count(),
+            1,
+            "must send exactly one {name_eq}, got: {sent:?}"
+        );
+        assert!(
+            sent.contains(&format!("{name_eq}NEW")),
+            "must carry the reissued value, got: {sent:?}"
+        );
+    }
 }

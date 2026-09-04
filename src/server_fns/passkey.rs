@@ -423,3 +423,49 @@ pub async fn passkey_delete(id: i32) -> Result<(), ServerFnError> {
         Err(super::server_err("That passkey no longer exists."))
     }
 }
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use webauthn_rs::prelude::*;
+
+    use super::*;
+    use crate::passkey::webauthn::build_from_env;
+
+    /// Pins the two wire-format edits `augment_creation_options` makes,
+    /// against a *real* serialized challenge from the current webauthn-rs —
+    /// not a hand-rolled JSON literal, so a dependency upgrade that renames
+    /// a field (e.g. `residentKey`, or drops the unmodeled `prf` extension
+    /// slot) fails this test instead of silently shipping. Both failure
+    /// modes are silent otherwise: a missing `residentKey` breaks
+    /// username-less sign-in only for providers that honor it, and a
+    /// missing `extensions.prf` is not discoverable until phase 2, by which
+    /// point affected credentials would need deleting and re-enrolling
+    /// (spec section 9.3).
+    ///
+    /// Asserted on the serialized JSON, not the Rust struct — the whole
+    /// point is that this is an edit webauthn-rs has no typed API for, so a
+    /// struct-level assertion would not catch a serde rename either.
+    #[test]
+    fn augments_a_real_creation_challenge_with_both_edits() {
+        let wa = build_from_env();
+        let (ccr, _reg) = wa
+            .start_passkey_registration(
+                Uuid::new_v4(),
+                "alice@example.com",
+                "alice@example.com",
+                None,
+            )
+            .expect("start registration");
+        let mut ccr_json = serde_json::to_value(&ccr).expect("serialize ccr");
+
+        augment_creation_options(&mut ccr_json);
+
+        let selection = &ccr_json["publicKey"]["authenticatorSelection"];
+        assert_eq!(selection["residentKey"], "required");
+        assert_eq!(selection["requireResidentKey"], true);
+        assert!(
+            ccr_json["publicKey"]["extensions"]["prf"].is_object(),
+            "extensions.prf missing: {ccr_json}"
+        );
+    }
+}
