@@ -23,7 +23,7 @@ use leptos::logging::error;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use super::{StorageError, StorageKey, load, store};
+use super::{Backend, StorageError, StorageKey, load, store};
 
 /// A value persisted across reloads, with the load state made explicit.
 #[derive(Clone, Copy)]
@@ -48,7 +48,10 @@ impl Persistent {
             // But it must not be silent either — Safari private browsing and a
             // quota-exceeded `setItem` both throw, and the user would otherwise
             // lose data with nothing in the console to explain why.
-            if let Err(err) = store(key, &value).await {
+            //
+            // Backend is hardcoded to `Local` here; Task 17 makes this
+            // reactive to sign-in state.
+            if let Err(err) = store(Backend::Local, key, &value).await {
                 error!("failed to persist value for {key:?}: {err}");
             }
         });
@@ -84,9 +87,12 @@ pub fn use_persistent(key: StorageKey) -> Persistent {
     // `Effect::new` never runs during SSR, and on the client it runs *after*
     // the first render — so the DOM has already been matched by the time this
     // can change anything.
+    //
+    // Backend is hardcoded to `Local` here; Task 17 makes this reactive to
+    // sign-in state.
     Effect::new(move |_| {
         spawn_local(async move {
-            set_value.set(Some(loaded_value(load(key).await)));
+            set_value.set(Some(loaded_value(load(Backend::Local, key).await)));
         });
     });
 

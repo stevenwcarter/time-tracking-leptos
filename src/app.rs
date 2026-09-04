@@ -45,7 +45,11 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn HomePage() -> impl IntoView {
-    let entry = use_persistent(StorageKey::TimeEntry);
+    // `StorageKey::TimeEntry` now carries the day being viewed. Task 19
+    // rewrites this component to take that day from the route; a fixed date
+    // is a placeholder that compiles on every target until then.
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+    let entry = use_persistent(StorageKey::TimeEntry(today));
 
     view! {
         <div class="min-h-screen bg-gray-50">
