@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+@source "../src/**/*.rs";
+
+/* The summary panel's value slots are blank until storage is read
+   (see spec §5). Reserve their height so the fill-in does not shift
+   layout. */
+@layer components {
+    .value-slot {
+        min-height: 1.75rem;
+    }
+}
