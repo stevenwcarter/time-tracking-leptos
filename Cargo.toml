@@ -80,7 +80,9 @@ lettre = { version = "0.11", default-features = false, features = [
 ring = { version = "0.17", optional = true }
 base64 = { version = "0.22", optional = true }
 hex = { version = "0.4", optional = true }
-uuid = { version = "1", features = ["v7"], optional = true }
+# v5: a stable per-user UUID for WebAuthn registration, derived from the
+# user's email so re-registering never creates a second WebAuthn "user".
+uuid = { version = "1", features = ["v7", "v5"], optional = true }
 anyhow = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

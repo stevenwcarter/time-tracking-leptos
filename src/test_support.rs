@@ -10,6 +10,9 @@
 //! HTTP, and inspect captured mail; [`signed_in_as`] builds on it to mint a
 //! real session cookie without sending mail or consuming a magic link.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use axum::body::Body;
 use axum::extract::{Extension, State};
 use axum::http::{Request, header};
@@ -25,6 +28,7 @@ use tower::ServiceExt;
 
 use crate::app::{App, shell};
 use crate::context::AppCtx;
+use crate::dto::PasskeyListItem;
 use crate::{auth, db, email, session};
 
 /// Root-level static files that must be routed explicitly.
@@ -145,6 +149,7 @@ impl TestApp {
         SessionClient {
             router: self.router.clone(),
             cookie: None,
+            extra_cookies: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -166,6 +171,7 @@ pub async fn signed_in_as(app: &TestApp, email: &str) -> SessionClient {
     SessionClient {
         router: app.router.clone(),
         cookie: Some(format!("{}={token}", session::COOKIE_NAME)),
+        extra_cookies: RefCell::new(HashMap::new()),
     }
 }
 
@@ -173,10 +179,21 @@ pub async fn signed_in_as(app: &TestApp, email: &str) -> SessionClient {
 /// [`TestApp::anonymous`], none) and driving requests through the real
 /// router — including the session middleware and `require_user` — rather
 /// than calling repository functions directly.
+///
+/// `extra_cookies` holds whatever short-lived cookies a response has set
+/// (the WebAuthn ceremony state cookie, chiefly) so a follow-up call on the
+/// same client carries them back, the way a browser's cookie jar would. It
+/// is a `RefCell`, not a plain field, so `call` can update it from `&self` —
+/// every server-fn method here reads like a stateless request even though
+/// this one piece of it is not. `#[derive(Clone)]` still snapshots it by
+/// value (a `RefCell<T>` clones `T`, it does not share it), which is what
+/// keeps `clone_session` modeling an independent second device rather than
+/// a second handle onto the same one.
 #[derive(Clone)]
 pub struct SessionClient {
     router: Router,
     cookie: Option<String>,
+    extra_cookies: RefCell<HashMap<String, String>>,
 }
 
 impl SessionClient {
@@ -217,6 +234,60 @@ impl SessionClient {
         self.call("session/logout_all", &[]).await
     }
 
+    /// Starts a passkey enrolment ceremony, returning the serialized
+    /// creation challenge.
+    pub async fn passkey_register_start(&self) -> Result<String, String> {
+        self.call("passkey/register_start", &[]).await
+    }
+
+    /// Completes a passkey enrolment ceremony.
+    pub async fn passkey_register_finish(
+        &self,
+        response_json: &str,
+        prf_capable: bool,
+    ) -> Result<(), String> {
+        let prf_capable = if prf_capable { "true" } else { "false" };
+        self.call(
+            "passkey/register_finish",
+            &[
+                ("response_json", response_json),
+                ("prf_capable", prf_capable),
+            ],
+        )
+        .await
+    }
+
+    /// Starts a passkey sign-in ceremony, returning the serialized request
+    /// challenge. `None` drives the username-less, discoverable flow.
+    pub async fn passkey_login_start(&self, email: Option<&str>) -> Result<String, String> {
+        match email {
+            Some(email) => self.call("passkey/login_start", &[("email", email)]).await,
+            None => self.call("passkey/login_start", &[]).await,
+        }
+    }
+
+    /// Completes a passkey sign-in ceremony.
+    pub async fn passkey_login_finish(&self, response_json: &str) -> Result<(), String> {
+        self.call("passkey/login_finish", &[("response_json", response_json)])
+            .await
+    }
+
+    /// This client's enrolled passkeys, newest first.
+    pub async fn passkey_list(&self) -> Result<Vec<PasskeyListItem>, String> {
+        self.call("passkey/list", &[]).await
+    }
+
+    pub async fn passkey_rename(&self, id: i32, name: &str) -> Result<(), String> {
+        let id = id.to_string();
+        self.call("passkey/rename", &[("id", &id), ("name", name)])
+            .await
+    }
+
+    pub async fn passkey_delete(&self, id: i32) -> Result<(), String> {
+        let id = id.to_string();
+        self.call("passkey/delete", &[("id", &id)]).await
+    }
+
     /// Posts a URL-encoded form body to `/api/{endpoint}` with this client's
     /// cookie, if any, and decodes a JSON response.
     ///
@@ -240,8 +311,9 @@ impl SessionClient {
             .method("POST")
             .uri(format!("/api/{endpoint}"))
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
-        if let Some(cookie) = &self.cookie {
-            req = req.header(header::COOKIE, cookie.clone());
+        let cookie_header = self.cookie_header();
+        if let Some(cookie_header) = &cookie_header {
+            req = req.header(header::COOKIE, cookie_header.clone());
         }
         let res = self
             .router
@@ -249,6 +321,7 @@ impl SessionClient {
             .oneshot(req.body(Body::from(body)).expect("request"))
             .await
             .expect("response");
+        self.absorb_set_cookies(res.headers());
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024)
             .await
@@ -257,6 +330,46 @@ impl SessionClient {
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())
         } else {
             Err(String::from_utf8_lossy(&bytes).into_owned())
+        }
+    }
+
+    /// The `Cookie:` request header value: the long-lived session cookie (if
+    /// any) plus every short-lived cookie a previous response set.
+    fn cookie_header(&self) -> Option<String> {
+        let extra = self
+            .extra_cookies
+            .borrow()
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>();
+        let all = self.cookie.iter().cloned().chain(extra).collect::<Vec<_>>();
+        if all.is_empty() {
+            None
+        } else {
+            Some(all.join("; "))
+        }
+    }
+
+    /// Records every `Set-Cookie` a response sent, so the next call on this
+    /// same client replays it — a minimal stand-in for a browser's cookie
+    /// jar. A cookie cleared with an empty value (`Max-Age=0`, as
+    /// `passkey::state::clear_cookie_header` sends) is dropped rather than
+    /// stored, matching a browser deleting it.
+    fn absorb_set_cookies(&self, headers: &header::HeaderMap) {
+        let mut jar = self.extra_cookies.borrow_mut();
+        for raw in headers.get_all(header::SET_COOKIE) {
+            let Ok(raw) = raw.to_str() else { continue };
+            let Some(pair) = raw.split(';').next() else {
+                continue;
+            };
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if value.is_empty() {
+                jar.remove(name);
+            } else {
+                jar.insert(name.to_string(), value.to_string());
+            }
         }
     }
 }
