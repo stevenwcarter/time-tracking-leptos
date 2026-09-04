@@ -61,6 +61,14 @@ pub async fn load(key: StorageKey) -> Result<Option<String>, StorageError> {
 }
 
 /// Writes a value, replacing any previous one. A no-op under `ssr`.
+///
+/// Unlike `load`/`clear`, this is a plain fn that builds the future by hand:
+/// `value` is copied into an owned `String` *before* the `async move` block.
+/// That is load-bearing, not style — `Persistent::set` in `hook.rs` hands this
+/// future to `spawn_local`, which requires `'static`. A plain
+/// `async fn store(_, value: &str)` would instead capture the caller's
+/// borrow, so the future could only live as long as `value`, failing that
+/// bound. Do not "simplify" this to match its siblings.
 pub fn store(key: StorageKey, value: &str) -> impl Future<Output = Result<(), StorageError>> {
     let value = value.to_owned();
     async move {

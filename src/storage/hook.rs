@@ -22,7 +22,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use super::{StorageKey, load, store};
+use super::{StorageError, StorageKey, load, store};
 
 /// A value persisted across reloads, with the load state made explicit.
 #[derive(Clone, Copy)]
@@ -54,6 +54,14 @@ impl Persistent {
     }
 }
 
+/// Collapses a storage read into the loaded state.
+///
+/// Both "nothing stored" and "the read failed" become loaded-and-empty:
+/// leaving the value unloaded on error would strand the UI blank forever.
+fn loaded_value(read: Result<Option<String>, StorageError>) -> String {
+    read.ok().flatten().unwrap_or_default()
+}
+
 /// Reads `key` from storage after hydration, exposing the tri-state above.
 pub fn use_persistent(key: StorageKey) -> Persistent {
     // Identical on server and client, which is what makes hydration match.
@@ -64,10 +72,7 @@ pub fn use_persistent(key: StorageKey) -> Persistent {
     // can change anything.
     Effect::new(move |_| {
         spawn_local(async move {
-            // A read failure is indistinguishable from "nothing stored" as far
-            // as the UI is concerned: either way we are now loaded and empty.
-            let stored = load(key).await.ok().flatten().unwrap_or_default();
-            set_value.set(Some(stored));
+            set_value.set(Some(loaded_value(load(key).await)));
         });
     });
 
@@ -75,5 +80,25 @@ pub fn use_persistent(key: StorageKey) -> Persistent {
         value,
         set_value,
         key,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn found_value_is_loaded_as_is() {
+        assert_eq!(loaded_value(Ok(Some("saved".to_string()))), "saved");
+    }
+
+    #[test]
+    fn nothing_stored_becomes_loaded_and_empty() {
+        assert_eq!(loaded_value(Ok(None)), "");
+    }
+
+    #[test]
+    fn read_failure_becomes_loaded_and_empty() {
+        assert_eq!(loaded_value(Err(StorageError::Unavailable)), "");
     }
 }
