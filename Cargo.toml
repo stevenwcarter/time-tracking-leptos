@@ -1,38 +1,92 @@
 [package]
-name = "time-tracking-dioxus"
+name = "time-tracking-leptos"
 version = "0.1.3"
 authors = ["Steven Carter <steve@javapl.us>"]
-edition = "2021"
+edition = "2024"
 publish = false
+default-run = "time-tracking-leptos"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "time-tracking-leptos"
+path = "src/main.rs"
 
 [dependencies]
-dioxus = { version = "0.6.0", features = [] }
-dioxus-clipboard = "0.2.0"
-gloo-storage = "0.3.0"
-serde = "1.0.219"
+# Always-on — compiled into both the server binary and the wasm bundle.
+leptos = { version = "0.8", features = ["nightly"] }
+leptos_router = { version = "0.8", features = ["nightly"] }
+leptos_meta = "0.8"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
 time-tracking-parser = { git = "https://github.com/stevenwcarter/time-tracking-parser" }
-wasm-bindgen = "0.2.100"
-wasm-bindgen-futures = "0.4.50"
-web-sys = { version = "0.3.77", features = [
+
+# Hydrate-only (wasm).
+console_error_panic_hook = { version = "0.1", optional = true }
+wasm-bindgen = { version = "0.2.100", optional = true }
+wasm-bindgen-futures = { version = "0.4.50", optional = true }
+web-sys = { version = "0.3.77", optional = true, features = [
   "Clipboard",
   "Navigator",
+  "Storage",
   "Window",
 ] }
 
+# SSR-only (server binary).
+axum = { version = "0.8", optional = true }
+leptos_axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+tower-http = { version = "0.6", features = ["fs", "compression-gzip"], optional = true }
+
 [features]
-default = ["web"]
-web = ["dioxus/web"]
-desktop = ["dioxus/desktop"]
-mobile = ["dioxus/mobile"]
+default = []
+hydrate = [
+  "leptos/hydrate",
+  "dep:console_error_panic_hook",
+  "dep:wasm-bindgen",
+  "dep:wasm-bindgen-futures",
+  "dep:web-sys",
+]
+ssr = [
+  "leptos/ssr",
+  "leptos_meta/ssr",
+  "leptos_router/ssr",
+  "dep:leptos_axum",
+  "dep:axum",
+  "dep:tokio",
+  "dep:tower",
+  "dep:tower-http",
+]
 
-[profile.wasm-dev]
-inherits = "dev"
-opt-level = 1
+[profile.release]
+codegen-units = 1
+opt-level = 'z'
+lto = true
 
-[profile.server-dev]
-inherits = "dev"
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = "abort"
 
-[profile.android-dev]
-inherits = "dev"
+[package.metadata.leptos]
+output-name          = "time-tracking-leptos"
+site-root            = "target/site"
+site-pkg-dir         = "pkg"
+# Local dev only. The Docker image overrides this with LEPTOS_SITE_ADDR=0.0.0.0:80,
+# because binding port 80 locally would need privileges.
+site-addr            = "127.0.0.1:3000"
+reload-port          = 3001
+assets-dir           = "public"
+tailwind-input-file  = "style/tailwind.css"
+browserquery         = "defaults"
+env                  = "DEV"
+bin-features         = ["ssr"]
+bin-default-features = false
+lib-features         = ["hydrate"]
+lib-default-features = false
+lib-profile-release  = "wasm-release"
