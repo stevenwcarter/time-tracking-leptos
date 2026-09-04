@@ -101,7 +101,7 @@ mod tests {
         );
         assert!(html.contains("How to use this tool"), "help toggle missing");
         assert!(
-            html.contains("11:45-12:15 code1"),
+            html.contains("whitespace-pre-wrap"),
             "help sample block missing — it must be in the SSR'd HTML, not \
              mounted client-side, or hydration sees a different node count"
         );
