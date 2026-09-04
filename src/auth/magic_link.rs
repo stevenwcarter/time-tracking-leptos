@@ -52,7 +52,9 @@ pub fn ttl() -> Duration {
 }
 
 fn hash(token: &str) -> Vec<u8> {
-    digest::digest(&digest::SHA256, token.as_bytes()).as_ref().to_vec()
+    digest::digest(&digest::SHA256, token.as_bytes())
+        .as_ref()
+        .to_vec()
 }
 
 /// Creates a token row and returns the raw token to embed in a URL.
@@ -60,8 +62,8 @@ fn hash(token: &str) -> Vec<u8> {
 /// The returned string is the only copy; it is not recoverable from the
 /// database afterwards, since only its hash is stored.
 pub fn mint(conn: &mut DbConn, email: &str, ttl: Duration) -> Result<String> {
-    let normalized =
-        user::normalize_email(email).ok_or_else(|| anyhow::anyhow!("not a usable email address"))?;
+    let normalized = user::normalize_email(email)
+        .ok_or_else(|| anyhow::anyhow!("not a usable email address"))?;
     let token = Uuid::now_v7().to_string();
     let now = Utc::now().naive_utc();
 
@@ -95,17 +97,21 @@ pub fn consume(conn: &mut DbConn, token: &str) -> Result<ConsumeResult> {
     // impl `transaction`'s generic `E` should resolve to, and diesel provides
     // more than one.
     conn.transaction(|conn| -> Result<ConsumeResult, diesel::result::Error> {
-        let row: Option<(i32, String, Option<chrono::NaiveDateTime>, chrono::NaiveDateTime)> =
-            magic_link_token::table
-                .filter(magic_link_token::token_hash.eq(&token_hash))
-                .select((
-                    magic_link_token::id,
-                    magic_link_token::email,
-                    magic_link_token::used_at,
-                    magic_link_token::expires_at,
-                ))
-                .first(conn)
-                .optional()?;
+        let row: Option<(
+            i32,
+            String,
+            Option<chrono::NaiveDateTime>,
+            chrono::NaiveDateTime,
+        )> = magic_link_token::table
+            .filter(magic_link_token::token_hash.eq(&token_hash))
+            .select((
+                magic_link_token::id,
+                magic_link_token::email,
+                magic_link_token::used_at,
+                magic_link_token::expires_at,
+            ))
+            .first(conn)
+            .optional()?;
 
         let Some((id, email, used_at, expires_at)) = row else {
             return Ok(ConsumeResult::NotFound);
@@ -116,7 +122,9 @@ pub fn consume(conn: &mut DbConn, token: &str) -> Result<ConsumeResult> {
         }
 
         let updated = diesel::update(
-            magic_link_token::table.find(id).filter(magic_link_token::used_at.is_null()),
+            magic_link_token::table
+                .find(id)
+                .filter(magic_link_token::used_at.is_null()),
         )
         .set(magic_link_token::used_at.eq(now))
         .execute(conn)?;
@@ -144,7 +152,9 @@ mod tests {
         let token = mint(&mut conn, "alice@example.com", Duration::minutes(15)).expect("mint");
         assert_eq!(
             consume(&mut conn, &token).expect("consume"),
-            ConsumeResult::Consumed { email: "alice@example.com".to_string() }
+            ConsumeResult::Consumed {
+                email: "alice@example.com".to_string()
+            }
         );
     }
 
@@ -158,7 +168,9 @@ mod tests {
         consume(&mut conn, &token).expect("first consume");
         assert_eq!(
             consume(&mut conn, &token).expect("second consume"),
-            ConsumeResult::Stale { email: "alice@example.com".to_string() }
+            ConsumeResult::Stale {
+                email: "alice@example.com".to_string()
+            }
         );
     }
 
@@ -169,7 +181,9 @@ mod tests {
         let token = mint(&mut conn, "alice@example.com", Duration::seconds(-1)).expect("mint");
         assert_eq!(
             consume(&mut conn, &token).expect("consume"),
-            ConsumeResult::Stale { email: "alice@example.com".to_string() }
+            ConsumeResult::Stale {
+                email: "alice@example.com".to_string()
+            }
         );
     }
 
@@ -198,8 +212,17 @@ mod tests {
             .select(magic_link_token::token_hash)
             .first(&mut conn)
             .expect("row exists");
-        assert_ne!(stored, token.as_bytes(), "token must be hashed, not stored raw");
+        assert_ne!(
+            stored,
+            token.as_bytes(),
+            "token must be hashed, not stored raw"
+        );
         assert_eq!(stored.len(), 32, "SHA-256 is 32 bytes");
+        assert_eq!(
+            stored,
+            digest::digest(&digest::SHA256, token.as_bytes()).as_ref(),
+            "stored value must be SHA-256 of the token itself, not of some other input"
+        );
     }
 
     /// Two tokens minted back to back must differ, or one user's link would
@@ -239,7 +262,9 @@ mod tests {
         let token = mint(&mut conn, "  Alice@Example.COM ", Duration::minutes(15)).expect("mint");
         assert_eq!(
             consume(&mut conn, &token).expect("consume"),
-            ConsumeResult::Consumed { email: "alice@example.com".to_string() }
+            ConsumeResult::Consumed {
+                email: "alice@example.com".to_string()
+            }
         );
     }
 }
