@@ -24,7 +24,12 @@ RUN curl -L \
 WORKDIR /build
 COPY . .
 
-RUN cargo leptos build --release
+# --precompress ships .gz/.br siblings next to the wasm/js/css bundle;
+# leptos_axum's file_and_error_handler (main.rs's fallback) already serves
+# them via .precompressed_gzip()/.precompressed_br() when present. This is a
+# CLI flag, not a [package.metadata.leptos] key — cargo-leptos 0.3.7 ignores
+# `precompress` there and warns "not recognized".
+RUN cargo leptos build --release --precompress
 
 # Not the :nonroot variant — the app binds port 80, which needs privileges.
 FROM gcr.io/distroless/cc-debian12 AS runtime
