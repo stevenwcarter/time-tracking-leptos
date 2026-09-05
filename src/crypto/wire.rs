@@ -36,6 +36,56 @@ pub const APP_SALT: &[u8; 32] = &[
     0x7b, 0x28, 0x57, 0x11, 0x63, 0xc3, 0xd9, 0x2e, 0x8c, 0x00, 0x83, 0xcd, 0x3a, 0xb1, 0x34, 0xa9,
 ];
 
+/// How a wrap is opened: which secret derives the key-encryption key that
+/// unwraps it.
+///
+/// Lives here, beside the two `info` strings it selects between, rather than
+/// in `entry_key`. Both halves of the app need it — the server writes and
+/// reads it as the `entry_key_wrap.kind` column, the browser parses it back
+/// out of [`crate::dto::WrapDto`] to choose a route — and `entry_key` is
+/// `ssr`-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapKind {
+    /// Unwrapped by a key derived from one credential's PRF output.
+    Passkey,
+    /// Unwrapped by a key derived from the account's recovery code.
+    Recovery,
+}
+
+impl WrapKind {
+    /// The stored form, in the column and on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WrapKind::Passkey => "passkey",
+            WrapKind::Recovery => "recovery",
+        }
+    }
+
+    /// Reads the stored form back. `None` for anything this build does not
+    /// know, which each caller handles rather than guesses at.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "passkey" => Some(WrapKind::Passkey),
+            "recovery" => Some(WrapKind::Recovery),
+            _ => None,
+        }
+    }
+
+    /// The HKDF `info` this route's key-encryption key is derived with.
+    ///
+    /// The only mapping between a route and its `info`, and the reason it is
+    /// a mapping at all: `deriveKey` takes `info` as a plain byte string and
+    /// cannot tell the two apart, so a wrap made under the other route's
+    /// `info` is a well-formed wrap that no device will ever open, failing
+    /// exactly the way a corrupt row does (invariant E6).
+    pub fn info(self) -> &'static [u8] {
+        match self {
+            WrapKind::Passkey => INFO_PASSKEY,
+            WrapKind::Recovery => INFO_RECOVERY,
+        }
+    }
+}
+
 /// A nonce and the AES-GCM output that goes with it. WebCrypto returns
 /// `ciphertext ‖ tag` as a single buffer, so `ciphertext` includes the tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +197,24 @@ mod tests {
         use sha2::{Digest, Sha256};
         let expected = Sha256::digest(b"time-tracking-leptos/entry-key/v1");
         assert_eq!(APP_SALT, expected.as_slice());
+    }
+
+    /// The other half of E6. [`derivation_inputs_are_pinned`] fixes the two
+    /// `info` strings; this fixes which route uses which. Nothing downstream
+    /// could catch them swapped — `deriveKey` would succeed, the wrap would
+    /// be well-formed, and it would simply never open.
+    #[test]
+    fn each_kind_keeps_its_own_info_string() {
+        assert_eq!(WrapKind::Passkey.info(), INFO_PASSKEY);
+        assert_eq!(WrapKind::Recovery.info(), INFO_RECOVERY);
+    }
+
+    #[test]
+    fn as_str_and_parse_round_trip() {
+        for kind in [WrapKind::Passkey, WrapKind::Recovery] {
+            assert_eq!(WrapKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(WrapKind::parse("bogus"), None);
     }
 
     #[test]

@@ -15,10 +15,11 @@ pub struct PasskeyListItem {
 
 /// One route to the account's data key, as seen from the browser.
 ///
-/// `kind` travels as a `String` rather than `entry_key::WrapKind`: that enum
-/// lives behind Diesel, which does not exist in the wasm bundle, so this
-/// type — not that one — is what a server function can return and the
-/// browser can select a route from.
+/// `kind` travels as the stored `String` rather than as
+/// [`crate::crypto::wire::WrapKind`], and stays one: a row whose kind a
+/// future build writes and this one does not know still deserializes, and
+/// `crypto::choose_route` skips that row instead of the whole response
+/// failing to parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapDto {
     pub kind: String,

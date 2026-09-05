@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use chrono::{NaiveDateTime, Utc};
 use diesel::prelude::*;
 
+use crate::crypto::wire::WrapKind;
 use crate::db::DbConn;
-use crate::entry_key::WrapKind;
 use crate::schema::{entry_key_wrap, user};
 
 /// Recorded per row for the same reason the envelope carries `alg`: a future
