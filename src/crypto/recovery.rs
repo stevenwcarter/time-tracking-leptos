@@ -119,7 +119,9 @@ mod tests {
 
     #[test]
     fn formatting_is_deterministic_and_reversible() {
-        let bytes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+        let bytes = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ];
         let code = format_code(&bytes);
         assert_eq!(normalize(&code).expect("normalize"), bytes.to_vec());
     }
@@ -180,7 +182,10 @@ mod tests {
     #[test]
     fn characters_outside_the_alphabet_are_rejected() {
         let bad = format!("U{}", "0".repeat(CODE_CHARS - 1));
-        assert!(matches!(normalize(&bad), Err(RecoveryError::Character('U'))));
+        assert!(matches!(
+            normalize(&bad),
+            Err(RecoveryError::Character('U'))
+        ));
     }
 
     /// 160 bits. Anything less and the "no rate limiting needed" argument in

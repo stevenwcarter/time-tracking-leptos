@@ -219,7 +219,10 @@ mod tests {
             let decoded = decode_v2(&raw).expect("decode");
 
             let plain = cipher()
-                .decrypt(Nonce::from_slice(&decoded.nonce), decoded.ciphertext.as_ref())
+                .decrypt(
+                    Nonce::from_slice(&decoded.nonce),
+                    decoded.ciphertext.as_ref(),
+                )
                 .expect("decrypt");
             assert_eq!(plain, b"11:45-12:15 code1");
         }
@@ -242,7 +245,10 @@ mod tests {
             .expect("decode");
             assert!(
                 cipher()
-                    .decrypt(Nonce::from_slice(&decoded.nonce), decoded.ciphertext.as_ref())
+                    .decrypt(
+                        Nonce::from_slice(&decoded.nonce),
+                        decoded.ciphertext.as_ref()
+                    )
                     .is_err()
             );
         }
