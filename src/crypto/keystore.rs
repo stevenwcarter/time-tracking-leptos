@@ -31,6 +31,13 @@
 //!    them must land the session on `Locked` with an unlock prompt. The user
 //!    still has their passkey and their recovery code; a panic would take
 //!    both away from them.
+//! 3. [`put`] and [`clear`] await the transaction's `complete` event, not
+//!    the request's `success` (see [`write`]). An aborted transaction is
+//!    rolled back in full, so a request that succeeded inside one has
+//!    changed nothing. That matters most for [`clear`], which is what
+//!    "Lock now" and sign-out call: returning `Ok` there while the delete
+//!    was rolled back would report that the device had forgotten its key
+//!    while leaving the key exactly where it was.
 //!
 //! No error raised here carries key material: failures name the IndexedDB
 //! operation and the `DOMException` that ended it, nothing else.
@@ -38,7 +45,7 @@
 use js_sys::{Function, Object, Promise, Reflect};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{IdbDatabase, IdbObjectStore, IdbRequest, IdbTransactionMode};
+use web_sys::{IdbDatabase, IdbObjectStore, IdbRequest, IdbTransaction, IdbTransactionMode};
 
 use super::subtle::{CryptoError, DataKey, failed, js_object};
 
@@ -175,25 +182,79 @@ fn store(db: &IdbDatabase, mode: IdbTransactionMode) -> Result<IdbObjectStore, C
         .map_err(|e| failed("objectStore", &e))
 }
 
-/// Writes the record, replacing whatever was under `"dek"`.
+/// Awaits a transaction's `complete` event, or its abort.
 ///
-/// What is awaited is the request, not the transaction's commit. A commit
-/// that then fails — a full disk, an eviction — leaves the device with no
-/// stored key, which is exactly the state it was in before: the next load
-/// lands on `Locked` and asks for an unlock.
+/// The counterpart to [`settle`] one level up: a request's `success` fires
+/// while its transaction is still open, and an abort after that rolls the
+/// request's write back in full. Only `complete` says the change survived.
+///
+/// An unhandled request error aborts the transaction, so every failure
+/// reaches `onabort` and this promise always settles.
+fn committed(transaction: &IdbTransaction) -> Promise {
+    let transaction = transaction.clone();
+    Promise::new(&mut |resolve, reject| {
+        let on_complete = Closure::once_into_js(move || {
+            resolve.call1(&JsValue::UNDEFINED, &JsValue::UNDEFINED).ok();
+        });
+        transaction.set_oncomplete(Some(on_complete.unchecked_ref()));
+
+        let aborted = transaction.clone();
+        let on_abort = Closure::once_into_js(move || {
+            let thrown = match aborted.error() {
+                Some(exception) => exception.into(),
+                None => reason("the transaction was aborted"),
+            };
+            reject.call1(&JsValue::UNDEFINED, &thrown).ok();
+        });
+        transaction.set_onabort(Some(on_abort.unchecked_ref()));
+    })
+}
+
+/// Issues one write and waits for its **transaction** to commit.
+///
+/// What is awaited is the `complete` event, not just the request's
+/// `success`. IndexedDB rolls an aborted transaction back in full — a quota
+/// failure, an eviction, a tab closing mid-transaction — so a request that
+/// succeeded inside one that later aborted has changed nothing. For
+/// [`clear`] the difference is the difference between a security control
+/// that worked and one that said it had while leaving the old key
+/// retrievable; for [`put`] it only means one extra unlock prompt, but a
+/// single behaviour is simpler than two.
+///
+/// Both promises are created before the first `await`, and deliberately:
+/// `complete` fires as soon as the request's own success handler returns, so
+/// a handler attached after awaiting the request would be waiting for an
+/// event that had already happened, and the call would hang.
+async fn write(
+    db: &IdbDatabase,
+    operation: &str,
+    issue: impl FnOnce(&IdbObjectStore) -> Result<IdbRequest, JsValue>,
+) -> Result<(), CryptoError> {
+    let store = store(db, IdbTransactionMode::Readwrite)?;
+    let transaction = store.transaction();
+    let request = issue(&store).map_err(|e| failed(operation, &e))?;
+    let settled = settle(&request);
+    let committed = committed(&transaction);
+
+    JsFuture::from(settled)
+        .await
+        .map_err(|e| failed(operation, &e))?;
+    JsFuture::from(committed)
+        .await
+        .map_err(|e| failed(&format!("{operation} commit"), &e))?;
+    Ok(())
+}
+
+/// Writes the record, replacing whatever was under `"dek"`.
 async fn put_in(db: &IdbDatabase, user: &str, key: &DataKey) -> Result<(), CryptoError> {
     let record = js_object(&[
         (USER_FIELD, JsValue::from_str(user)),
         (KEY_FIELD, key.as_object().clone().into()),
     ]);
-    let request = store(db, IdbTransactionMode::Readwrite)?
-        .put_with_key(&record, &RECORD.into())
-        .map_err(|e| failed("put", &e))?;
-
-    JsFuture::from(settle(&request))
-        .await
-        .map_err(|e| failed("put", &e))?;
-    Ok(())
+    write(db, "put", |store| {
+        store.put_with_key(&record, &RECORD.into())
+    })
+    .await
 }
 
 /// Reads the record and decides whether it belongs to `user`.
@@ -240,16 +301,9 @@ async fn get_from(db: &IdbDatabase, user: &str) -> Result<Option<DataKey>, Crypt
     Ok(Some(key))
 }
 
-/// Removes the record.
+/// Removes the record, and returns `Ok` only once that has committed.
 async fn delete_from(db: &IdbDatabase) -> Result<(), CryptoError> {
-    let request = store(db, IdbTransactionMode::Readwrite)?
-        .delete(&RECORD.into())
-        .map_err(|e| failed("delete", &e))?;
-
-    JsFuture::from(settle(&request))
-        .await
-        .map_err(|e| failed("delete", &e))?;
-    Ok(())
+    write(db, "delete", |store| store.delete(&RECORD.into())).await
 }
 
 /// Removes the record on a read path that refuses to hand its key back,
@@ -293,6 +347,10 @@ pub async fn get(user: &str) -> Result<Option<DataKey>, CryptoError> {
 ///
 /// Deleting a record that is not there succeeds, so this is safe to call
 /// unconditionally — including on a device that never stored one.
+///
+/// `Ok` means the delete committed, not merely that the request reported
+/// success; see [`write`]. A caller may tell the user their key is gone from
+/// this device on the strength of it.
 pub async fn clear() -> Result<(), CryptoError> {
     let db = open_db().await?;
     let cleared = delete_from(&db).await;
