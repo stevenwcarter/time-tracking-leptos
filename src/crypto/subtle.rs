@@ -12,8 +12,13 @@
 //! The three things a reviewer should check by eye, because nothing else
 //! will:
 //!
-//! 1. [`unwrap_dek`] is called with [`Extractable::Sealed`] everywhere except
-//!    the single add-a-passkey path of spec section 6.5 (invariant E5).
+//! 1. The extractable handle — a [`RawDataKey`], from
+//!    [`generate_dek_extractable`] or [`unwrap_dek_raw`] — appears only in
+//!    the enable ceremony of spec section 6.1 and the single add-a-passkey
+//!    path of spec section 6.5, and is dropped as soon as it has been
+//!    wrapped. Every other holder of the data key has a [`DataKey`], which
+//!    cannot be exported and cannot be turned into a [`RawDataKey`]
+//!    (invariant E5).
 //! 2. [`seal`] draws a fresh nonce per call and takes none from its caller.
 //! 3. [`derive_kek`] passes [`APP_SALT`], never a fresh random salt
 //!    (invariant E6).
@@ -38,42 +43,53 @@ use super::wire::{self, APP_SALT, NONCE_LEN};
 #[error("{0}")]
 pub struct CryptoError(pub String);
 
-/// A live, non-extractable AES-256-GCM key. Cloneable because `CryptoKey` is
-/// a JS handle; cloning duplicates the handle, not the key material.
+/// A live, non-extractable AES-256-GCM key: the sealed data key everything
+/// but the two ceremonies holds. Cloneable because `CryptoKey` is a JS
+/// handle; cloning duplicates the handle, not the key material.
 ///
 /// Deliberately not `Debug`: the point of the type is that its bytes cannot
 /// be read, and a derived formatter is an invitation to log it anyway.
 #[derive(Clone)]
-pub struct DataKey(pub(crate) Object);
+pub struct DataKey(Object);
 
-/// Whether an unwrapped key may have its bytes read back out.
-///
-/// [`Extractable::Sealed`] is correct everywhere except one path — adding a
-/// passkey to an already-encrypted account (spec section 6.5), which must
-/// re-wrap the raw data key under the new credential's KEK, uses the raw
-/// handle immediately, and drops it.
-///
-/// This is an enum rather than a `bool` so that no call site can read
-/// `unwrap_dek(w, k, true)` without saying what the `true` means. Getting it
-/// backwards silently defeats the whole non-extractable design (invariant
-/// E5) and no test in this project can catch it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Extractable {
-    /// The key can be used but its bytes cannot be exported.
-    Sealed,
-    /// The key's bytes can be exported with [`export_raw`].
-    Raw,
-}
+impl DataKey {
+    /// Wraps a `CryptoKey` handle that is expected to be non-extractable.
+    ///
+    /// `pub(super)` rather than public: the handle inside a [`DataKey`] is
+    /// this module's business, and [`super::keystore`] is the only outside
+    /// caller — it rebuilds one from the `CryptoKey` IndexedDB gave back.
+    pub(super) fn from_object(key: Object) -> Self {
+        Self(key)
+    }
 
-impl Extractable {
-    /// The `extractable` argument WebCrypto expects.
-    fn as_js(self) -> JsValue {
-        match self {
-            Self::Sealed => JsValue::FALSE,
-            Self::Raw => JsValue::TRUE,
-        }
+    /// The underlying handle, for [`super::keystore`] to store.
+    pub(super) fn as_object(&self) -> &Object {
+        &self.0
     }
 }
+
+/// A data key handle whose bytes *can* be read back out.
+///
+/// It exists because `wrapKey` will not accept a non-extractable key: the
+/// enable ceremony's first wrap (spec section 6.1) and the re-wrap when a
+/// second passkey is added (spec section 6.5) both need a handle that was
+/// created extractable. [`export_raw`] then takes the same handle.
+///
+/// Every value of this type is short-lived by construction — it exists
+/// between generating or unwrapping the data key and wrapping it, and is
+/// dropped there. There is no conversion from a [`DataKey`], so the sealed
+/// key that the rest of the app holds can never become one (invariant E5).
+///
+/// Not `Debug`, and not `Clone`, for the reasons [`DataKey`] is not.
+pub struct RawDataKey(Object);
+
+/// A key-encryption key: the AES-KW key [`derive_kek`] produces, whose only
+/// job is to wrap and unwrap the data key.
+///
+/// A distinct type from the two data-key handles so that [`wrap_dek`]'s
+/// arguments cannot be swapped. In JS both are `CryptoKey`s, so the mistake
+/// would be a runtime `InvalidAccessError` at best; here it does not compile.
+pub struct Kek(Object);
 
 /// WebCrypto's name for the body cipher.
 const AES_GCM: &str = "AES-GCM";
@@ -249,14 +265,18 @@ pub fn random_bytes(n: usize) -> Result<Vec<u8>, CryptoError> {
 ///
 /// Extractable, and the only function here that generates a key that way: the
 /// enable ceremony has to wrap the fresh data key under two KEKs before it
-/// can re-import it sealed. The handle this returns must not outlive that
-/// ceremony (spec section 6.1).
-pub async fn generate_dek_extractable() -> Result<Object, CryptoError> {
+/// can re-import it sealed, and `wrapKey` refuses a non-extractable key. The
+/// [`RawDataKey`] this returns must not outlive that ceremony (spec section
+/// 6.1).
+pub async fn generate_dek_extractable() -> Result<RawDataKey, CryptoError> {
     let algorithm = js_object(&[("name", AES_GCM.into()), ("length", KEY_BITS.into())]);
     let usages = dek_usages();
     let args = js_array(&[&algorithm, &JsValue::TRUE, &usages]);
 
-    as_key("generateKey", subtle_call("generateKey", &args).await?)
+    Ok(RawDataKey(as_key(
+        "generateKey",
+        subtle_call("generateKey", &args).await?,
+    )?))
 }
 
 /// `crypto.subtle.importKey("raw", raw, {name:"AES-GCM"}, false, ["encrypt","decrypt"])`
@@ -271,7 +291,7 @@ pub async fn import_dek_non_extractable(raw: &[u8]) -> Result<DataKey, CryptoErr
     let usages = dek_usages();
     let args = js_array(&[&RAW.into(), &material, &algorithm, &JsValue::FALSE, &usages]);
 
-    Ok(DataKey(as_key(
+    Ok(DataKey::from_object(as_key(
         "importKey",
         subtle_call("importKey", &args).await?,
     )?))
@@ -300,7 +320,7 @@ pub async fn import_dek_non_extractable(raw: &[u8]) -> Result<DataKey, CryptoErr
 /// `info` separates the two routes — `wire::INFO_PASSKEY` from
 /// `wire::INFO_RECOVERY` — so one route's KEK can never open the other's
 /// wrap. The derived key is non-extractable and may only wrap and unwrap.
-pub async fn derive_kek(ikm: &[u8], info: &[u8]) -> Result<Object, CryptoError> {
+pub async fn derive_kek(ikm: &[u8], info: &[u8]) -> Result<Kek, CryptoError> {
     let material = Uint8Array::from(ikm);
     let base_usages = ikm_usages();
     let import_args = js_array(&[
@@ -328,32 +348,44 @@ pub async fn derive_kek(ikm: &[u8], info: &[u8]) -> Result<Object, CryptoError> 
         &derived_usages,
     ]);
 
-    as_key("deriveKey", subtle_call("deriveKey", &derive_args).await?)
+    Ok(Kek(as_key(
+        "deriveKey",
+        subtle_call("deriveKey", &derive_args).await?,
+    )?))
 }
 
 /// `crypto.subtle.wrapKey("raw", dek, kek, "AES-KW")`
 ///
 /// Returns exactly [`wire::WRAPPED_KEY_LEN`] bytes for a 256-bit data key —
 /// the width the `entry_key_wrap.wrapped_key` column is sized to.
-pub async fn wrap_dek(dek: &Object, kek: &Object) -> Result<Vec<u8>, CryptoError> {
-    let args = js_array(&[&RAW.into(), dek, kek, &AES_KW.into()]);
+///
+/// **`wrapKey` throws `InvalidAccessError` unless the key being wrapped is
+/// extractable.** That precondition is why the data key arrives here as a
+/// [`RawDataKey`] and not as a [`DataKey`]: the sealed handle would fail this
+/// call at runtime, in the browser, where no test in this project can see it.
+///
+/// The two handles are separate types for the same reason. In JS they are
+/// both `CryptoKey`s, so `wrapKey(dek, kek)` with the arguments the wrong way
+/// round is a well-formed call that fails only at runtime.
+pub async fn wrap_dek(dek: &RawDataKey, kek: &Kek) -> Result<Vec<u8>, CryptoError> {
+    let args = js_array(&[&RAW.into(), &dek.0, &kek.0, &AES_KW.into()]);
 
     as_bytes("wrapKey", subtle_call("wrapKey", &args).await?)
 }
 
 /// `crypto.subtle.unwrapKey("raw", wrapped, kek, "AES-KW", {name:"AES-GCM",length:256}, extractable, ["encrypt","decrypt"])`
 ///
-/// Pass [`Extractable::Sealed`] unless you are the add-a-passkey path of spec
-/// section 6.5; see [`Extractable`].
+/// The `extractable` argument is not a parameter: the two public wrappers
+/// below each pass their own, and their return types say which they passed.
 ///
 /// AES-KW is authenticated, so the wrong KEK — a wrong recovery code, the
 /// wrong credential's wrap — fails here cleanly instead of yielding a key
 /// that decrypts to garbage. That is why the recovery code carries no
 /// checksum (spec section 6.4).
-pub async fn unwrap_dek(
+async fn unwrap_key(
     wrapped: &[u8],
-    kek: &Object,
-    extractable: Extractable,
+    kek: &Kek,
+    extractable: &JsValue,
 ) -> Result<Object, CryptoError> {
     let material = Uint8Array::from(wrapped);
     let unwrapped_algorithm = js_object(&[("name", AES_GCM.into()), ("length", KEY_BITS.into())]);
@@ -361,25 +393,46 @@ pub async fn unwrap_dek(
     let args = js_array(&[
         &RAW.into(),
         &material,
-        kek,
+        &kek.0,
         &AES_KW.into(),
         &unwrapped_algorithm,
-        &extractable.as_js(),
+        extractable,
         &usages,
     ]);
 
     as_key("unwrapKey", subtle_call("unwrapKey", &args).await?)
 }
 
+/// Unwraps the stored data key into a sealed [`DataKey`].
+///
+/// This is the unlock path — every sign-in, on every device — and the only
+/// one anything outside the two ceremonies should need. See [`unwrap_key`]
+/// for what a wrong KEK does.
+pub async fn unwrap_dek_sealed(wrapped: &[u8], kek: &Kek) -> Result<DataKey, CryptoError> {
+    Ok(DataKey::from_object(
+        unwrap_key(wrapped, kek, &JsValue::FALSE).await?,
+    ))
+}
+
+/// Unwraps the stored data key into an exportable [`RawDataKey`].
+///
+/// Only the add-a-passkey path of spec section 6.5 may call this: it opens
+/// the existing wrap, re-wraps the same data key under the new credential's
+/// KEK, and drops the handle. A new call site is a change to invariant E5 and
+/// should be reviewed as one.
+pub async fn unwrap_dek_raw(wrapped: &[u8], kek: &Kek) -> Result<RawDataKey, CryptoError> {
+    Ok(RawDataKey(unwrap_key(wrapped, kek, &JsValue::TRUE).await?))
+}
+
 /// `crypto.subtle.exportKey("raw", key)`
 ///
-/// Only ever called on a handle that was created extractable: the enable
-/// ceremony's generated key, or an [`Extractable::Raw`] unwrap in spec
-/// section 6.5. On any other handle WebCrypto refuses, which is the whole
-/// protection — so a call added here against a [`DataKey`] would fail at
-/// runtime rather than leak, but it should not be written in the first place.
-pub async fn export_raw(key: &Object) -> Result<Vec<u8>, CryptoError> {
-    let args = js_array(&[&RAW.into(), key]);
+/// Takes only a [`RawDataKey`] — the enable ceremony's generated key or an
+/// [`unwrap_dek_raw`] handle from spec section 6.5. WebCrypto would refuse a
+/// sealed key at runtime, but the point of the parameter type is that the
+/// call cannot be written: handing this a [`DataKey`] does not compile, so
+/// the protection is not left to a browser to enforce.
+pub async fn export_raw(key: &RawDataKey) -> Result<Vec<u8>, CryptoError> {
+    let args = js_array(&[&RAW.into(), &key.0]);
 
     as_bytes("exportKey", subtle_call("exportKey", &args).await?)
 }

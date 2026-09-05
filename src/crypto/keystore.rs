@@ -184,7 +184,7 @@ fn store(db: &IdbDatabase, mode: IdbTransactionMode) -> Result<IdbObjectStore, C
 async fn put_in(db: &IdbDatabase, user: &str, key: &DataKey) -> Result<(), CryptoError> {
     let record = js_object(&[
         (USER_FIELD, JsValue::from_str(user)),
-        (KEY_FIELD, key.0.clone().into()),
+        (KEY_FIELD, key.as_object().clone().into()),
     ]);
     let request = store(db, IdbTransactionMode::Readwrite)?
         .put_with_key(&record, &RECORD.into())
@@ -231,7 +231,7 @@ async fn get_from(db: &IdbDatabase, user: &str) -> Result<Option<DataKey>, Crypt
         discard(db).await;
         return Ok(None);
     };
-    Ok(Some(DataKey(key)))
+    Ok(Some(DataKey::from_object(key)))
 }
 
 /// Removes the record.
