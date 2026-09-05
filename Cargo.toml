@@ -64,7 +64,6 @@ web-sys = { version = "0.3.77", optional = true, features = [
 # SSR-only (server binary).
 axum = { version = "0.8", optional = true }
 axum-extra = { version = "0.12", features = ["cookie"], optional = true }
-cookie = { version = "0.18", optional = true }
 leptos_axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
 diesel = { version = "2.2", default-features = false, features = [
@@ -91,7 +90,6 @@ dotenvy = { version = "0.15", optional = true }
 webauthn-rs = { version = "0.6.1-dev", features = [
   "danger-allow-state-serialisation", "conditional-ui",
 ], optional = true }
-webauthn-rs-proto = { version = "0.6.1-dev", optional = true }
 # `oneshot`, used by `test_support::SessionClient::call` to dispatch requests.
 # A regular dependency (not dev-only): `test_support` is part of the library,
 # not `#[cfg(test)]` — `tests/` is a separate crate and cannot see
@@ -105,6 +103,11 @@ tower = { version = "0.5", default-features = false, features = [
 webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false, features = [
   "softpasskey",
 ] }
+# The executor leptos's `spawn_local` dispatches into. Not needed by the app —
+# `cargo-leptos` installs one — but `storage::hook`'s write-path test calls
+# `Persistent::set` for real, and `spawn_local` panics in a debug build with no
+# global executor set. The pool is never polled; the spawned future just parks.
+any_spawner = { version = "0.3", features = ["futures-executor"] }
 
 [features]
 default = []
@@ -123,7 +126,6 @@ ssr = [
   "dep:leptos_axum",
   "dep:axum",
   "dep:axum-extra",
-  "dep:cookie",
   "dep:tokio",
   "dep:diesel",
   "dep:diesel_migrations",
@@ -138,7 +140,6 @@ ssr = [
   "dep:tracing-subscriber",
   "dep:dotenvy",
   "dep:webauthn-rs",
-  "dep:webauthn-rs-proto",
   "dep:tower",
 ]
 

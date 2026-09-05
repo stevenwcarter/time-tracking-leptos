@@ -59,13 +59,6 @@ pub fn today_local() -> NaiveDate {
     chrono::Local::now().date_naive()
 }
 
-/// The server's UTC date. Used only where a date is needed for logging or a
-/// token expiry — never to decide which day a user is looking at.
-#[cfg(feature = "ssr")]
-pub fn today_utc() -> NaiveDate {
-    chrono::Utc::now().date_naive()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

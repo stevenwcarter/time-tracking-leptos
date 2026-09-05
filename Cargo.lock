@@ -3667,13 +3667,13 @@ dependencies = [
 name = "time-tracking-leptos"
 version = "0.1.3"
 dependencies = [
+ "any_spawner",
  "anyhow",
  "axum",
  "axum-extra",
  "base64 0.22.1",
  "chrono",
  "console_error_panic_hook",
- "cookie",
  "diesel",
  "diesel_migrations",
  "dotenvy",
@@ -3700,7 +3700,6 @@ dependencies = [
  "web-sys",
  "webauthn-authenticator-rs",
  "webauthn-rs",
- "webauthn-rs-proto",
 ]
 
 [[package]]
