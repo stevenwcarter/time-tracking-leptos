@@ -2,4 +2,5 @@
 //!
 //! See `docs/superpowers/specs/2026-09-05-client-side-encryption-design.md`.
 
+pub mod recovery;
 pub mod wire;
