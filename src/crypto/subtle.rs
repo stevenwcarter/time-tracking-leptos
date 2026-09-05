@@ -110,7 +110,10 @@ fn ikm_usages() -> Array {
 /// keys cannot fail, so its result is discarded — the same call shape, and
 /// the same `.ok()`, that `webauthn_browser` uses to build its `publicKey`
 /// argument.
-fn js_object(fields: &[(&str, JsValue)]) -> Object {
+///
+/// Shared with [`super::keystore`], which builds its stored record the same
+/// way.
+pub(super) fn js_object(fields: &[(&str, JsValue)]) -> Object {
     let object = Object::new();
     for (name, value) in fields {
         Reflect::set(&object, &(*name).into(), value).ok();
@@ -141,7 +144,10 @@ fn js_array(items: &[&JsValue]) -> Array {
 /// algorithm — which is enough to tell an expected failure from a bug, while
 /// `message` is the one field an implementation could echo an argument into.
 /// Every argument in this module is key material or plaintext.
-fn failed(operation: &str, thrown: &JsValue) -> CryptoError {
+///
+/// Shared with [`super::keystore`], whose failures arrive as IndexedDB
+/// `DOMException`s and carry a `name` in the same way.
+pub(super) fn failed(operation: &str, thrown: &JsValue) -> CryptoError {
     let name = Reflect::get(thrown, &"name".into())
         .ok()
         .and_then(|v| v.as_string())
