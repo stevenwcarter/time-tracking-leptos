@@ -19,9 +19,13 @@ pub const NONCE_LEN: usize = 12;
 pub const WRAPPED_KEY_LEN: usize = 40;
 
 /// HKDF `info` for the passkey-PRF route.
-pub const INFO_PASSKEY: &[u8] = b"tt/entry-kek/passkey/v1";
-/// HKDF `info` for the recovery-code route.
-pub const INFO_RECOVERY: &[u8] = b"tt/entry-kek/recovery/v1";
+///
+/// Not `pub`: [`WrapKind::info`] is the only thing that hands this out, so a
+/// caller reaches an `info` string only by going through the route it
+/// belongs to, never by passing an arbitrary one in.
+const INFO_PASSKEY: &[u8] = b"tt/entry-kek/passkey/v1";
+/// HKDF `info` for the recovery-code route. See [`INFO_PASSKEY`].
+const INFO_RECOVERY: &[u8] = b"tt/entry-kek/recovery/v1";
 
 /// HKDF salt: SHA-256 of `time-tracking-leptos/entry-key/v1`.
 ///

@@ -37,7 +37,7 @@ use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array}
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
-use super::wire::{self, APP_SALT, NONCE_LEN};
+use super::wire::{self, APP_SALT, NONCE_LEN, WrapKind};
 
 /// A WebCrypto operation failed. The `String` is for the log, never for the
 /// user — callers map this to a human sentence themselves.
@@ -381,10 +381,13 @@ pub async fn import_dek_non_extractable(raw: &[u8]) -> Result<DataKey, CryptoErr
 /// the failure would look like data corruption rather than like a bug
 /// (invariant E6, spec section 4.2).
 ///
-/// `info` separates the two routes — `wire::INFO_PASSKEY` from
-/// `wire::INFO_RECOVERY` — so one route's KEK can never open the other's
-/// wrap. The derived key is non-extractable and may only wrap and unwrap.
-pub async fn derive_kek(ikm: &[u8], info: &[u8]) -> Result<Kek, CryptoError> {
+/// `kind` selects `info` via [`WrapKind::info`] rather than taking one as a
+/// raw byte string: the two routes must never share an `info`, and a
+/// `WrapKind` is the only way to name one of them, so a wrap made under the
+/// wrong route's `info` — which would be a well-formed wrap no device ever
+/// opens — is not an argument a caller can pass by mistake (invariant E6).
+/// The derived key is non-extractable and may only wrap and unwrap.
+pub async fn derive_kek(ikm: &[u8], kind: WrapKind) -> Result<Kek, CryptoError> {
     let material = Uint8Array::from(ikm);
     let base_usages = ikm_usages();
     let import_args = js_array(&[
@@ -400,7 +403,7 @@ pub async fn derive_kek(ikm: &[u8], info: &[u8]) -> Result<Kek, CryptoError> {
         ("name", HKDF.into()),
         ("hash", SHA_256.into()),
         ("salt", Uint8Array::from(&APP_SALT[..]).into()),
-        ("info", Uint8Array::from(info).into()),
+        ("info", Uint8Array::from(kind.info()).into()),
     ]);
     let derived_algorithm = js_object(&[("name", AES_KW.into()), ("length", KEY_BITS.into())]);
     let derived_usages = kek_usages();

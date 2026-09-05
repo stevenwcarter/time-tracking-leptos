@@ -210,12 +210,13 @@ mod ceremony {
 
     /// Derives the key-encryption key for one route from that route's secret.
     ///
-    /// Every derivation in this file goes through here so that `info` is
-    /// never chosen at a call site: it comes from [`WrapKind::info`], the
-    /// single table, pinned on the host by `wire`'s
-    /// `each_kind_keeps_its_own_info_string` (invariant E6).
+    /// Every derivation in this file goes through here — and through
+    /// [`subtle::derive_kek`], which takes a [`WrapKind`] rather than a raw
+    /// `info` byte string — so `info` is never chosen at a call site: it can
+    /// only come from [`WrapKind::info`], the single table, pinned on the
+    /// host by `wire`'s `each_kind_keeps_its_own_info_string` (invariant E6).
     async fn derive(kind: WrapKind, ikm: &[u8]) -> Result<Kek, CryptoError> {
-        subtle::derive_kek(ikm, kind.info()).await
+        subtle::derive_kek(ikm, kind).await
     }
 
     /// Derives the key-encryption key that opens `opener`.
