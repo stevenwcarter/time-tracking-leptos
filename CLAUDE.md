@@ -135,7 +135,9 @@ gaining a decrypt step.
   any component.
 - `src/components/` — one file per group of related views: `summary`,
   `projects`, `time_display`, `time_entry_area`, `header`, `account_menu`,
-  `account_page`, `calendar`, `week_view`, `import_banner`
+  `account_page`, `calendar`, `week_view`, `import_banner`, `unlock`,
+  `encryption_panel`, `status` (the shared note/problem line `/account`'s
+  two halves both talk back through)
 - `src/clipboard.rs` — same signature on both targets, side effect gated
 
 ## Configuration
