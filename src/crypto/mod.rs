@@ -473,4 +473,17 @@ mod tests {
         passkey_shaped.kind = "future".to_string();
         assert!(choose_route(&[passkey_shaped], Some(b"cred-x")).is_none());
     }
+
+    /// The credential id must match exactly. `starts_with` would let
+    /// `"cred"` open either row below, deriving a KEK from whichever
+    /// credential's PRF output the browser happened to hand over — not the
+    /// one the wrap was actually made for.
+    #[test]
+    fn a_credential_id_prefix_is_not_a_match() {
+        let rows = vec![
+            wrap(WrapKind::Passkey, Some(b"cred-a"), 1),
+            wrap(WrapKind::Passkey, Some(b"cred-b"), 2),
+        ];
+        assert!(choose_route(&rows, Some(b"cred")).is_none());
+    }
 }
