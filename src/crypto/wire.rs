@@ -212,11 +212,13 @@ mod tests {
         assert!(matches!(decode_v2(raw), Err(WireError::Base64(_))));
     }
 
-    /// The browser's WebCrypto is not available here, so a second, independent
-    /// AES-256-GCM implementation stands in for it. If our nonce placement,
-    /// tag handling or base64 alphabet were wrong, these would fail — which is
-    /// exactly the class of bug that would otherwise only appear in a browser
-    /// against real user data (spec section 10).
+    /// The browser's WebCrypto is not available here, so a second,
+    /// independent AES-256-GCM implementation stands in for it. Nonce
+    /// placement and tag handling are `aes-gcm`'s responsibility, not this
+    /// module's — `wire.rs` only moves opaque bytes. What these tests pin is
+    /// that *our* part, the envelope's base64 encoding and field layout,
+    /// round-trips through a second implementation rather than only ever
+    /// being read back by the code that wrote it (spec section 10).
     mod cross_implementation {
         use super::*;
         use aes_gcm::aead::{Aead, KeyInit};
