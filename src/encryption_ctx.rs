@@ -155,6 +155,41 @@ impl EncryptionState {
             }
         }
     }
+
+    /// Whether a save made right now would be stored, for the view.
+    ///
+    /// Reads the decision back out of [`write_key`](Self::write_key) rather
+    /// than repeating the match, so the entry area cannot invite a keystroke
+    /// the seam then refuses. See [`Writes`].
+    pub fn writes(&self) -> Writes {
+        match self.write_key() {
+            WriteKey::Plaintext | WriteKey::Sealed(_) => Writes::Accepted,
+            WriteKey::Locked => Writes::Refused,
+        }
+    }
+}
+
+/// Whether a save made right now would be stored.
+///
+/// The write side's counterpart to [`KeyIdentity`], and the answer the entry
+/// area renders itself from. It is derived from
+/// [`write_key`](EncryptionState::write_key) rather than matched on the
+/// state again, so the box the user can type into and the call that refuses
+/// the keystroke cannot come to disagree.
+///
+/// It exists because the disagreement is silent. The server always renders
+/// `Unknown` (invariant E2) and so does the client's first render, and
+/// `Unknown` is `WriteKey::Locked` — for a signed-in visitor that window is
+/// a full network round trip, with the textarea mounted and editable
+/// throughout. Anything typed into it was refused with nothing on screen to
+/// say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writes {
+    /// The account has no encryption, or this device holds the key.
+    Accepted,
+    /// Nothing is known about the account's encryption yet, or this device
+    /// cannot seal. A save would be refused.
+    Refused,
 }
 
 /// Which key a read would use, reduced to something a `Memo` can compare.
@@ -424,6 +459,15 @@ impl EncryptionCtx {
         self.state.get_untracked()
     }
 
+    /// Whether a save made right now would be stored, tracked.
+    ///
+    /// Tracked because the answer changes under the user: the probe
+    /// resolving is what turns a page that cannot save into one that can,
+    /// with no other event to redraw on.
+    pub fn writes(self) -> Writes {
+        self.state.get().writes()
+    }
+
     /// Which key a read would use, tracked — the narrow dependency the
     /// storage load subscribes to instead of [`state`](Self::state).
     ///
@@ -614,6 +658,26 @@ mod tests {
             EncryptionState::Disabled.write_key(),
             WriteKey::Plaintext
         ));
+    }
+
+    /// What the entry area renders from has to be the same answer the seam
+    /// acts on. If these two ever disagreed the textarea would invite a
+    /// keystroke the save then refused — which is precisely the silence
+    /// `Writes` exists to end.
+    ///
+    /// `Unlocked` is absent because it needs a `SessionKey`, uninhabited on
+    /// the host; its arm is the one `write_key` and `writes` share by
+    /// construction, since the second reads the first.
+    #[test]
+    fn what_the_view_shows_matches_what_a_write_would_do() {
+        for state in [
+            EncryptionState::Unknown,
+            EncryptionState::Unreachable,
+            EncryptionState::Locked,
+        ] {
+            assert_eq!(state.writes(), Writes::Refused);
+        }
+        assert_eq!(EncryptionState::Disabled.writes(), Writes::Accepted);
     }
 
     // `EncryptionState::key` has no host test of its own, deliberately. The

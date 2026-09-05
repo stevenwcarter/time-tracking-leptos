@@ -31,7 +31,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use super::{Backend, Generation, StorageError, StorageKey, load, store};
-use crate::encryption_ctx::{EncryptionCtx, EncryptionState, KeyIdentity};
+use crate::encryption_ctx::{EncryptionCtx, EncryptionState, KeyIdentity, Writes};
 
 /// A value persisted across reloads, with the load state made explicit.
 #[derive(Clone, Copy)]
@@ -51,6 +51,16 @@ impl Persistent {
     /// The current value, or `None` if storage has not been read yet.
     pub fn get(self) -> Option<String> {
         self.value.get()
+    }
+
+    /// Whether a [`set`](Self::set) made right now would be stored.
+    ///
+    /// Asked of the same object the save goes through, deliberately: an
+    /// editor that reads the session from anywhere else can come to invite a
+    /// keystroke this `Persistent` then refuses, and the refusal is silent
+    /// (see [`Writes`]).
+    pub fn writes(self) -> Writes {
+        self.encryption.writes()
     }
 
     /// Updates the value and writes it through to storage.

@@ -170,6 +170,11 @@ fn DayView(date: NaiveDate) -> impl IntoView {
                 // — a brief flash on a rare path, not a permanent wrong
                 // answer.
                 //
+                // Mounted is not the same as editable. `Unknown` is
+                // `WriteKey::Locked`, so `TimeEntryArea` renders its box
+                // read-only and says so until the probe lands — the server
+                // renders that same shell, which is what keeps it hydrating.
+                //
                 // `Unreachable` joins `Locked` rather than `Unknown`, and the
                 // difference is who can end the state. `Unknown` ends by
                 // itself, in milliseconds; `Unreachable` ends only if the
@@ -335,6 +340,40 @@ mod tests {
                 "a non-locked session must not render the unlock prompt"
             );
         }
+    }
+
+    /// The window this exists to close: `Unknown` mounts the entry area —
+    /// it has to, since the server renders `Unknown` for everybody — but
+    /// `Unknown` is `WriteKey::Locked`, so every save made in it is refused.
+    /// For a signed-in visitor that window is a full network round trip, and
+    /// before this the box took keystrokes and dropped them with nothing on
+    /// screen to say so.
+    ///
+    /// Read-only rather than absent, because the server renders this state
+    /// and blanking it would remove the entry area from every server-rendered
+    /// page. Both halves are asserted in both directions, so neither the
+    /// attribute nor the line can be left permanently on or permanently off.
+    #[test]
+    fn the_entry_area_is_read_only_until_a_save_would_be_stored() {
+        let waiting = render_day_view(EncryptionState::Unknown);
+        assert!(
+            waiting.contains("readonly"),
+            "an unknown session must not offer an editable box it would refuse to save"
+        );
+        assert!(
+            waiting.contains("nothing typed here would be saved yet"),
+            "a greyed-out box with no explanation reads as broken: {waiting}"
+        );
+
+        let saving = render_day_view(EncryptionState::Disabled);
+        assert!(
+            !saving.contains("readonly"),
+            "a session that can save must hand over an editable box"
+        );
+        assert!(
+            !saving.contains("nothing typed here would be saved yet"),
+            "a page that saves must say nothing about not saving"
+        );
     }
 
     #[test]
