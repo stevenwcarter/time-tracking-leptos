@@ -12,9 +12,10 @@ use crate::components::header::AppHeader;
 use crate::components::import_banner::ImportBanner;
 use crate::components::time_display::TimeDisplay;
 use crate::components::time_entry_area::TimeEntryArea;
+use crate::components::unlock::UnlockPrompt;
 use crate::components::week_view::WeekView;
 use crate::date::parse_iso;
-use crate::encryption_ctx::EncryptionCtx;
+use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 use crate::storage::StorageKey;
 use crate::storage::hook::use_persistent;
 
@@ -146,6 +147,7 @@ fn DayPage() -> impl IntoView {
 #[component]
 fn DayView(date: NaiveDate) -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
+    let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     let key = Signal::derive(move || StorageKey::TimeEntry(date));
     let entry = use_persistent(key, auth.backend());
 
@@ -154,10 +156,29 @@ fn DayView(date: NaiveDate) -> impl IntoView {
             <AppHeader date=Some(date)/>
             <div class="w-full max-w-7xl mx-auto px-4 py-8">
                 <ImportBanner/>
-                <div class="flex flex-col md:flex-row gap-6 w-full">
-                    <TimeEntryArea entry=entry/>
-                    <TimeDisplay entry=entry/>
-                </div>
+                // The gate spec section 7.4 requires: only `Locked` swaps in
+                // the unlock prompt. `Unknown` renders the entry area in its
+                // ordinary unloaded state — exactly what the server already
+                // renders for every visitor — rather than blanking it; the
+                // server is always `Unknown` (invariant E2), so blanking it
+                // would remove the entry area from every server-rendered
+                // page, not just a locked one. The cost of *not* blanking is
+                // narrower: a locked session sees the same unloaded shell for
+                // the width of the post-hydration probe before this swaps it
+                // for the prompt, since a `Locked` read fails the same way
+                // `hook::loaded_value` maps any other one — a brief flash on
+                // a rare path, not a permanent wrong answer.
+                {move || match encryption.state() {
+                    EncryptionState::Locked => Either::Right(view! { <UnlockPrompt/> }),
+                    EncryptionState::Unknown
+                    | EncryptionState::Disabled
+                    | EncryptionState::Unlocked(_) => Either::Left(view! {
+                        <div class="flex flex-col md:flex-row gap-6 w-full">
+                            <TimeEntryArea entry=entry/>
+                            <TimeDisplay entry=entry/>
+                        </div>
+                    }),
+                }}
             </div>
         </div>
     }
@@ -211,6 +232,73 @@ mod tests {
 
     fn render_app() -> String {
         render_at("/2026-09-04", None)
+    }
+
+    /// Renders `DayView` directly, with `EncryptionCtx` parked at `state`
+    /// via [`EncryptionCtx::for_state`] rather than the real probe — which
+    /// never produces anything but `Unknown` under `ssr` (invariant E2), so
+    /// there is no other way to reach `Locked` here at all.
+    ///
+    /// `DayView` reads `AuthCtx` directly (for `auth.backend()`) and, deeper
+    /// in, `AppHeader`'s `AccountMenu`/`DatePicker` do too — both need a
+    /// signed-in identity for their own rendering, independent of the gate
+    /// this test exists to pin. Wrapped in a bare `<Router>` (no `<Routes>`):
+    /// `AppHeader`'s `<A>` needs router context to resolve its `href` or it
+    /// panics, but nothing here navigates, so no route table is required.
+    fn render_day_view(state: EncryptionState) -> String {
+        let runtime = Owner::new();
+        let date = crate::date::parse_iso("2026-09-04").expect("valid date");
+        let html = runtime.with(move || {
+            provide_context(RequestUrl::new("/2026-09-04"));
+            provide_context(AuthCtx {
+                user: RwSignal::new(Some("alice@example.com".to_string())),
+            });
+            provide_context(EncryptionCtx::for_state(state));
+            view! { <Router><DayView date=date/></Router> }.to_html()
+        });
+        runtime.cleanup();
+        html
+    }
+
+    /// The mount gate's primary case (spec section 7.4): `Locked` must swap
+    /// the entry area for the unlock prompt, not merely leave it showing
+    /// unloaded — without this, `hook::loaded_value` would go on to map the
+    /// locked read's failure to an empty string, rendering "No projects
+    /// found" over a day of real data.
+    #[test]
+    fn day_view_shows_the_unlock_prompt_when_locked() {
+        let html = render_day_view(EncryptionState::Locked);
+        assert!(
+            html.contains("Unlock your entries"),
+            "a locked session must render the unlock prompt"
+        );
+        assert!(
+            !html.contains("<textarea"),
+            "the entry area must not mount alongside the unlock prompt"
+        );
+    }
+
+    /// The gate's other half: every other state still mounts the entry
+    /// area, exactly as it did before this gate existed (spec 7.4's
+    /// correction — `Unknown` is not a second reason to hide it).
+    #[test]
+    fn day_view_shows_the_entry_area_when_not_locked() {
+        for state in [
+            EncryptionState::Unknown,
+            EncryptionState::Disabled,
+            // `Unlocked` needs a `SessionKey`, uninhabited on the host — its
+            // arm is covered by `encryption_ctx`'s own tests instead.
+        ] {
+            let html = render_day_view(state);
+            assert!(
+                html.contains("<textarea") && html.contains("></textarea>"),
+                "a non-locked session must still mount the entry area"
+            );
+            assert!(
+                !html.contains("Unlock your entries"),
+                "a non-locked session must not render the unlock prompt"
+            );
+        }
     }
 
     #[test]

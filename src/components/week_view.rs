@@ -6,7 +6,7 @@
 //! survive it (spec section 9.1).
 
 use chrono::{Days, NaiveDate};
-use leptos::either::Either;
+use leptos::either::{Either, EitherOf3};
 use leptos::logging::error;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -17,8 +17,9 @@ use time_tracking_parser::{Time, parse_time_tracking_data};
 
 use crate::auth_ctx::AuthCtx;
 use crate::components::header::AppHeader;
+use crate::components::unlock::UnlockPrompt;
 use crate::date::{parse_iso, to_iso, week_bounds};
-use crate::encryption_ctx::EncryptionCtx;
+use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 use crate::storage::{Backend, Generation, StorageError, bodies_in_range};
 
 /// A week's totals, ready to render.
@@ -180,18 +181,32 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
                     </div>
                 </div>
 
-                {move || match totals.get() {
-                    None => Either::Left(view! {
+                // Gated the same way `DayView` gates the entry area, and for
+                // the same reason (spec section 7.4): only `Locked` swaps in
+                // the unlock prompt. `Unknown` falls through to the ordinary
+                // loading/empty states below, exactly as it did before this
+                // gate existed — the server is always `Unknown` (invariant
+                // E2), so treating it as a reason to hide the totals shell
+                // would remove this page's chrome for every visitor, not
+                // just a locked one. A genuinely `Locked` session still gets
+                // there in the end: its range read comes back with every row
+                // unreadable, `loaded_rows` turns that into an empty week,
+                // and this arm replaces that empty week with the prompt once
+                // the post-hydration probe resolves — a brief flash of
+                // "Nothing logged", not a permanent wrong answer.
+                {move || match (encryption.state(), totals.get()) {
+                    (EncryptionState::Locked, _) => EitherOf3::C(view! { <UnlockPrompt/> }),
+                    (_, None) => EitherOf3::A(view! {
                         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
                             <p class="value-slot"></p>
                         </div>
                     }),
-                    Some(t) if t.per_day.is_empty() => Either::Left(view! {
+                    (_, Some(t)) if t.per_day.is_empty() => EitherOf3::A(view! {
                         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
                             <p class="text-sm text-gray-500">"Nothing logged this week."</p>
                         </div>
                     }),
-                    Some(t) => Either::Right(view! { <WeekTables totals=t/> }),
+                    (_, Some(t)) => EitherOf3::B(view! { <WeekTables totals=t/> }),
                 }}
             </main>
         </div>
@@ -357,5 +372,84 @@ mod tests {
     #[test]
     fn a_failed_range_read_becomes_empty() {
         assert_eq!(loaded_rows(Err(StorageError::Unavailable)), Vec::new());
+    }
+}
+
+/// Pins the mount gate directly (spec section 7.4), the same way `app`'s
+/// `day_view_shows_the_unlock_prompt_when_locked` pins `DayView`'s. A
+/// separate, `ssr`-gated module rather than folding into `mod tests` above:
+/// `.to_html()` needs `leptos`'s `ssr` feature, which the pure `aggregate`/
+/// `loaded_rows` tests above have no reason to require.
+#[cfg(all(test, feature = "ssr"))]
+mod gate_tests {
+    use leptos_router::components::Router;
+    use leptos_router::location::RequestUrl;
+
+    use super::*;
+
+    /// Renders `WeekBody` directly, with `EncryptionCtx` parked at `state`
+    /// via [`EncryptionCtx::for_state`] — the real probe never produces
+    /// anything but `Unknown` under `ssr` (invariant E2), so there is no
+    /// other way to reach `Locked` here.
+    ///
+    /// Wrapped in a bare `<Router>` (no `<Routes>`) for the same reason
+    /// `app`'s `render_day_view` is: `AppHeader`'s `<A>` needs router
+    /// context to resolve its `href` or it panics, and nothing here
+    /// navigates, so no route table is required. `backend` is passed
+    /// directly rather than read from `AuthCtx`, since `WeekBody` — unlike
+    /// `WeekView`, its param-parsing wrapper — takes it as a plain argument.
+    fn render_week_body(state: EncryptionState) -> String {
+        let runtime = Owner::new();
+        let anchor = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let html = runtime.with(move || {
+            provide_context(RequestUrl::new("/week/2026-09-01"));
+            provide_context(AuthCtx {
+                user: RwSignal::new(Some("alice@example.com".to_string())),
+            });
+            provide_context(EncryptionCtx::for_state(state));
+            let backend = Signal::derive(|| Backend::Local);
+            view! { <Router><WeekBody anchor=anchor backend=backend/></Router> }.to_html()
+        });
+        runtime.cleanup();
+        html
+    }
+
+    /// The primary case: `Locked` must swap the totals shell for the unlock
+    /// prompt, not merely leave the week looking empty — without this,
+    /// `loaded_rows` would go on to turn the locked range read's failure
+    /// into an empty week, rendering "Nothing logged this week." over a
+    /// week of real data.
+    #[test]
+    fn week_body_shows_the_unlock_prompt_when_locked() {
+        let html = render_week_body(EncryptionState::Locked);
+        assert!(
+            html.contains("Unlock your entries"),
+            "a locked session must render the unlock prompt"
+        );
+        assert!(
+            !html.contains("Nothing logged this week."),
+            "the totals shell must not mount alongside the unlock prompt"
+        );
+    }
+
+    /// The other half: every other state still mounts the totals shell,
+    /// exactly as it did before this gate existed (spec 7.4's correction —
+    /// `Unknown` is not a second reason to hide it). `totals` starts `None`
+    /// and the range-read effect never runs under `ssr`, so this always
+    /// renders the loading skeleton rather than a resolved total — enough
+    /// to prove the *unlock prompt* did not mount, which is this test's job.
+    #[test]
+    fn week_body_shows_the_totals_shell_when_not_locked() {
+        for state in [EncryptionState::Unknown, EncryptionState::Disabled] {
+            let html = render_week_body(state);
+            assert!(
+                html.contains("value-slot"),
+                "a non-locked session must still mount the totals shell"
+            );
+            assert!(
+                !html.contains("Unlock your entries"),
+                "a non-locked session must not render the unlock prompt"
+            );
+        }
     }
 }

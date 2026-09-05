@@ -203,6 +203,28 @@ impl EncryptionCtx {
         Self { state }
     }
 
+    /// Builds a context already parked at `state`, bypassing the probe
+    /// entirely.
+    ///
+    /// Test-only, and the only way to reach `Locked` — or to pin
+    /// `Disabled`/`Unlocked` explicitly — on the host: `probing` always
+    /// starts at `Unknown`, and the `Effect` that could move it anywhere
+    /// else is `hydrate`-only. `DayView`'s and `WeekView`'s mount-gate tests
+    /// need exactly this to prove those components actually branch on
+    /// `EncryptionState`, not merely that the states exist.
+    ///
+    /// `ssr` as well as `test`: both call sites render with `.to_html()`,
+    /// which needs `leptos`'s `ssr` feature, so this has no caller — and
+    /// would be dead code — under a bare `cargo test --no-default-features`.
+    #[cfg(all(test, feature = "ssr"))]
+    pub(crate) fn for_state(state: EncryptionState) -> Self {
+        #[cfg(feature = "hydrate")]
+        let state = RwSignal::new_local(state);
+        #[cfg(not(feature = "hydrate"))]
+        let state = RwSignal::new(state);
+        Self { state }
+    }
+
     /// The current state, tracked.
     ///
     /// Tracked is what makes an unlock visible without a reload: the day and
@@ -220,6 +242,23 @@ impl EncryptionCtx {
     /// backend untracked.
     pub fn state_untracked(self) -> EncryptionState {
         self.state.get_untracked()
+    }
+
+    /// Publishes a session an unlock ceremony just opened (spec section 6.3).
+    ///
+    /// The only way anything outside this module reaches `Unlocked` other
+    /// than the probe finding a key already in the keystore.
+    /// `crypto::unlock_with_prf`/`unlock_with_recovery` have already called
+    /// `SessionKey::adopt`, which writes the keystore record — this call
+    /// only tells the rest of the tree the session changed, which is what
+    /// makes the day and week loads (tracked through [`state`](Self::state))
+    /// re-run and show the now-readable entries without a reload.
+    ///
+    /// `hydrate`-only, like the type it takes: nothing off the browser ever
+    /// holds a `SessionKey` to pass here.
+    #[cfg(feature = "hydrate")]
+    pub fn unlock(self, key: SessionKey) {
+        self.state.set(EncryptionState::Unlocked(key));
     }
 }
 

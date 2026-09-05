@@ -9,4 +9,5 @@ pub mod projects;
 pub mod summary;
 pub mod time_display;
 pub mod time_entry_area;
+pub mod unlock;
 pub mod week_view;
