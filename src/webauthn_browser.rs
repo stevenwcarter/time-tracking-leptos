@@ -241,10 +241,17 @@ mod browser {
     /// There is no `prf_output_from_json` to write, so don't go looking for
     /// one — the live JS values have to be walked.
     ///
-    /// Every step reads as "no PRF output" rather than panicking. Note the
-    /// hops are checked in order because `Reflect::get` on a value that
-    /// turned out to be `undefined` throws: a missing `prf` key surfaces as
-    /// the `Err` of the *following* get, not of its own.
+    /// Every step reads as "no PRF output" rather than panicking, with one
+    /// narrow exception: `Uint8Array::new(&buffer)` below is a non-`catch`
+    /// wasm-bindgen binding, so a detached `ArrayBuffer` would throw straight
+    /// past this function's `Option` contract rather than read as `None`.
+    /// Unreachable in practice — `buffer` is freshly minted by the browser
+    /// for this assertion, never a value this code could itself have
+    /// detached — but it means the claim above is "reads as no output",
+    /// not "provably cannot panic." Note the hops are checked in order
+    /// because `Reflect::get` on a value that turned out to be `undefined`
+    /// throws: a missing `prf` key surfaces as the `Err` of the *following*
+    /// get, not of its own.
     fn prf_output(cred: &JsValue) -> Option<Vec<u8>> {
         let results = method(cred, "getClientExtensionResults")
             .ok()?
@@ -259,6 +266,15 @@ mod browser {
         // An empty buffer is not a PRF output. Handing one on would derive a
         // key-encryption key from no entropy at all, and it would round-trip
         // happily — the worst way for this to fail.
+        //
+        // Anything else — including a result that is not the 32 bytes this
+        // build's own derivation expects — is forwarded uninspected, and
+        // that is a deliberate choice, not an oversight: HKDF accepts input
+        // keying material of any length, and a given authenticator returns
+        // the same length on every assertion, so an odd length is
+        // self-consistent rather than a sign of corruption. Rejecting it
+        // would trade a working unlock for a lockout on a spec-violating
+        // browser or authenticator — availability is the right bias here.
         (!bytes.is_empty()).then_some(bytes)
     }
 
@@ -295,11 +311,15 @@ mod browser {
     /// `parseRequestOptionsFromJSON` is inconsistent, so a salt that went
     /// through the JSON parser would silently do nothing on some browsers
     /// (spec section 7.1). One welcome consequence: `passkey_login_start`
-    /// needs no change at all. Assignment rather than a merge is safe
-    /// because the login challenge carries no extensions — webauthn-rs fills
-    /// in only `appid`, which this app never sets. A failed set is ignored
-    /// for the same reason a missing result is: it costs the unlock, not the
-    /// sign-in.
+    /// needs no change at all. Assignment rather than a merge is safe today
+    /// because `start_passkey_authentication` always passes `extensions:
+    /// None` for the login challenge — not because the type is small:
+    /// `RequestAuthenticationExtensions` actually carries three fields
+    /// (`appid`, `uvm`, `hmac_get_secret`). **If the login challenge ever
+    /// gains a server-side extension, this line will silently drop it** —
+    /// that is the point at which assignment here must become a merge. A
+    /// failed set is ignored for the same reason a missing result is: it
+    /// costs the unlock, not the sign-in.
     ///
     /// Coverage: [`prf_output`], which reads the result, has none — see its
     /// own note. `register`'s neighbouring capability check runs through

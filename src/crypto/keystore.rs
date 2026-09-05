@@ -243,6 +243,14 @@ async fn write(
     let settled = settle(&request);
     let committed = committed(&transaction);
 
+    // A failed request aborts its transaction, which fires the `onabort`
+    // handler `committed` already registered above — but the `?` here
+    // returns before that promise is ever awaited. It still settles
+    // (rejected), just with nobody observing it, which is likely an
+    // unhandled-promise-rejection warning in the console on every write
+    // failure. Not a hang and not a security issue — the caller still gets
+    // the real error below — but worth naming so the console noise doesn't
+    // read as a second bug.
     JsFuture::from(settled)
         .await
         .map_err(|e| failed(operation, &e))?;

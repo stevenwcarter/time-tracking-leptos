@@ -187,11 +187,15 @@ fn js_array(items: &[&JsValue]) -> Array {
 ///
 /// - Every secret this module handles crosses into JS as a `Uint8Array`
 ///   BufferSource: key material, PRF output, recovery-code bytes, entry
-///   plaintext. The only *strings* passed to WebCrypto are compile-time
+///   plaintext. The strings passed to WebCrypto are all compile-time
 ///   constants — `"raw"`, `"AES-GCM"`, `"AES-KW"`, `"HKDF"`, `"SHA-256"`,
-///   the usage names — and, from [`super::keystore`], the fixed database,
-///   store and record names. For key material to reach a `message`, a
-///   browser would have to format typed-array contents into an exception
+///   the usage names. IndexedDB, via [`super::keystore`], additionally
+///   passes the fixed database, store and record names, plus one dynamic
+///   string: `put_in` stores the account's `user` identifier alongside the
+///   key. None of that is key material, which is the property this
+///   argument actually needs — `user` is an email the client already holds,
+///   not a secret — so for key material specifically to reach a `message`,
+///   a browser would have to format typed-array contents into an exception
 ///   string, which none does.
 /// - Against that, `name` alone is often useless. Every argument-shape
 ///   mistake — a malformed algorithm object, a missing field, the wrong sort
