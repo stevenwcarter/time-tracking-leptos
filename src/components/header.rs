@@ -33,7 +33,7 @@ pub fn AppHeader(
                     {date.map(|date| view! { <DatePicker date=date/> })}
                 </div>
                 <div class="shrink-0">
-                    <AccountMenu/>
+                    <AccountMenu date=date/>
                 </div>
             </div>
         </header>

@@ -1,7 +1,10 @@
 //! Persistent storage seam.
 //!
-//! Components never touch this module directly — they use
-//! [`hook::use_persistent`]. Two things vary behind it:
+//! A single day's value is read or written through [`hook::use_persistent`];
+//! components should not call [`load`] or [`store`] directly. A *range* of
+//! days ([`dates_with_entries`], [`bodies_in_range`]) has no per-day signal
+//! to hang off of, so those are called directly (`week_view` is the only
+//! caller today). Two things vary behind either path:
 //!
 //! - **Which day** is being read or written ([`StorageKey`]).
 //! - **Where** it lives ([`Backend`]): `localStorage` when signed out, the
@@ -69,6 +72,36 @@ pub enum Backend {
     Local,
     /// The server, via server functions. Used when signed in.
     Remote,
+}
+
+/// Monotonic counter identifying the newest in-flight load.
+///
+/// Loads are async and can overlap — re-running one while an earlier call is
+/// still in flight is normal (a changed date, a changed backend, a
+/// fast-clicked "next week"), and nothing guarantees the two resolve in the
+/// order they started. Only the newest may publish its result; an older one
+/// arriving after must be discarded rather than overwrite it.
+///
+/// Shared by [`hook::use_persistent`] and `week_view`'s range load, which
+/// both need the same guard. Only the type is `pub(crate)`: the shape of the
+/// guard is settled, but the actual holding-a-token-across-an-await dance
+/// stays with each caller, so it can be paired with that caller's specific
+/// signal writes.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Generation(u64);
+
+impl Generation {
+    /// Starts a new load, invalidating any earlier one, and returns its
+    /// token. Tokens start at 1, so 0 is a safe "never current" sentinel.
+    pub(crate) fn next(&mut self) -> u64 {
+        self.0 += 1;
+        self.0
+    }
+
+    /// Whether `token` identifies the newest load.
+    pub(crate) fn is_current(&self, token: u64) -> bool {
+        self.0 == token
+    }
 }
 
 /// Something went wrong reaching or interpreting the backing store.
@@ -190,6 +223,40 @@ pub async fn dates_with_entries(
     }
 }
 
+/// Every stored body in `[from, to]`, unwrapped. Feeds the week view.
+///
+/// Separate from [`dates_with_entries`] because the two answer different
+/// questions and should move different amounts of data: the calendar wants
+/// to know *which* days, this wants *what*.
+pub async fn bodies_in_range(
+    backend: Backend,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<(NaiveDate, String)>, StorageError> {
+    #[cfg(feature = "hydrate")]
+    {
+        let raw = match backend {
+            Backend::Local => local::bodies_in_range(from, to).await?,
+            Backend::Remote => remote::bodies_in_range(from, to).await?,
+        };
+        raw.into_iter()
+            .map(|(date, env)| {
+                envelope::unwrap(&env)
+                    .map(|body| (date, body))
+                    .map_err(|source| StorageError::Envelope {
+                        key: StorageKey::TimeEntry(date).as_key(),
+                        source,
+                    })
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        let _ = (backend, from, to);
+        Ok(Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +328,41 @@ mod tests {
         let key = StorageKey::TimeEntry(d(2026, 9, 4));
         assert_eq!(block_on(store(Backend::Local, key, "x")), Ok(()));
         assert_eq!(block_on(clear(Backend::Local, key)), Ok(()));
+    }
+
+    /// Same invariant as `ssr_backends_return_none`, for the range read the
+    /// week view uses: no backend may return content during SSR.
+    #[test]
+    fn ssr_bodies_in_range_is_empty() {
+        for backend in [Backend::Local, Backend::Remote] {
+            assert_eq!(
+                block_on(bodies_in_range(backend, d(2026, 8, 31), d(2026, 9, 6))),
+                Ok(Vec::new()),
+                "{backend:?} must not return entries during SSR"
+            );
+        }
+    }
+
+    /// Pins invariant I2 for a range load: the *older* of two overlapping
+    /// loads resolves last. Without a generation guard it would overwrite
+    /// the newer result with stale data.
+    #[test]
+    fn a_stale_load_does_not_overwrite_a_newer_one() {
+        let mut generation = Generation::default();
+        let first = generation.next();
+        let second = generation.next();
+        assert!(generation.is_current(second), "the newest load may write");
+        assert!(
+            !generation.is_current(first),
+            "an older load must be discarded"
+        );
+    }
+
+    #[test]
+    fn a_single_load_is_always_current() {
+        let mut generation = Generation::default();
+        let only = generation.next();
+        assert!(generation.is_current(only));
     }
 
     /// Minimal executor — these futures never yield under `ssr`.

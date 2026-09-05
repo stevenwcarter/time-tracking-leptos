@@ -1,12 +1,14 @@
 //! The upper-right account control: sign-in popover when signed out, a small
 //! menu when signed in.
 
+use chrono::NaiveDate;
 use leptos::either::Either;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
 
 use crate::auth_ctx::AuthCtx;
+use crate::date::to_iso;
 use crate::server_fns::session::{logout, request_magic_link};
 
 /// The local part of an address, capped, for the corner label.
@@ -20,7 +22,12 @@ pub fn short_name(email: &str) -> String {
 }
 
 #[component]
-pub fn AccountMenu() -> impl IntoView {
+pub fn AccountMenu(
+    /// The day currently in view, so the signed-in menu can link to its
+    /// week. `None` on routes that don't name one (`/`, `/account`) — there
+    /// the "This week" link is omitted rather than guessed.
+    date: Option<NaiveDate>,
+) -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
     let open = RwSignal::new(false);
 
@@ -57,7 +64,7 @@ pub fn AccountMenu() -> impl IntoView {
             >
                 {move || match auth.user.get() {
                     None => Either::Left(view! { <SignInPanel/> }),
-                    Some(email) => Either::Right(view! { <SignedInPanel email=email/> }),
+                    Some(email) => Either::Right(view! { <SignedInPanel email=email date=date/> }),
                 }}
             </div>
         </div>
@@ -65,7 +72,7 @@ pub fn AccountMenu() -> impl IntoView {
 }
 
 #[component]
-fn SignedInPanel(email: String) -> impl IntoView {
+fn SignedInPanel(email: String, date: Option<NaiveDate>) -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
 
     let sign_out = move |_| {
@@ -81,6 +88,18 @@ fn SignedInPanel(email: String) -> impl IntoView {
 
     view! {
         <p class="text-xs text-gray-500 truncate pb-2 mb-2 border-b border-gray-100">{email}</p>
+        // Only on routes that already name a day: there is no client-only
+        // "today" to fall back on here (`date::today_local` doesn't exist
+        // under `ssr`), so a dateless route just omits the link rather than
+        // guessing — the same tradeoff `AppHeader` makes for `DatePicker`.
+        {date.map(|date| view! {
+            <A
+                href=format!("/week/{}", to_iso(date))
+                attr:class="block text-sm text-gray-700 hover:bg-gray-50 rounded px-2 py-1.5 no-underline"
+            >
+                "This week"
+            </A>
+        })}
         <A
             href="/account"
             attr:class="block text-sm text-gray-700 hover:bg-gray-50 rounded px-2 py-1.5 no-underline"

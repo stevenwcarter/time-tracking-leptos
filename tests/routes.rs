@@ -71,6 +71,23 @@ async fn account_route_beats_the_date_route() {
     );
 }
 
+/// `/week/{date}` is a two-segment path, so it cannot actually match the
+/// one-segment `/{date}` pattern — but that is reasoning, not a test. This
+/// pins it against the real component rather than the task-19 stub.
+#[tokio::test]
+async fn week_route_beats_the_date_route() {
+    let (status, body) = get("/week/2026-08-31").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Week of"),
+        "/week/2026-08-31 did not render the week view"
+    );
+    assert!(
+        !body.contains("Time Entry"),
+        "/week/2026-08-31 rendered the day view instead of the week view"
+    );
+}
+
 #[tokio::test]
 async fn a_real_date_renders_the_day_view() {
     let (status, body) = get("/2026-09-04").await;

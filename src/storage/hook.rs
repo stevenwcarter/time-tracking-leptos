@@ -30,30 +30,7 @@ use leptos::logging::error;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use super::{Backend, StorageError, StorageKey, load, store};
-
-/// Monotonic counter identifying the newest in-flight load.
-///
-/// Loads are async and can overlap: changing the date twice quickly starts
-/// two, and nothing guarantees they resolve in order. Only the newest may
-/// publish its result. Purely internal to [`use_persistent`], so it stays
-/// unexported.
-#[derive(Debug, Default, Clone, Copy)]
-struct Generation(u64);
-
-impl Generation {
-    /// Starts a new load, invalidating any earlier one, and returns its
-    /// token. Tokens start at 1, so 0 is a safe "never current" sentinel.
-    fn next(&mut self) -> u64 {
-        self.0 += 1;
-        self.0
-    }
-
-    /// Whether `token` identifies the newest load.
-    fn is_current(&self, token: u64) -> bool {
-        self.0 == token
-    }
-}
+use super::{Backend, Generation, StorageError, StorageKey, load, store};
 
 /// A value persisted across reloads, with the load state made explicit.
 #[derive(Clone, Copy)]
@@ -178,26 +155,7 @@ mod tests {
         assert_eq!(loaded_value(Err(StorageError::Unavailable)), "");
     }
 
-    /// Pins invariant I2. Two loads are in flight; the *older* one resolves
-    /// last. Without a generation guard it would overwrite the newer day's
-    /// value, showing the wrong date's text with no indication anything is
-    /// wrong.
-    #[test]
-    fn a_stale_load_does_not_overwrite_a_newer_one() {
-        let mut generation = Generation::default();
-        let first = generation.next();
-        let second = generation.next();
-        assert!(generation.is_current(second), "the newest load may write");
-        assert!(
-            !generation.is_current(first),
-            "an older load must be discarded"
-        );
-    }
-
-    #[test]
-    fn a_single_load_is_always_current() {
-        let mut generation = Generation::default();
-        let only = generation.next();
-        assert!(generation.is_current(only));
-    }
+    // `Generation`'s own behaviour (a stale load is discarded, a single
+    // load is always current) is pinned once in `storage::tests`, where the
+    // type now lives — it is shared with `week_view`'s range load.
 }

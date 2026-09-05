@@ -46,3 +46,17 @@ pub async fn dates_with_entries(
         .filter_map(|s| parse_iso(s))
         .collect())
 }
+
+/// Every stored body in `[from, to]`, still envelope-wrapped — unwrapping
+/// happens back in `mod.rs`, never here (see the module doc there).
+pub async fn bodies_in_range(
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<(NaiveDate, String)>, StorageError> {
+    Ok(entries::entries_in_range(to_iso(from), to_iso(to))
+        .await
+        .map_err(server_error)?
+        .into_iter()
+        .filter_map(|(date, body)| parse_iso(&date).map(|date| (date, body)))
+        .collect())
+}

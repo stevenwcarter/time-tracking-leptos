@@ -92,6 +92,20 @@ mod browser {
         store.get_item(key).map_err(|_| StorageError::Unavailable)
     }
 
+    /// Every key currently in the store, in whatever order the browser
+    /// enumerates them. Shared by every range query, which each then filter
+    /// down to the dates they care about.
+    fn all_keys(store: &web_sys::Storage) -> Result<Vec<String>, StorageError> {
+        let len = store.length().map_err(|_| StorageError::Unavailable)?;
+        let mut keys = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            if let Ok(Some(k)) = store.key(i) {
+                keys.push(k);
+            }
+        }
+        Ok(keys)
+    }
+
     /// Peels the codec layer off a raw dated value, leaving the envelope
     /// string for [`super::resolve_load`] (and ultimately the seam in
     /// `mod.rs`) to unwrap.
@@ -137,19 +151,33 @@ mod browser {
         to: NaiveDate,
     ) -> Result<Vec<NaiveDate>, StorageError> {
         let store = storage()?;
-        let len = store.length().map_err(|_| StorageError::Unavailable)?;
-        let mut keys = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            if let Ok(Some(k)) = store.key(i) {
-                keys.push(k);
+        let keys = all_keys(&store)?;
+        Ok(dates_from_keys(&keys, from, to))
+    }
+
+    /// Reads every dated entry in `[from, to]`, skipping days that were
+    /// never written. Like [`dates_with_entries`], this only ever sees the
+    /// dated keys — the undated legacy alias for today is not considered,
+    /// the same limitation `dates_with_entries` already has.
+    pub async fn bodies_in_range(
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<(NaiveDate, String)>, StorageError> {
+        let store = storage()?;
+        let keys = all_keys(&store)?;
+        let mut out = Vec::new();
+        for date in dates_from_keys(&keys, from, to) {
+            let key = StorageKey::TimeEntry(date).as_key();
+            if let Some(raw) = read(&store, &key)? {
+                out.push((date, decode_stored(&raw, &key)?));
             }
         }
-        Ok(dates_from_keys(&keys, from, to))
+        Ok(out)
     }
 }
 
 #[cfg(feature = "hydrate")]
-pub use browser::{clear, dates_with_entries, load, store_value as store};
+pub use browser::{bodies_in_range, clear, dates_with_entries, load, store_value as store};
 
 #[cfg(test)]
 mod tests {
