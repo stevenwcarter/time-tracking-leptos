@@ -1,5 +1,40 @@
 # Client-Side Encryption Implementation Plan
 
+> **Historical. This is the plan as written before implementation, and it is
+> materially stale.** It is kept as a record of *intent*, not of outcome. The
+> feature shipped on `feat/client-side-encryption`; several tasks changed
+> scope while being executed, and the corrections were folded into the spec
+> (`docs/superpowers/specs/2026-09-05-client-side-encryption-design.md`),
+> which is amended in place and is the accurate document. Where the two
+> disagree, the spec wins; where the spec and the code disagree, the code
+> wins. Known divergences, so nobody re-derives them:
+>
+> - **Task 11 / the File Structure.** `store` and `clear` take a
+>   `WriteKey { Plaintext, Sealed, Locked }`, not the `Option<&SessionKey>`
+>   the plan specifies. `None` on a write turned out to mean two things, one
+>   of which silently downgrades an encrypted account's row to plaintext —
+>   see spec E7. Reads do still take `Option<&SessionKey>`.
+> - **Task 12.** `EncryptionState` has five variants, not four: `Unreachable`
+>   was added for a probe that *failed* as distinct from one that has not
+>   finished. And the seed is not always `Unknown` — a signed-out visitor
+>   seeds `Disabled`, computed from the same session cookie both targets
+>   already agree on. See spec §7.4 and its amendment.
+> - **Files not in the File Structure table.** `src/crypto/flow.rs` (ceremony
+>   steps needing the authenticator *and* the server, shared by the unlock
+>   prompt and the account panel) and `src/components/status.rs` (the shared
+>   note/problem line) were both extracted during implementation.
+> - **`WrapKind`** lives in `src/crypto/wire.rs`, not `src/entry_key/mod.rs`:
+>   both halves of the app need it and `entry_key` is `ssr`-only.
+> - **`envelope::unwrap`** does not exist. It split into the pure,
+>   host-testable `plan_read`/`decide_row` and the async browser-only
+>   `open_row`. Spec §5.1 records why.
+> - **Ceremony ordering.** Spec §6.1's steps do not run in their written
+>   order; the spec carries two amendments explaining what moved and what
+>   failure each reordering trades away.
+>
+> The verification matrix, the crypto-constant list, and the code conventions
+> in Global Constraints below are all still correct and still binding.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Encrypt signed-in users' entry bodies in the browser under a key the server never sees, unwrapped by passkey PRF with a recovery code as backup.

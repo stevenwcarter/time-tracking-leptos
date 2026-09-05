@@ -424,7 +424,9 @@ mod ceremony {
     /// the call site would compile, file each wrap under the other's route,
     /// and leave the account openable by neither secret.
     pub struct Enabled {
-        /// Unlocked, and already remembered on this device.
+        /// Unlocked, but **not** yet remembered on this device: nothing here
+        /// touches the keystore, and the caller reaches it only by handing
+        /// this to `EncryptionCtx::unlock` once the server has confirmed.
         pub session_key: SessionKey,
         /// Shown once and never again (spec section 6.1 step 5).
         pub recovery_code: String,

@@ -92,7 +92,14 @@ Small blast radius, by design. Phase 1 put the seam in the right place.
 **New:** `src/crypto/mod.rs`, `src/crypto/wire.rs`, `src/crypto/recovery.rs`,
 `src/crypto/subtle.rs`, `src/crypto/keystore.rs`, `src/encryption_ctx.rs`,
 `src/entry_key/{mod,store}.rs`, `src/server_fns/encryption.rs`,
-`src/components/unlock.rs`, one migration.
+`src/components/unlock.rs`, one migration. Three more were extracted during
+implementation and belong on this list: `src/crypto/flow.rs` (the ceremony
+steps needing the authenticator *and* the server, shared by the unlock prompt
+and the account panel so their wording and retries cannot drift),
+`src/components/encryption_panel.rs` (§6.1's enable and manage UI, which
+`account_page` mounts rather than hosting inline), and
+`src/components/status.rs` (the one note/problem line `/account`'s two halves
+both talk back through).
 
 **Unchanged, and this is the point:** every component that reads or writes a
 day's text. `summary`, `projects`, `time_display`, `time_entry_area`,
@@ -238,13 +245,13 @@ that the recovery code is the only backup.
    before the dialog closes; there is a "copy" control, and the code is never
    shown again. **Runs before step 4.**
 6. Re-import the DEK non-extractable, store it in the keystore (§7.3), and
-   run the migration (§8). **The keystore half runs before step 4** as well;
-   the migration still runs last.
+   run the migration (§8). Both halves run after step 4 — see the third
+   amendment below.
 
-**Amended during implementation, twice.** The steps keep the numbers above —
-other documents and several doc comments cite them — but the order they run
-in is `1 → 2 → 3 → 6(keystore) → 5 → 4 → 6(migration)`. Neither departure is
-cosmetic; each trades one failure for a strictly better one.
+**Amended during implementation, three times.** The steps keep the numbers
+above — other documents and several doc comments cite them — but the order
+they run in is **`1 → 2 → 3 → 5 → 4 → 6`**. No departure is cosmetic; each
+trades one failure for a strictly better one.
 
 *The keystore write moved before the server call.* `crypto::enable` performs
 it itself, rather than returning the sealed key for the caller to persist
@@ -258,6 +265,29 @@ next probe reports `Disabled` and nothing ever reads the record; a retry
 overwrites it, and sign-out clears it. Persisting local state for unconfirmed
 server state is normally worth avoiding, but here the local state does
 nothing without the server state.
+
+*Third amendment: the keystore write moved back, and past step 4.* The two
+paragraphs above are **superseded** — kept because the argument they make is
+still the right one for the failure they were weighing, and because what
+overrode it was a failure neither had considered. `crypto::enable` no longer
+touches the keystore at all; the write lives in `EncryptionCtx::unlock`,
+which the caller invokes on `encryption_enable`'s `Ok` branch.
+
+The forcing case is **whose** account the key belongs to. Writing on the way
+past meant writing before anyone had asked, and the ceremony is async with
+the account menu mounted throughout it — so an enable resolving after a
+sign-out left the previous account's key sitting on the device. No other
+account could read it (`keystore::get` checks the stored user), but "your key
+is gone from this device" is exactly the promise sign-out makes. `unlock`
+checks the signed-in identity, writes, then checks again on the far side of
+the write, because the write is itself an `await` and sign-out is a live
+toggle for the whole of it.
+
+The "forgot to call `keystore::put`" bug the first amendment guarded against
+is closed a different way: `unlock` is the single door to `Unlocked` for
+every ceremony, so persisting and publishing are one call rather than two
+that a caller could get half right. The orphan-key risk is gone with it —
+nothing is written until the server has confirmed.
 
 *The recovery code moved before the server call too.* Step 5 is shown, and
 confirmed, while the server still knows nothing; the user's confirmation is
@@ -493,6 +523,33 @@ on both sides is the only value that hydrates. This is the same reasoning as
 the existing entry tri-state, and the same reasoning that keeps
 `ssr_omits_loaded_state` passing.
 
+**Amended during implementation: "always" is now "for a signed-in visitor".**
+The seed is computed from `auth_ctx::initial_user`, which both targets derive
+identically from the session cookie: a signed-in visitor seeds `Unknown`
+exactly as above, and a **signed-out visitor seeds `Disabled`**. The
+paragraph above is unchanged for the case it was written about; what it
+missed is that the case does not cover everyone.
+
+A signed-out visitor is on `Backend::Local`, which §1.2 excludes from
+encryption outright. That is not a conclusion read from a row nobody has
+fetched — it is a fact about which backend `localStorage` is, true before any
+probe could run, and derived from the same cookie the header already renders.
+Seeding `Unknown` there bought the app's signed-out majority a read-only
+textarea and a "getting ready" line on the main page for as long as wasm took
+to load, protecting a visitor who was never at risk. Hydration is undisturbed
+because both targets compute the seed from the same input.
+
+The asymmetry is the point, and it is not cosmetic: `Disabled` would hydrate
+just as cleanly for a *signed-in* visitor, which is exactly why seeding it
+there would be wrong rather than merely unnecessary. `Disabled` is a
+conclusion — "this account has no encryption" — and its write key is
+`Plaintext`. Asserting it before anything has been read is how plaintext rows
+get written into an encrypted account (E7).
+
+Pinned by `app.rs`'s `ssr_offers_an_editable_entry_area_when_signed_out` and
+`ssr_still_withholds_an_editable_entry_area_when_signed_in`, which assert the
+two halves against each other so neither can be "fixed" alone.
+
 ### 7.5 The storage seam
 
 `envelope::wrap`/`unwrap` become async and take `Option<&SessionKey>`:
@@ -641,9 +698,22 @@ it — the phase-1 spec's §10 convention.
   opaque strings and the migration's version filtering happens in the
   browser. *Guarded by:* the absence of any body-inspecting server code, plus
   the existing week-aggregation-is-client-side tests.
-- **E2. SSR renders no entry content and no encryption state.** *Guarded by:*
-  `ssr_omits_loaded_state`, `ssr_omits_entry_content_even_when_signed_in`,
-  and a new `ssr_renders_unknown_encryption_state`.
+- **E2. SSR renders no entry content, and no encryption state it has not
+  already rendered by another name.** *Guarded by:* `ssr_omits_loaded_state`,
+  `ssr_omits_entry_content_even_when_signed_in`, and
+  `ssr_renders_unknown_encryption_state`.
+
+  **Narrowed during implementation**, from "and no encryption state". The
+  server renders `Unknown` for a signed-in visitor and `Disabled` for a
+  signed-out one (§7.4's amendment). `Disabled` there is not a fact about any
+  account: it is restatement of the session cookie, which the header already
+  puts in the SSR body, so it discloses nothing new and hydrates identically
+  on both targets. What E2 still forbids absolutely is what it was written
+  for — SSR must never render a state derived from a **row**, which is every
+  state that distinguishes one signed-in account from another: `Locked`,
+  `Unlocked`, or a `Disabled` reached by reading `encrypted_at`. `Unlocked`
+  is unconstructible under `ssr` (`SessionKey` is uninhabited there), and the
+  server never probes, so it never reaches `Unreachable` either.
 - **E3. Envelope dispatch is per-row, on the row's own `v`.** Partial
   migration correctness rests entirely on this. *Guarded by:* mixed-version
   round-trip tests.
@@ -694,6 +764,24 @@ it — the phase-1 spec's §10 convention.
   So E7 has a second half: **the key is published on the same `Ok` branch
   that returns from `encryption_enable`, with no intervening `await` and no
   user interaction in between.** Any deferral reopens the window.
+
+  **Amended: "no intervening `await`" is now "no `await` but the publish
+  itself".** `EncryptionCtx::unlock` is `async` — the keystore write has to
+  be sequenced against the identity check that guards it (§6.1's third
+  amendment) — so the `Ok` branch awaits exactly once, on the call that does
+  the publishing. Nothing else may go between them, and nothing does.
+
+  What survives of the original wording is the part that matters: **no user
+  interaction.** The residual window is one IndexedDB round trip in which
+  `EncryptionCtx` still reports `Disabled`, and it is a real window rather
+  than a proven-impossible one — an `await` yields to the event loop, and the
+  event loop is where clicks come from. It is bounded by a local write with
+  no network in it, it is reachable only by navigating off `/account`
+  mid-write, and closing it entirely would mean publishing before the
+  identity check, which is the strictly worse bug §6.1's third amendment
+  exists to fix. Recorded rather than argued away, per §10's rule: if a
+  future change makes `unlock` slower or gives that window a network hop, it
+  stops being acceptable and E7's second half needs re-deciding.
 
 - **E6. `APP_SALT` and the two HKDF `info` strings never change.** Changing
   one silently makes every existing wrap unopenable. *Guarded by:*

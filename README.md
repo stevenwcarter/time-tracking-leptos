@@ -76,7 +76,8 @@ changes where entries are stored, and nothing else about how the app is used:
 - The first time you sign in on a device that already has local entries, a
   banner offers to import them; days that already exist on the server are
   left untouched either way, so importing twice is safe.
-- `/account` manages passkeys: add one, rename it, or remove it.
+- `/account` manages passkeys: add one, rename it, or remove it — and, once
+  you have a passkey that supports it, turns on encryption (below).
 - Signing out returns you to the `localStorage` backend. Nothing already
   saved on the server is deleted.
 
@@ -107,6 +108,74 @@ SMTP_INSECURE=true
 STARTTLS, which Mailpit does not offer, and every send fails with "STARTTLS is
 not supported on this server". Sign-in emails then appear in the web UI.
 
+## Encrypting your entries
+
+Signing in moves your entries onto the server. By default they are stored
+there in the clear, which means whoever runs the server can read them. You
+can turn that off.
+
+**What enabling encryption does.** Your browser generates a key, encrypts
+every entry with it, and sends the server only ciphertext. The key never
+leaves your browser — the server stores two *wrapped* copies of it that it
+has no way to open. From then on the server holds the encrypted text, which
+day each entry belongs to, and roughly how long it is; it cannot read a word
+of any entry, and neither can anyone with a copy of the database, a backup,
+or a court order served on whoever hosts it.
+
+**How to turn it on.** `/account` offers it once you have enrolled a passkey
+whose authenticator supports the WebAuthn PRF extension — most modern
+platform authenticators and security keys do. Accounts without one keep
+working exactly as before, unencrypted. Enabling re-encrypts the entries you
+already have, in one pass you can watch; if it is interrupted, `/account`
+tells you how many days are left and offers to finish. Nothing becomes
+unreadable in the meantime.
+
+**Your recovery code is shown once, and it is the only backup.** Enabling
+generates a 32-character code and shows it to you on a screen you have to
+confirm before it closes. It is never shown again. Write it down or put it in
+a password manager *before* clicking through — the code is what gets you back
+in on a browser your passkey cannot reach, or after your passkey is gone.
+
+> **If you lose every passkey and the recovery code, your entries are gone,
+> permanently.** Not locked, not recoverable by support, not restorable from
+> a backup — the ciphertext is still there and no key on earth opens it. That
+> is exactly what "the server cannot read your entries" costs, and it is not
+> a limitation anyone can lift for you afterwards.
+
+You can ask `/account` for a fresh recovery code at any time, which replaces
+the old one. You are offered one automatically after unlocking with a code,
+since typing it in may have left it somewhere careless.
+
+**Unlocking.** Each browser unlocks once and then remembers — the key is
+stored in that browser in a form scripts cannot read out, so reloads and
+restarts do not re-prompt. Signing in *with a passkey* unlocks in the same
+gesture, with no extra prompt. Signing in with a magic link does not, so the
+day view asks you to unlock, either with a passkey or with your recovery
+code. "Lock now" on `/account` forgets the key for that browser, and so does
+signing out. Clearing site data or using a private window means unlocking
+again.
+
+**Adding a passkey to an encrypted account takes three prompts.** Your
+authenticator asks three times in a row: once to create the new passkey, once
+against a passkey you already have — to recover the key so it can be wrapped
+for the new one — and once against the new passkey. You can substitute your
+recovery code for that middle prompt, but there is no way to do it in fewer
+than three steps: the key is deliberately held in a form nothing can copy
+out, the app included, so it has to be re-derived at that moment. `/account`
+says so before you start rather than springing three prompts on you one at a
+time.
+
+**Removing a passkey** deletes its ability to unlock. The app refuses to
+remove your *last* unlocking passkey while encryption is on, and points you
+at your recovery code instead, so a single click cannot destroy your data.
+
+**What it does not protect against.** Encryption defends your entries at
+rest — an operator reading the database, a stolen backup, a subpoena. It does
+not hide which days you logged time or roughly how much you wrote; it does
+not hide your email address or when you signed in; and it cannot defend
+against a server that ships modified JavaScript to your browser, because the
+server is what serves the app in the first place.
+
 ## Architecture
 
 The app is Leptos SSR + hydration: the server renders the page shell, the
@@ -116,16 +185,27 @@ browser fills in the actual saved time entry after hydration, from
 
 Signed-out users' time-tracking data is never sent to the server: it lives
 only in `localStorage`. **Signed-in users' entries are stored server-side, and
-today that storage is plaintext** — anyone with access to the database can
-read them. The server is structured so that it never needs to parse an
-entry's contents (the week view's totals, for instance, are computed in the
-browser, not in a server query) specifically so that a planned phase 2 can
-replace plaintext storage with client-side encryption the server cannot undo,
-without changing that structure. Until phase 2 ships, treat every signed-in
-entry as readable by whoever operates the server.
+whether that storage is readable by the operator depends on the account.** An
+account that has enabled encryption (above) stores ciphertext under a key the
+server never holds; an account that has not — the default, and the only
+option for an account with no PRF-capable passkey — stores plaintext that
+anyone with database access can read. Both shapes coexist, and so do both
+within a single account while its migration pass runs: each stored row
+carries its own version tag and is read according to that tag, which is what
+makes a half-migrated account a normal state rather than a broken one.
+
+The server is structured so that it never needs to parse an entry's contents
+— the week view's totals are computed in the browser, not in a server query,
+and the enable-time migration asks the browser, not the database, which rows
+still need encrypting. That structure predates the encryption and is what
+let it drop in at the storage seam without touching a single component that
+reads or writes entry text.
 
 See `docs/superpowers/specs/2026-09-03-leptos-migration-design.md` for the
 hydration contract — the reason stored state is `Option<String>` rather than
-`String` — and `docs/superpowers/specs/2026-09-04-accounts-and-dated-entries-design.md`
-for accounts, per-day storage, and the encryption trajectory (§9).
+`String` — `docs/superpowers/specs/2026-09-04-accounts-and-dated-entries-design.md`
+for accounts and per-day storage, and
+`docs/superpowers/specs/2026-09-05-client-side-encryption-design.md` for the
+key hierarchy, the ceremonies, the threat model, and the invariants a change
+in this area has to keep.
 

@@ -215,12 +215,14 @@ impl EncryptionState {
 /// state again, so the box the user can type into and the call that refuses
 /// the keystroke cannot come to disagree.
 ///
-/// It exists because the disagreement is silent. The server always renders
-/// `Unknown` (invariant E2) and so does the client's first render, and
-/// `Unknown` is `WriteKey::Locked` — for a signed-in visitor that window is
-/// a full network round trip, with the textarea mounted and editable
-/// throughout. Anything typed into it was refused with nothing on screen to
-/// say so.
+/// It exists because the disagreement is silent. For a signed-in visitor the
+/// server renders `Unknown` (invariant E2) and so does the client's first
+/// render, and `Unknown` is `WriteKey::Locked` — a window a full network
+/// round trip wide, with the textarea mounted and editable throughout.
+/// Anything typed into it was refused with nothing on screen to say so. A
+/// signed-out visitor never sees that window at all; their seed is
+/// `Disabled`, which is why the seed depends on who is signed in (see this
+/// module's header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Writes {
     /// The account has no encryption, or this device holds the key.

@@ -480,6 +480,30 @@ That the parsing happens client-side is not an implementation detail — see
 
 ## 9. The encryption trajectory
 
+> **Phase 2 has shipped.** Its design is
+> `2026-09-05-client-side-encryption-design.md`, which supersedes §9.2 and
+> §9.3 below and amends this section in place rather than replacing it. §9.1
+> and §9.4 still hold as written, and §9.1 in particular is now load-bearing
+> rather than aspirational — it is phase-2 invariant E1.
+>
+> §9.2 and §9.3 are **predictions, kept because the record of what was
+> predicted and why it changed is the useful part.** Both were wrong in the
+> same instructive way: they picked primitives before the unlock *ceremony*
+> was designed, and the ceremony is what actually constrained the choice. Do
+> not read either as a description of the code. What shipped instead:
+>
+> | §9 predicted | Shipped | Why it changed |
+> |---|---|---|
+> | `alg: "xchacha20poly1305"` (§9.2) | `alg: "a256gcm"` — AES-256-GCM via WebCrypto | Holding the key as a **non-extractable** `CryptoKey` is a WebCrypto-only capability, and WebCrypto has no ChaCha. Also costs no wasm bundle weight and is hardware-accelerated. |
+> | An Argon2id passphrase as the second wrapper (§9.3) | A 160-bit recovery code, HKDF-SHA256 | No passphrase at all: the backup is a code shown once at enable. At 160 bits of entropy a memory-hard KDF buys nothing — Argon2id exists to make *low*-entropy secrets expensive to guess. |
+>
+> Everything §9.2 says about the *envelope* — versioned from day one, applied
+> at the storage seam, layered above `storage/codec.rs` — held exactly as
+> written, and is why phase 2 needed no data migration. Everything §9.3 says
+> about **requesting PRF at credential creation** and persisting
+> `prf_capable` held too, and is why existing passkeys did not have to be
+> re-enrolled. It is only the two primitive choices that moved.
+
 Phase 2 encrypts entry bodies so that the operator cannot read them. Phase 1
 does not encrypt anything, but it must not foreclose that. This section is the
 contract phase 2 depends on.
@@ -497,7 +521,13 @@ Three consequences, all already reflected above:
   user whose rows it could trivially read (§10.1).
 - `entry_save` performs no validation of `body` beyond a length cap.
 
-### 9.2 The envelope
+### 9.2 The envelope — *partly superseded*
+
+> **Superseded in one respect** by
+> `2026-09-05-client-side-encryption-design.md` §1.3 and §5.1: phase 2 writes
+> `{"v":2,"alg":"a256gcm","n":…,"ct":…}`, not `xchacha20poly1305`. The
+> `alg` field is what let that be a recorded choice rather than a migration,
+> which is the whole point this subsection was making. Kept as written.
 
 Bodies are stored as a versioned JSON envelope from day one:
 
@@ -516,7 +546,15 @@ shape and a future export moves between them unchanged. Note this is a
 string encoding on the `localStorage` side; the codec's compatibility
 contract is untouched.
 
-### 9.3 Passkey PRF (D9)
+### 9.3 Passkey PRF (D9) — *partly superseded*
+
+> **Superseded in one respect** by
+> `2026-09-05-client-side-encryption-design.md` §1.1 and §4: the second
+> wrapper is a **160-bit recovery code** run through HKDF-SHA256, not an
+> Argon2id passphrase, and there is no passphrase anywhere in the shipped
+> feature. The paragraph below about requesting PRF at *creation* time, and
+> persisting `prf_capable`, held exactly and is what phase 2 spent. Kept as
+> written.
 
 Phase 2 generates a random data key and wraps it twice: once under a key
 derived from the WebAuthn PRF extension, once under an Argon2id passphrase
@@ -684,6 +722,9 @@ It must not be reachable in release without a warning on every send.
 - **Route shadowing (§8.3).** Silent when wrong. Pinned by I4.
 - **PRF availability.** The extension may be refused; `prf_capable` is then
   `false` and phase 2 falls back to the passphrase. Phase 1 behavior is
-  unaffected either way.
+  unaffected either way. *(Superseded with §9.3: what shipped falls back to
+  the recovery code, not a passphrase, and a `prf_capable = false` credential
+  gets no wrap and cannot unlock at all. The risk itself was real; only the
+  named fallback changed.)*
 - **SMTP in production.** A spawned send that fails is only logged. Acceptable
   for a 15-minute re-requestable link; revisit if support load says otherwise.
