@@ -156,6 +156,13 @@ pub async fn encryption_add_passkey_wrap(
 /// Re-issues the recovery wrap after a recovery unlock (spec section 6.4).
 /// `entry_key::store::replace_recovery_wrap` already deletes-then-inserts in
 /// its own transaction, so there is nothing more to wrap here.
+///
+/// Idempotent for a given `wrapped_key`, which the store guarantees rather
+/// than this layer: a client whose first response was lost may resend the
+/// same bytes and will be told it succeeded. Without that, a reply dropped
+/// after a successful replace leaves the user holding a recovery code that
+/// no longer opens anything, believing it does — the one failure in this
+/// design that ends in permanently unreadable entries.
 #[server(endpoint = "encryption/replace_recovery_wrap")]
 pub async fn encryption_replace_recovery_wrap(wrapped_key: Vec<u8>) -> Result<(), ServerFnError> {
     use crate::entry_key::store;

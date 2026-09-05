@@ -147,8 +147,29 @@ pub fn delete_wrap_for_credential(
 /// Replaces the account's recovery wrap, leaving exactly one. Re-issuing a
 /// recovery code must not accumulate rows — only the newest one should ever
 /// open the data key.
+///
+/// **Idempotent for a given `wrapped_key`**: submitting the wrap the account
+/// already holds reports success without touching the row. That is what
+/// makes the client's retry safe, and the client needs one — a reply lost on
+/// the way back from a successful replace would otherwise leave the user
+/// believing the code they still hold works, when the server had already
+/// swapped it for a code they were never shown (see
+/// `components::unlock`'s `store_recovery_wrap`).
+///
+/// The comparison runs inside the same transaction as the write it might
+/// skip, so a concurrent re-issue cannot land between them and turn "already
+/// done" into a lie.
 pub fn replace_recovery_wrap(conn: &mut DbConn, user_id: i32, wrapped_key: &[u8]) -> Result<()> {
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        let current: Option<Vec<u8>> = entry_key_wrap::table
+            .filter(entry_key_wrap::user_id.eq(user_id))
+            .filter(entry_key_wrap::kind.eq(WrapKind::Recovery.as_str()))
+            .select(entry_key_wrap::wrapped_key)
+            .first(conn)
+            .optional()?;
+        if current.as_deref() == Some(wrapped_key) {
+            return Ok(());
+        }
         diesel::delete(
             entry_key_wrap::table
                 .filter(entry_key_wrap::user_id.eq(user_id))
@@ -250,6 +271,28 @@ mod tests {
             .filter(|w| w.kind == WrapKind::Recovery)
             .collect();
         assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].wrapped_key, vec![2; 40]);
+    }
+
+    /// The lost-response failure mode, from the server's side. A client that
+    /// never learned whether its submit landed must be able to send the same
+    /// wrap again: the retry has to *succeed* — reporting failure would send
+    /// the user back to a screen telling them their old code still works,
+    /// after this row had already been replaced — and it has to leave one
+    /// row, not two.
+    #[test]
+    fn resubmitting_the_same_recovery_wrap_succeeds_and_leaves_one_row() {
+        let (mut conn, uid) = seed();
+        insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[1; 40]).expect("first");
+        replace_recovery_wrap(&mut conn, uid, &[2; 40]).expect("replace");
+        replace_recovery_wrap(&mut conn, uid, &[2; 40]).expect("the retry must succeed");
+
+        let recovery: Vec<_> = list_wraps(&mut conn, uid)
+            .expect("list")
+            .into_iter()
+            .filter(|w| w.kind == WrapKind::Recovery)
+            .collect();
+        assert_eq!(recovery.len(), 1, "a retry must not accumulate rows");
         assert_eq!(recovery[0].wrapped_key, vec![2; 40]);
     }
 
