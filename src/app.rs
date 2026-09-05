@@ -14,6 +14,7 @@ use crate::components::time_display::TimeDisplay;
 use crate::components::time_entry_area::TimeEntryArea;
 use crate::components::week_view::WeekView;
 use crate::date::parse_iso;
+use crate::encryption_ctx::EncryptionCtx;
 use crate::storage::StorageKey;
 use crate::storage::hook::use_persistent;
 
@@ -46,9 +47,16 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
-    provide_context(AuthCtx {
+    let auth = AuthCtx {
         user: RwSignal::new(initial_user()),
-    });
+    };
+    provide_context(auth);
+    // Takes `auth` rather than reading it back out of context, so the
+    // dependency between the two is in the signature instead of in the order
+    // these two lines happen to be written in. The probe behind it never
+    // runs on the server, which is what keeps encryption state out of the
+    // SSR body (invariant E2).
+    provide_context(EncryptionCtx::probing(auth));
 
     view! {
         <Stylesheet id="leptos" href="/pkg/time-tracking-leptos.css"/>
@@ -270,6 +278,40 @@ mod tests {
         assert!(
             html.contains("<textarea") && html.contains("></textarea>"),
             "the SSR'd textarea must still be empty for a signed-in user"
+        );
+    }
+
+    /// Pins invariant E2. The server could read `encrypted_at` cheaply — it
+    /// has the session — but rendering `Locked` would put user-derived state
+    /// in the SSR body, and the client cannot tell locked from unlocked
+    /// without an async IndexedDB read anyway, so the first client render
+    /// would differ regardless. `Unknown` on both sides is the only value
+    /// that hydrates.
+    ///
+    /// Asserts negatively, like its two neighbours. Do not weaken it to make
+    /// a change pass.
+    ///
+    /// This cannot distinguish `Unknown` from `Disabled` — neither renders
+    /// unlock UI — so `encryption_ctx`'s
+    /// `a_context_that_has_not_probed_yet_is_unknown` pins that half.
+    #[test]
+    fn ssr_renders_unknown_encryption_state() {
+        let html = render_at("/2026-09-05", Some("alice@example.com"));
+        // The same positive control as the test above, and for the same
+        // reason: without it these assertions would pass just as well
+        // against a render that quietly stayed on the signed-out path.
+        assert!(
+            html.contains("alice"),
+            "this render must actually be the signed-in one, or the \
+             assertions below prove nothing about a signed-in user"
+        );
+        assert!(
+            !html.contains("Unlock"),
+            "server rendered the locked prompt"
+        );
+        assert!(
+            !html.contains("recovery code"),
+            "server rendered unlock UI it cannot know is needed"
         );
     }
 

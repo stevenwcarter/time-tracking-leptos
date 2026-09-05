@@ -31,6 +31,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use super::{Backend, Generation, StorageError, StorageKey, load, store};
+use crate::encryption_ctx::EncryptionCtx;
 
 /// A value persisted across reloads, with the load state made explicit.
 #[derive(Clone, Copy)]
@@ -39,6 +40,8 @@ pub struct Persistent {
     set_value: WriteSignal<Option<String>>,
     key: Signal<StorageKey>,
     backend: Signal<Backend>,
+    /// Whether this account's bodies are sealed, and with what.
+    encryption: EncryptionCtx,
     /// Shared with the loading effect, so a write can invalidate a read.
     /// See [`begin_operation`].
     generation: StoredValue<Generation>,
@@ -64,21 +67,21 @@ impl Persistent {
         // disagreeing.
         begin_operation(self.generation);
         self.set_value.set(Some(value.clone()));
-        // A write must use the day and backend current *right now*, not
-        // subscribe to their future changes — reading them untracked keeps
-        // this call from becoming a reactive dependency of its own effect.
+        // A write must use the day, backend and session current *right
+        // now*, not subscribe to their future changes — reading them
+        // untracked keeps this call from becoming a reactive dependency of
+        // its own effect.
         let key = self.key.get_untracked();
         let backend = self.backend.get_untracked();
+        let session = self.encryption.state_untracked();
         spawn_local(async move {
             // A failed write must not break the UI — the in-memory value
             // stands — but it must not be silent either: Safari private
-            // browsing and a quota-exceeded `setItem` both throw, and the
-            // user would otherwise lose data with nothing to explain why.
-            // `None`: Task 12 threads the real key here, out of
-            // `EncryptionCtx`. Until then every write is a v1 envelope,
-            // which is exactly what an account with encryption off writes
-            // anyway.
-            if let Err(err) = store(backend, key, &value, None).await {
+            // browsing and a quota-exceeded `setItem` both throw, a session
+            // that cannot seal refuses outright rather than storing the body
+            // in the clear, and the user would otherwise lose data with
+            // nothing to explain why.
+            if let Err(err) = store(backend, key, &value, session.write_key()).await {
                 error!("failed to persist value for {key:?}: {err}");
             }
         });
@@ -127,9 +130,15 @@ fn begin_operation(generation: StoredValue<Generation>) -> u64 {
 }
 
 /// Reads `key` from `backend`, re-reading whenever either changes.
+///
+/// The session comes from context rather than an argument, because unlike
+/// the day and the backend it is one fact about the whole page: every reader
+/// and writer in the tree wants the same answer, and threading it would just
+/// push this `use_context` into each of them.
 pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Persistent {
     // Identical on server and client, which is what makes hydration match.
     let (value, set_value) = signal::<Option<String>>(None);
+    let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     let generation = StoredValue::new(Generation::default());
 
     // `Effect::new` never runs during SSR, and on the client it runs after
@@ -138,6 +147,11 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
     Effect::new(move |_| {
         let key = key.get();
         let backend = backend.get();
+        // Tracked, unlike the write path's read of the same context: the
+        // probe resolving — and an unlock after it — is what turns a sealed
+        // row into readable text, so this load has to run again when it
+        // happens rather than leave the day looking empty until a reload.
+        let session = encryption.state();
         let token = begin_operation(generation);
 
         // Back to "not loaded" before the new read starts. Without this the
@@ -146,11 +160,10 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
         set_value.set(None);
 
         spawn_local(async move {
-            // `None`: Task 12 threads the real key here, out of
-            // `EncryptionCtx`. Until then a v2 row reads as
+            // A v2 row with no key to open it reads as
             // `StorageError::Locked`, which `loaded_value` logs and shows as
             // empty — the same as any other read failure.
-            let loaded = loaded_value(load(backend, key, None).await);
+            let loaded = loaded_value(load(backend, key, session.key()).await);
             // Discard if a newer load started while this one was in flight,
             // or if this component has since been unmounted.
             let is_current = generation
@@ -167,6 +180,7 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
         set_value,
         key,
         backend,
+        encryption,
         generation,
     }
 }
@@ -176,11 +190,17 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::*;
+    use crate::auth_ctx::AuthCtx;
 
     /// A `Persistent` wired the way [`use_persistent`] wires one, minus the
     /// `Effect` — which never runs under `ssr` anyway (see this module's
     /// header), so there is nothing to drive it with here. Everything the
     /// write path touches is real.
+    ///
+    /// Its `EncryptionCtx` stays on `Unknown` for the same reason: the probe
+    /// is an `Effect` too. That makes every write here a refusal, which
+    /// these tests do not mind — what they exercise is the bookkeeping `set`
+    /// does *before* spawning, and nothing polls the spawned future.
     fn persistent(generation: StoredValue<Generation>) -> Persistent {
         let (value, set_value) = signal::<Option<String>>(None);
         let date = NaiveDate::from_ymd_opt(2026, 9, 4).expect("valid date");
@@ -189,6 +209,9 @@ mod tests {
             set_value,
             key: Signal::stored(StorageKey::TimeEntry(date)),
             backend: Signal::stored(Backend::Local),
+            encryption: EncryptionCtx::probing(AuthCtx {
+                user: RwSignal::new(None),
+            }),
             generation,
         }
     }

@@ -17,6 +17,8 @@ use crate::auth_ctx::AuthCtx;
 #[cfg(feature = "hydrate")]
 use crate::date::today_local;
 #[cfg(feature = "hydrate")]
+use crate::encryption_ctx::EncryptionCtx;
+#[cfg(feature = "hydrate")]
 use crate::storage::{Backend, Generation, StorageKey, bodies_in_range, dates_with_entries, store};
 
 /// Per-device marker so the banner appears at most once.
@@ -88,6 +90,12 @@ fn import_outcome(copied: usize, total: usize) -> (bool, String) {
 pub fn ImportBanner() -> impl IntoView {
     let candidates = RwSignal::new(Vec::<NaiveDate>::new());
     let status = RwSignal::new(Option::<String>::None);
+
+    // Read here rather than inside `import` below: a DOM event handler runs
+    // with no reactive owner, so `use_context` there would find nothing.
+    // `EncryptionCtx` is `Copy`, so the closure just takes a copy.
+    #[cfg(feature = "hydrate")]
+    let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
 
     // Scoped to the whole `hydrate` feature, unlike every other component
     // that reads `AuthCtx`: `today_local()` has no server-side meaning (the
@@ -171,14 +179,18 @@ pub fn ImportBanner() -> impl IntoView {
         {
             let days = candidates.get_untracked();
             let total = days.len();
+            // Read once, synchronously, for the reason `Persistent::set`
+            // reads its own untracked: an import must use the session as it
+            // is at the click, and this is an event handler besides.
+            let session = encryption.state_untracked();
             spawn_local(async move {
                 let (Some(&first), Some(&last)) = (days.first(), days.last()) else {
                     return;
                 };
-                // `None`: Task 12 threads the real key here, out of
-                // `EncryptionCtx`. The read side is signed-out
-                // `localStorage`, which is never encrypted, so `None` is
-                // already the right answer for it.
+                // No key on the read: the source is signed-out
+                // `localStorage`, which is never encrypted (spec section
+                // 1.2's non-goal), so every row here is v1 by construction
+                // and a key would have nothing to open.
                 let bodies = bodies_in_range(Backend::Local, first, last, None)
                     .await
                     .unwrap_or_default();
@@ -191,14 +203,22 @@ pub fn ImportBanner() -> impl IntoView {
                     // Local copies are deliberately left in place: a failed
                     // import then loses nothing, and signing out still
                     // leaves the user their data.
-                    // `None`: Task 12 threads the real key here, out of
-                    // `EncryptionCtx`. This one is the write side, into the
-                    // signed-in account — so until Task 12 lands, an import
-                    // into an encrypted account would write v1 rows the
-                    // migration then has to pick up.
-                    if store(Backend::Remote, StorageKey::TimeEntry(date), &body, None)
-                        .await
-                        .is_ok()
+                    //
+                    // The write side lands in the signed-in account, so an
+                    // encrypted one gets v2 rows. A session that cannot seal
+                    // refuses every write instead, which reads out as
+                    // "Imported 0 of N days." and leaves this device
+                    // unsettled — so the offer comes back after an unlock
+                    // rather than the days being silently stored in the
+                    // clear.
+                    if store(
+                        Backend::Remote,
+                        StorageKey::TimeEntry(date),
+                        &body,
+                        session.write_key(),
+                    )
+                    .await
+                    .is_ok()
                     {
                         copied += 1;
                     }

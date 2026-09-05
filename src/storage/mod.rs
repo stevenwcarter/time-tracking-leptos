@@ -15,12 +15,15 @@
 //! shape and the pre-envelope legacy value can be normalized in one place.
 //!
 //! Encryption is the third thing that varies, and it varies here for the
-//! same reason. [`load`], [`store`] and [`bodies_in_range`] take an
-//! `Option<&SessionKey>` and seal or open around the backend call, so no
-//! component ever learns that an entry body is anything but a string. `None`
-//! is an account with encryption off: write v1, read whatever each row says
-//! it is. `Some` writes v2 and still reads either — which is what lets a
-//! half-migrated account work at all (spec E3).
+//! same reason. [`load`] and [`bodies_in_range`] take an
+//! `Option<&SessionKey>`, [`store`] takes a [`WriteKey`], and both seal or
+//! open around the backend call, so no component ever learns that an entry
+//! body is anything but a string. With no key: read whatever each row says
+//! it is, and write v1. With one: write v2 and still read either — which is
+//! what lets a half-migrated account work at all (spec E3).
+//!
+//! The two directions take different types because "no key" means different
+//! things in each; [`WriteKey`] says why.
 
 pub mod codec;
 pub mod envelope;
@@ -87,6 +90,30 @@ pub enum Backend {
     Remote,
 }
 
+/// What the seam should do with a body on the way out.
+///
+/// Distinct from the read side's `Option<&SessionKey>` for one reason: on a
+/// write, "no key" is ambiguous and one of its two meanings is dangerous. An
+/// account with encryption off should write v1. An encrypted account whose
+/// device holds no key must write *nothing* — a v1 row there is a silent
+/// plaintext downgrade, and nothing downstream would ever flag it: the
+/// migration pass reads it as an ordinary un-migrated row and re-seals it,
+/// so the only trace is the window in which the body sat on the server in
+/// the clear. Reads have no such ambiguity — a row says which it is — which
+/// is why only this direction needs the extra state.
+///
+/// [`crate::encryption_ctx::EncryptionState::write_key`] is the one place
+/// that decides which of these an account is in.
+pub enum WriteKey<'a> {
+    /// The account has no encryption. Write v1.
+    Plaintext,
+    /// The account is encrypted and this session can seal. Write v2.
+    Sealed(&'a SessionKey),
+    /// The account is encrypted and this session cannot seal — locked, or
+    /// not yet known to be either. Refuse.
+    Locked,
+}
+
 /// Monotonic counter identifying the newest in-flight load.
 ///
 /// Loads are async and can overlap — re-running one while an earlier call is
@@ -132,11 +159,16 @@ pub enum StorageError {
         key: String,
         source: envelope::EnvelopeError,
     },
-    /// The row is sealed and this session holds no key to open it.
+    /// The account is encrypted and this session holds no key for it.
+    ///
+    /// On a read, the row is sealed and cannot be opened. On a write, the
+    /// body was not stored at all — writing it unsealed would silently
+    /// downgrade an encrypted account's row to plaintext, which is what
+    /// [`WriteKey`] exists to make impossible.
     ///
     /// Deliberately *not* [`StorageError::Envelope`]. The two send the user
     /// to opposite places — "unlock and try again" against "this row is
-    /// damaged" — and only the first is true here, of a reader who has
+    /// damaged" — and only the first is true here, of a session that has
     /// simply not unlocked yet.
     #[error("`{key}` is encrypted and this session holds no key for it")]
     Locked { key: String },
@@ -265,31 +297,47 @@ pub async fn load(
 
 /// Writes a value, replacing any previous one for that day.
 ///
-/// `session` picks the envelope version: `None` writes v1, `Some` seals and
-/// writes v2 (see [`envelope::wrap`]). Readers never consult that choice.
+/// `session` picks the envelope version: [`WriteKey::Plaintext`] writes v1,
+/// [`WriteKey::Sealed`] seals and writes v2 (see [`envelope::wrap`]), and
+/// [`WriteKey::Locked`] writes nothing and fails with
+/// [`StorageError::Locked`]. Readers never consult that choice.
+///
+/// The refusal is decided here rather than in either `cfg` branch below, so
+/// it holds on every target and costs no backend call — a locked write is
+/// not a write that failed partway, it is one that never started.
 ///
 /// A plain fn building the future by hand, not an `async fn`: `value` is
-/// copied into an owned `String` — and `session` into an owned key — *before*
-/// the `async move`. That is load-bearing — `Persistent::set` hands this
-/// future to `spawn_local`, which requires `'static`, and an `async fn`
-/// taking `&str` would capture the caller's borrow instead. Do not
-/// "simplify" it.
+/// copied into an owned `String` — and `session` resolved into an owned
+/// decision — *before* the `async move`. That is load-bearing —
+/// `Persistent::set` hands this future to `spawn_local`, which requires
+/// `'static`, and an `async fn` taking `&str` would capture the caller's
+/// borrow instead. Do not "simplify" it.
 ///
 /// Sealing is async, so the [`envelope::wrap`] call itself has to happen
-/// *inside* the async block; only the two copies above it may not move
+/// *inside* the async block; only the two values above it may not move
 /// there. `use<>` is what makes that a compile error rather than a subtle
 /// one: it declares that the returned future captures no lifetime at all,
-/// so moving either copy inside the block fails here instead of at some
-/// distant `spawn_local` (spec E4).
+/// so moving either inside the block fails here instead of at some distant
+/// `spawn_local` (spec E4).
 pub fn store(
     backend: Backend,
     key: StorageKey,
     value: &str,
-    session: Option<&SessionKey>,
+    session: WriteKey<'_>,
 ) -> impl Future<Output = Result<(), StorageError>> + use<> {
     let value = value.to_owned();
-    let session = session.cloned();
+    let sealing = match session {
+        WriteKey::Plaintext => Ok(None),
+        // `Option::cloned`, not a direct `session.clone()`: on a target
+        // where `SessionKey` is uninhabited this arm cannot be reached, and
+        // cloning the key itself would say so as an `unreachable_code`
+        // warning. Going through the `Option` keeps the expression's type
+        // inhabited and the arm silent.
+        WriteKey::Sealed(session) => Ok(Some(session).cloned()),
+        WriteKey::Locked => Err(StorageError::Locked { key: key.as_key() }),
+    };
     async move {
+        let session = sealing?;
         #[cfg(feature = "hydrate")]
         {
             let wrapped = envelope::wrap(&value, session.as_ref())
@@ -516,8 +564,29 @@ mod tests {
     #[test]
     fn ssr_writes_are_noops() {
         let key = StorageKey::TimeEntry(d(2026, 9, 4));
-        assert_eq!(block_on(store(Backend::Local, key, "x", None)), Ok(()));
+        assert_eq!(
+            block_on(store(Backend::Local, key, "x", WriteKey::Plaintext)),
+            Ok(())
+        );
         assert_eq!(block_on(clear(Backend::Local, key)), Ok(()));
+    }
+
+    /// The regression this guards against: a session that cannot seal must
+    /// refuse the write, not fall back to writing the body in the clear.
+    /// A plaintext row in an encrypted account is invisible afterwards —
+    /// the migration pass would re-seal it as if it had always been an
+    /// un-migrated row, leaving nothing to say the body had been exposed.
+    ///
+    /// Asserted on a target that cannot encrypt anything at all, which is
+    /// the point: the refusal is decided before any backend or any
+    /// `cfg` branch, so it cannot be lost to one.
+    #[test]
+    fn a_locked_session_refuses_the_write_rather_than_downgrading_it() {
+        let key = StorageKey::TimeEntry(d(2026, 9, 4));
+        assert_eq!(
+            block_on(store(Backend::Local, key, "9-10 code1", WriteKey::Locked)),
+            Err(StorageError::Locked { key: key.as_key() })
+        );
     }
 
     /// Same invariant as `ssr_backends_return_none`, for the range read the

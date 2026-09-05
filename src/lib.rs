@@ -13,6 +13,7 @@ pub mod components;
 pub mod crypto;
 pub mod date;
 pub mod dto;
+pub mod encryption_ctx;
 pub mod server_fns;
 pub mod storage;
 // `test` as well as `hydrate`, same split as `storage::local`: `friendly_error`

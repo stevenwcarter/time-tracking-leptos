@@ -18,6 +18,7 @@ use time_tracking_parser::{Time, parse_time_tracking_data};
 use crate::auth_ctx::AuthCtx;
 use crate::components::header::AppHeader;
 use crate::date::{parse_iso, to_iso, week_bounds};
+use crate::encryption_ctx::EncryptionCtx;
 use crate::storage::{Backend, Generation, StorageError, bodies_in_range};
 
 /// A week's totals, ready to render.
@@ -107,6 +108,7 @@ pub fn WeekView() -> impl IntoView {
 
 #[component]
 fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
+    let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     let (start, end) = week_bounds(anchor);
     // `None` until loaded, exactly like the day view's entry: the totals are
     // a conclusion about stored data, and the shell must not assert one
@@ -116,6 +118,10 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
 
     Effect::new(move |_| {
         let backend = backend.get();
+        // Tracked, like the backend: unlocking mid-session turns a week of
+        // sealed rows into readable ones, and this page has to recompute
+        // when it happens rather than keep reporting an empty week.
+        let session = encryption.state();
         // Captured synchronously, before the `spawn_local` below: sign-out
         // is a live, no-reload toggle (`AccountMenu` flips `AuthCtx::user`
         // in place), so this effect can re-run — and start a second,
@@ -132,11 +138,10 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
         totals.set(None);
 
         spawn_local(async move {
-            // `None`: Task 12 threads the real key here, out of
-            // `EncryptionCtx`. Until then a sealed row is skipped like any
-            // other unreadable one, so a signed-in week reads as empty
-            // rather than wrong.
-            let rows = loaded_rows(bodies_in_range(backend, start, end, None).await);
+            // A row this session cannot open is skipped like any other
+            // unreadable one, costing its own day and no more — so a week
+            // read while locked comes out short rather than wrong.
+            let rows = loaded_rows(bodies_in_range(backend, start, end, session.key()).await);
             let computed = aggregate(&rows);
             // `try_with_value`, not the panicking form: this component's
             // owner — and so this `StoredValue` — can already be disposed
