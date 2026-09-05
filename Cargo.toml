@@ -69,8 +69,6 @@ web-sys = { version = "0.3.77", optional = true, features = [
   "IdbTransactionMode",
   "IdbObjectStore",
   "IdbRequest",
-  "IdbVersionChangeEvent",
-  "Event",
   "EventTarget",
   "DomException",
 ] }
@@ -124,9 +122,12 @@ any_spawner = { version = "0.3", features = ["futures-executor"] }
 # Host-side second implementation of the wire format. WebCrypto exists only
 # in a browser and this project has no wasm test runner, so these let an
 # ordinary `cargo test` decrypt an envelope the browser would have written
-# and produce one the browser must be able to read — pinning nonce
-# placement, tag inclusion, base64 alphabet and HKDF inputs against a
-# different implementation rather than against ourselves (spec section 10).
+# and produce one the browser must be able to read. Nonce placement and tag
+# handling are `aes-gcm`'s own business, not ours; what these tests pin is
+# that *our* part — the envelope's base64 encoding and field layout, the
+# AES-KW wrapped-key width, and the HKDF salt and info strings — round-trips
+# through a second, independent implementation rather than only ever being
+# read back by the code that wrote it (spec section 10).
 aes-gcm = "0.10"
 aes-kw = "0.2"
 hkdf = "0.12"
