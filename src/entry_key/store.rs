@@ -258,6 +258,27 @@ mod tests {
         assert_eq!(recovery[0].wrapped_key, vec![2; 40]);
     }
 
+    /// The schema, not just `replace_recovery_wrap`'s convention, must stop a
+    /// second recovery row from ever existing — a caller that inserts
+    /// directly instead of replacing would otherwise leave two, and "which
+    /// one does the code open?" becomes ambiguous.
+    #[test]
+    fn a_second_recovery_wrap_is_rejected() {
+        let (mut conn, uid) = seed();
+        insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[1; 40]).expect("first");
+        assert!(insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[2; 40]).is_err());
+    }
+
+    /// The one-recovery-row index is per user, not global — two accounts
+    /// must each be able to hold their own recovery wrap.
+    #[test]
+    fn the_recovery_index_is_scoped_to_one_user() {
+        let (mut conn, a) = seed();
+        let b = seed_another_user(&mut conn);
+        insert_wrap(&mut conn, a, WrapKind::Recovery, None, &[1; 40]).expect("a");
+        insert_wrap(&mut conn, b, WrapKind::Recovery, None, &[2; 40]).expect("b");
+    }
+
     #[test]
     fn deleting_a_credential_wrap_removes_only_that_one() {
         let (mut conn, uid) = seed();
