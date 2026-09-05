@@ -9,3 +9,7 @@
 
 # Subagent-driven-development scratch (ledger, briefs, review packages)
 /.superpowers
+
+# Local SQLite data directory (DATABASE_URL default) and local env overrides
+/data
+.env

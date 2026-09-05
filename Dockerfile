@@ -43,5 +43,13 @@ ENV LEPTOS_OUTPUT_NAME=time-tracking-leptos \
     LEPTOS_SITE_PKG_DIR=pkg \
     LEPTOS_SITE_ADDR=0.0.0.0:80
 
+# SQLite needs a writable, persistent location; /app is the read-only image
+# layer's WORKDIR, not a place to keep data across recreates.
+ENV DATABASE_URL=/data/time-tracking.db
+VOLUME ["/data"]
+
 EXPOSE 80
+# SESSION_KEY has no default in a release build (see src/session.rs) — the
+# container exits immediately if it is not supplied at run time. Intended:
+# refusing to boot beats silently signing every session with a guessable key.
 CMD ["/app/time-tracking-leptos"]

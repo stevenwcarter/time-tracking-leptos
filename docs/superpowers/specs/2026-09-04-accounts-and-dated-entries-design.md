@@ -562,8 +562,21 @@ and asserts no body text and no computed total appears. Without this, a later
 silently makes phase 2 impossible.
 
 **I2 — The tri-state survives a key change.**
-A test that changes the key signal and asserts the value returns to `None`
-before the next load resolves. Guards the stale-content flash from §7.4.
+Not covered the way an earlier draft of this entry claimed. This project has
+no wasm/reactive test runner, so there is no cheap way to mount
+`use_persistent`'s `Effect` and assert on the signal it drives — a test that
+"changes the key signal and asserts the value returns to `None` before the
+next load resolves" does not exist and cannot be written cheaply here. What
+*is* tested, in `src/storage/mod.rs`'s `tests` module, is the `Generation`
+counter in isolation (`a_stale_load_does_not_overwrite_a_newer_one`,
+`a_single_load_is_always_current`): given two tokens, the newer one is
+current and the older one is not. Those tests exercise `Generation` alone —
+not `use_persistent`'s `Effect`, which is what actually calls
+`Generation::next` and `set_value.set(None)` on every key/backend change
+(`src/storage/hook.rs`). A wrong-order token capture, a dropped
+`set_value.set(None)` reset, or a dropped `is_current` gate in that `Effect`
+would compile and leave every existing test green. The `Effect` is guarded by
+inspection, not by a test. Guards the stale-content flash from §7.4.
 
 **I3 — The legacy alias is read-only and self-erasing.**
 Tests: legacy value surfaces for today; does *not* surface for another date;
@@ -619,6 +632,18 @@ Following the existing suite's shape: host-testable logic in unit tests,
 The wasm-only paths — `webauthn_browser`, the `localStorage` backend — stay
 verified by their host-testable seams plus manual check, matching the existing
 project's position.
+
+**Lint coverage gap.** Those host-testable seams live in modules gated
+`#[cfg(any(feature = "hydrate", test))]` — `src/storage/local.rs`,
+`src/webauthn_browser.rs`, and part of `src/storage/mod.rs`. The project's
+documented lint command, `cargo clippy --features ssr --no-default-features`,
+compiles neither `hydrate` (off, by the flags) nor `cfg(test)` (off, because a
+bare `clippy` invocation isn't `--all-targets` or `cargo test`), so it never
+lints them. The actual minimum is `cargo clippy --features ssr
+--no-default-features --all-targets -- -D warnings` (which turns `cfg(test)`
+on) plus a `--target wasm32-unknown-unknown --features hydrate` pass (which
+turns `hydrate` on instead) — together they cover both halves of the `any(...)`
+gate. CLAUDE.md's Commands table documents both as required, not optional.
 
 ## 12. Configuration
 
