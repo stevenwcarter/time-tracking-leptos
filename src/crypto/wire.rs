@@ -55,6 +55,8 @@ pub enum WireError {
     NonceLength(usize),
     #[error("algorithm `{0}` is not supported by this build")]
     UnsupportedAlg(String),
+    #[error("envelope version {0} is not supported by this build")]
+    UnsupportedVersion(u8),
 }
 
 /// The written shape. A separate type from the read shape below: encoding
@@ -68,11 +70,13 @@ struct WireEnvelopeOut<'a> {
     ct: String,
 }
 
-/// The read shape. `v` is deliberately not a field here: a caller that has
-/// already dispatched on the envelope's version has no need to re-check it,
-/// and serde ignores the extra JSON field on its own.
+/// The read shape. `v` is checked here even though today's only caller has
+/// already dispatched on it before reaching this function — `decode_v2` must
+/// stay correct if a future caller ever invokes it directly with an
+/// unvalidated envelope.
 #[derive(Deserialize)]
 struct WireEnvelopeIn {
+    v: u8,
     alg: String,
     n: String,
     ct: String,
@@ -92,11 +96,16 @@ pub fn encode_v2(sealed: &Sealed) -> String {
 
 /// Reads a sealed body back out of a stored v2 envelope.
 ///
-/// Validates in this order: JSON shape, algorithm, base64, nonce length —
-/// so a caller sees the most fundamental problem first.
+/// Validates in this order: JSON shape, version, algorithm, base64, nonce
+/// length — so a caller sees the most fundamental problem first. The version
+/// check comes before `alg` because it is the coarsest discriminator: an
+/// envelope from a future version may not even use `alg` the same way.
 pub fn decode_v2(raw: &str) -> Result<Sealed, WireError> {
     let env: WireEnvelopeIn =
         serde_json::from_str(raw).map_err(|e| WireError::Malformed(e.to_string()))?;
+    if env.v != V2 {
+        return Err(WireError::UnsupportedVersion(env.v));
+    }
     if env.alg != ALG_V2 {
         return Err(WireError::UnsupportedAlg(env.alg));
     }
@@ -171,6 +180,21 @@ mod tests {
     fn a_wrong_nonce_length_is_rejected() {
         let raw = r#"{"v":2,"alg":"a256gcm","n":"AAAA","ct":"AAAA"}"#;
         assert!(matches!(decode_v2(raw), Err(WireError::NonceLength(3))));
+    }
+
+    /// An otherwise-valid v2 body under the wrong version tag must not be
+    /// accepted — `decode_v2` is not the only place that has ever dispatched
+    /// on `v`, and a future direct caller must not find this a silent no-op.
+    #[test]
+    fn a_wrong_version_is_rejected() {
+        let raw = format!(
+            r#"{{"v":99,"alg":"a256gcm","n":"{}","ct":"AAAA"}}"#,
+            base64_of(&[0u8; NONCE_LEN])
+        );
+        assert!(matches!(
+            decode_v2(&raw),
+            Err(WireError::UnsupportedVersion(99))
+        ));
     }
 
     #[test]
