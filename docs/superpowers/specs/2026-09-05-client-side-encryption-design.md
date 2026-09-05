@@ -408,9 +408,20 @@ pub enum EncryptionState {
 }
 ```
 
-Provided at the app root beside `AuthCtx`. `DayView` and `WeekView` mount the
-entry area only in `Disabled` and `Unlocked`; `Locked` renders the unlock
-prompt; `Unknown` renders blank.
+Provided at the app root beside `AuthCtx`. `Locked` renders the unlock
+prompt. **`Unknown`, `Disabled` and `Unlocked` all render the entry area** —
+`Unknown` in exactly the unloaded state the server renders today.
+
+An earlier draft said `Unknown` renders blank, and that was wrong. The server
+always renders `Unknown`, so blanking it removes the day view from every
+server-rendered page: `/{date}` would return a shell with no entry area until
+hydration finished, for every user including the signed-out majority who have
+no encryption at all. `tests/routes.rs`'s `a_real_date_renders_the_day_view`
+catches exactly this.
+
+The cost of the correction is that a locked user sees the empty entry area
+for the width of the probe before the prompt replaces it. That is a flash on
+a rare path, against an empty page on the universal one.
 
 It resolves after hydration, in one `Effect` that reruns whenever
 `AuthCtx::user` changes. Signed out → `Disabled` without a server call.
