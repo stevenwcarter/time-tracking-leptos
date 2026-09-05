@@ -1,6 +1,6 @@
 //! Hydrate-only wrapper around `navigator.credentials.create/get`.
 //!
-//! Both entry points take the server's WebAuthn JSON challenge and return
+//! Every entry point takes the server's WebAuthn JSON challenge and returns
 //! the browser's response as JSON, leaning on the browser's own
 //! `PublicKeyCredential.parseCreationOptionsFromJSON()`,
 //! `parseRequestOptionsFromJSON()`, and `toJSON()` rather than doing
@@ -80,7 +80,7 @@ pub(crate) fn prf_enabled_from_json(extension_results_json: &str) -> bool {
 mod browser {
     use std::fmt;
 
-    use js_sys::{Function, Object, Reflect};
+    use js_sys::{ArrayBuffer, Function, Object, Reflect, Uint8Array};
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
 
@@ -137,11 +137,15 @@ mod browser {
             .map_err(|_| WebauthnUserError::NotSupported)
     }
 
-    /// Runs one ceremony, returning the raw credential object.
-    async fn invoke(
+    /// Turns the server's challenge JSON into the browser's own options
+    /// object.
+    ///
+    /// Split out from [`invoke`] so a caller can mutate the parsed options
+    /// before the ceremony runs — which is the only place the PRF extension
+    /// may be added; see [`authenticate_with_prf`].
+    fn parse_options(
         challenge_json: &str,
         parse_method: &str,
-        creds_method: &str,
     ) -> Result<JsValue, WebauthnUserError> {
         let pk = pk_constructor()?;
         let parse = method(&pk, parse_method)?;
@@ -150,12 +154,18 @@ mod browser {
             .map_err(|_| WebauthnUserError::Other("bad challenge JSON".into()))?;
         let public_key = Reflect::get(&challenge, &"publicKey".into())
             .map_err(|_| WebauthnUserError::Other("missing publicKey".into()))?;
-        let options = parse.call1(&pk, &public_key).map_err(classify)?;
+        parse.call1(&pk, &public_key).map_err(classify)
+    }
 
+    /// Runs `navigator.credentials.<creds_method>({ publicKey: options })`.
+    async fn call_credentials(
+        options: &JsValue,
+        creds_method: &str,
+    ) -> Result<JsValue, WebauthnUserError> {
         let win = web_sys::window().ok_or_else(|| WebauthnUserError::Other("no window".into()))?;
         let creds = win.navigator().credentials();
         let arg = Object::new();
-        Reflect::set(&arg, &"publicKey".into(), &options).ok();
+        Reflect::set(&arg, &"publicKey".into(), options).ok();
 
         let promise = method(&creds, creds_method)?
             .call1(&creds, &arg)
@@ -166,6 +176,16 @@ mod browser {
             })?;
 
         JsFuture::from(promise).await.map_err(classify)
+    }
+
+    /// Runs one ceremony, returning the raw credential object.
+    async fn invoke(
+        challenge_json: &str,
+        parse_method: &str,
+        creds_method: &str,
+    ) -> Result<JsValue, WebauthnUserError> {
+        let options = parse_options(challenge_json, parse_method)?;
+        call_credentials(&options, creds_method).await
     }
 
     fn to_json(cred: &JsValue) -> Result<String, WebauthnUserError> {
@@ -195,6 +215,53 @@ mod browser {
         super::prf_enabled_from_json(&stringify(&results))
     }
 
+    /// Builds `{ prf: { eval: { first: <salt> } } }`.
+    ///
+    /// `Reflect::set` on a fresh, extensible object under a string key cannot
+    /// fail, so its result is discarded — the same shape [`call_credentials`]
+    /// uses to build its `publicKey` argument.
+    fn prf_eval_extension(prf_salt: &[u8]) -> Object {
+        let nest = |name: &str, value: &JsValue| {
+            let object = Object::new();
+            Reflect::set(&object, &name.into(), value).ok();
+            object
+        };
+        let eval = nest("first", &Uint8Array::from(prf_salt).into());
+        let prf = nest("eval", &eval.into());
+        nest("prf", &prf.into())
+    }
+
+    /// The PRF output from a completed assertion, or `None` if there wasn't
+    /// one.
+    ///
+    /// **Nothing automated covers this function** (spec section 10 lists it
+    /// as inspection-only), and the trick that made [`prf_enabled`]'s
+    /// decision host-testable cannot be reused: `prf.results.first` is an
+    /// `ArrayBuffer`, and `JSON.stringify` renders an `ArrayBuffer` as `{}`.
+    /// There is no `prf_output_from_json` to write, so don't go looking for
+    /// one — the live JS values have to be walked.
+    ///
+    /// Every step reads as "no PRF output" rather than panicking. Note the
+    /// hops are checked in order because `Reflect::get` on a value that
+    /// turned out to be `undefined` throws: a missing `prf` key surfaces as
+    /// the `Err` of the *following* get, not of its own.
+    fn prf_output(cred: &JsValue) -> Option<Vec<u8>> {
+        let results = method(cred, "getClientExtensionResults")
+            .ok()?
+            .call0(cred)
+            .ok()?;
+        let prf = Reflect::get(&results, &"prf".into()).ok()?;
+        let prf_results = Reflect::get(&prf, &"results".into()).ok()?;
+        let first = Reflect::get(&prf_results, &"first".into()).ok()?;
+        let buffer = first.dyn_into::<ArrayBuffer>().ok()?;
+        let bytes = Uint8Array::new(&buffer).to_vec();
+
+        // An empty buffer is not a PRF output. Handing one on would derive a
+        // key-encryption key from no entropy at all, and it would round-trip
+        // happily — the worst way for this to fail.
+        (!bytes.is_empty()).then_some(bytes)
+    }
+
     /// Enrols a credential. Returns its JSON and whether PRF is available.
     pub async fn register(challenge_json: &str) -> Result<(String, bool), WebauthnUserError> {
         let cred = invoke(challenge_json, "parseCreationOptionsFromJSON", "create").await?;
@@ -206,10 +273,57 @@ mod browser {
         let cred = invoke(challenge_json, "parseRequestOptionsFromJSON", "get").await?;
         to_json(&cred)
     }
+
+    /// Runs a sign-in assertion that also evaluates the PRF at `prf_salt`,
+    /// returning the credential JSON and, when the authenticator produced
+    /// one, the PRF output.
+    ///
+    /// Signing in already costs one assertion, so riding PRF on it unlocks
+    /// the user's data in the same gesture instead of prompting twice (spec
+    /// section 6.2). The PRF output is the caller's to turn into a key; it
+    /// never leaves the browser.
+    ///
+    /// **`None` is not a failure.** An authenticator without PRF, a browser
+    /// that ignored the extension, or a result in an unexpected shape all
+    /// yield `Ok((json, None))` and let sign-in complete. This same call
+    /// performs the sign-in: failing it because PRF was unavailable would
+    /// lock the user out of the application, where `None` only lands them in
+    /// a locked session they can open with their recovery code.
+    ///
+    /// **The extension is set here, on the parsed options object, and not in
+    /// the server's challenge JSON.** Browser support for `prf.eval` inside
+    /// `parseRequestOptionsFromJSON` is inconsistent, so a salt that went
+    /// through the JSON parser would silently do nothing on some browsers
+    /// (spec section 7.1). One welcome consequence: `passkey_login_start`
+    /// needs no change at all. Assignment rather than a merge is safe
+    /// because the login challenge carries no extensions — webauthn-rs fills
+    /// in only `appid`, which this app never sets. A failed set is ignored
+    /// for the same reason a missing result is: it costs the unlock, not the
+    /// sign-in.
+    ///
+    /// Coverage: [`prf_output`], which reads the result, has none — see its
+    /// own note. `register`'s neighbouring capability check runs through
+    /// [`super::prf_enabled_from_json`], which *is* host-tested; the two are
+    /// not in the same category and a reviewer should not read them as such.
+    pub async fn authenticate_with_prf(
+        challenge_json: &str,
+        prf_salt: &[u8],
+    ) -> Result<(String, Option<Vec<u8>>), WebauthnUserError> {
+        let options = parse_options(challenge_json, "parseRequestOptionsFromJSON")?;
+        Reflect::set(
+            &options,
+            &"extensions".into(),
+            &prf_eval_extension(prf_salt).into(),
+        )
+        .ok();
+
+        let cred = call_credentials(&options, "get").await?;
+        Ok((to_json(&cred)?, prf_output(&cred)))
+    }
 }
 
 #[cfg(feature = "hydrate")]
-pub use browser::{WebauthnUserError, authenticate, register};
+pub use browser::{WebauthnUserError, authenticate, authenticate_with_prf, register};
 
 #[cfg(test)]
 mod tests {
