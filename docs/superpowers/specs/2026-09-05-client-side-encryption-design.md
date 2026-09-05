@@ -682,6 +682,19 @@ it — the phase-1 spec's §10 convention.
   no call site derives one ad hoc. `Unknown` and `Unreachable` both map to
   `Locked`: refusing costs a retry, writing costs a silent plaintext row.
 
+  **The type is necessary but not sufficient — sequencing can walk around
+  it.** The enable ceremony originally parked the new key and published it
+  only on the user's confirm click. Between `encryption_enable` returning
+  `Ok` and that click, the account was encrypted server-side while
+  `EncryptionCtx` still reported `Disabled` — whose write key is
+  `Plaintext` — so navigating back to the day view and typing wrote v1 rows
+  into an encrypted account. The seam behaved correctly throughout; the UI
+  simply never asked it the question.
+
+  So E7 has a second half: **the key is published on the same `Ok` branch
+  that returns from `encryption_enable`, with no intervening `await` and no
+  user interaction in between.** Any deferral reopens the window.
+
 - **E6. `APP_SALT` and the two HKDF `info` strings never change.** Changing
   one silently makes every existing wrap unopenable. *Guarded by:*
   constant-pinning tests that assert their exact bytes, in the same spirit as
