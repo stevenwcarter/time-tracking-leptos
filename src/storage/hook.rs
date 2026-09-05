@@ -39,6 +39,9 @@ pub struct Persistent {
     set_value: WriteSignal<Option<String>>,
     key: Signal<StorageKey>,
     backend: Signal<Backend>,
+    /// Shared with the loading effect, so a write can invalidate a read.
+    /// See [`begin_operation`].
+    generation: StoredValue<Generation>,
 }
 
 impl Persistent {
@@ -49,6 +52,17 @@ impl Persistent {
 
     /// Updates the value and writes it through to storage.
     pub fn set(self, value: String) {
+        // Load-bearing, and easy to mistake for read-path bookkeeping: the
+        // effect below blanks the value and starts a load, and the textarea
+        // stays editable for the whole of that window — a microtask on
+        // `Local`, a network round trip on `Remote`, reopened on every date
+        // change and on sign-in and sign-out. A keystroke landing in that
+        // window is a *newer* truth than the load, so the load must be
+        // invalidated here. Without this bump the load resolves, still
+        // passes its `is_current` check, and silently replaces what the user
+        // typed — with the save already on disk, leaving screen and store
+        // disagreeing.
+        begin_operation(self.generation);
         self.set_value.set(Some(value.clone()));
         // A write must use the day and backend current *right now*, not
         // subscribe to their future changes — reading them untracked keeps
@@ -88,6 +102,26 @@ fn loaded_value(read: Result<Option<String>, StorageError>) -> String {
     }
 }
 
+/// Starts a new storage operation, invalidating any load still in flight,
+/// and returns its token.
+///
+/// Every path that changes what the stored value *should* be goes through
+/// here — the read path in [`use_persistent`]'s effect, and the write path in
+/// [`Persistent::set`]. Only a token still current when its load resolves may
+/// publish.
+///
+/// `try_update_value` rather than the panicking default: this `StoredValue`
+/// belongs to the same owner as the effect, but a spawned load can still be
+/// resolving after that owner (and therefore this value) is disposed, e.g. on
+/// navigation away. A fallback of 0 is never issued by [`Generation::next`],
+/// so it can never read as current — the disposed case degrades to "discard
+/// the load" rather than panicking.
+fn begin_operation(generation: StoredValue<Generation>) -> u64 {
+    generation
+        .try_update_value(Generation::next)
+        .unwrap_or_default()
+}
+
 /// Reads `key` from `backend`, re-reading whenever either changes.
 pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Persistent {
     // Identical on server and client, which is what makes hydration match.
@@ -100,15 +134,7 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
     Effect::new(move |_| {
         let key = key.get();
         let backend = backend.get();
-        // `try_update_value` rather than the panicking default: this
-        // `StoredValue` belongs to the same owner as the effect, but the
-        // spawned load below can still be resolving after that owner (and
-        // therefore this value) is disposed, e.g. on navigation away. A
-        // fallback of 0 is never issued by `next`, so it can never read as
-        // current — the disposed case degrades to "discard the load".
-        let token = generation
-            .try_update_value(Generation::next)
-            .unwrap_or_default();
+        let token = begin_operation(generation);
 
         // Back to "not loaded" before the new read starts. Without this the
         // previous day's text stays on screen under the new day's heading
@@ -133,12 +159,91 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
         set_value,
         key,
         backend,
+        generation,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::NaiveDate;
+
     use super::*;
+
+    /// A `Persistent` wired the way [`use_persistent`] wires one, minus the
+    /// `Effect` — which never runs under `ssr` anyway (see this module's
+    /// header), so there is nothing to drive it with here. Everything the
+    /// write path touches is real.
+    fn persistent(generation: StoredValue<Generation>) -> Persistent {
+        let (value, set_value) = signal::<Option<String>>(None);
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).expect("valid date");
+        Persistent {
+            value,
+            set_value,
+            key: Signal::stored(StorageKey::TimeEntry(date)),
+            backend: Signal::stored(Backend::Local),
+            generation,
+        }
+    }
+
+    /// `Persistent::set` is spawned into the same thread-local pool
+    /// `spawn_local` uses in the browser. Nothing polls it here, and nothing
+    /// needs to — the write's *store* is a no-op under `ssr`; what this
+    /// module tests is the bookkeeping `set` does before spawning. Without an
+    /// executor installed, `spawn_local` panics in a debug build.
+    fn with_executor() {
+        let _ = any_spawner::Executor::init_futures_executor();
+    }
+
+    /// The regression this guards against: a keystroke landing while a load
+    /// is in flight must invalidate that load. Both are async, the textarea
+    /// is editable throughout, and on `Remote` the window is a whole network
+    /// round trip — so a load that stays current outlives the newer truth
+    /// the user just typed and silently overwrites it on screen, while the
+    /// save it raced has already reached the store.
+    #[test]
+    fn a_write_invalidates_a_load_already_in_flight() {
+        with_executor();
+        let owner = Owner::new();
+        owner.with(|| {
+            let generation = StoredValue::new(Generation::default());
+            // The effect starts a load and holds its token across the await.
+            let in_flight = begin_operation(generation);
+            assert!(
+                generation
+                    .try_with_value(|g| g.is_current(in_flight))
+                    .unwrap_or(false),
+                "the load is the newest operation until something else starts"
+            );
+
+            persistent(generation).set("typed while loading".to_string());
+
+            assert!(
+                !generation
+                    .try_with_value(|g| g.is_current(in_flight))
+                    .unwrap_or(true),
+                "the load must be discarded rather than overwrite the keystroke"
+            );
+        });
+        owner.cleanup();
+    }
+
+    /// The complement: with no write racing it, a load still publishes.
+    /// Bumping the generation unconditionally somewhere on the read path
+    /// would discard every load and leave the UI blank forever.
+    #[test]
+    fn an_unraced_load_still_publishes() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let generation = StoredValue::new(Generation::default());
+            let in_flight = begin_operation(generation);
+            assert!(
+                generation
+                    .try_with_value(|g| g.is_current(in_flight))
+                    .unwrap_or(false)
+            );
+        });
+        owner.cleanup();
+    }
 
     #[test]
     fn found_value_is_loaded_as_is() {
