@@ -16,6 +16,8 @@ pub mod dto;
 pub mod encryption_ctx;
 pub mod server_fns;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod test_util;
 // `test` as well as `hydrate`, same split as `storage::local`: `friendly_error`
 // is pure and host-tested since there is no wasm test runner in this project.
 // Only the `web_sys` ceremony wrapper inside stays gated to `hydrate` alone.

@@ -286,12 +286,6 @@ mod browser {
         Ok((to_json(&cred)?, prf_enabled(&cred)))
     }
 
-    /// Runs a sign-in assertion.
-    pub async fn authenticate(challenge_json: &str) -> Result<String, WebauthnUserError> {
-        let cred = invoke(challenge_json, "parseRequestOptionsFromJSON", "get").await?;
-        to_json(&cred)
-    }
-
     /// Runs a sign-in assertion that also evaluates the PRF at `prf_salt`,
     /// returning the credential JSON and, when the authenticator produced
     /// one, the PRF output.
@@ -300,6 +294,12 @@ mod browser {
     /// the user's data in the same gesture instead of prompting twice (spec
     /// section 6.2). The PRF output is the caller's to turn into a key; it
     /// never leaves the browser.
+    ///
+    /// **The only assertion in the crate**, sign-in included. There is no
+    /// plain `authenticate` sibling to reach for: asking for the PRF costs
+    /// an authenticator that cannot provide it nothing — no extra prompt,
+    /// no failure, just a `None` — so a second entry point would only be a
+    /// way to forget the unlock.
     ///
     /// **`None` is not a failure.** An authenticator without PRF, a browser
     /// that ignored the extension, or a result in an unexpected shape all
@@ -345,7 +345,7 @@ mod browser {
 }
 
 #[cfg(feature = "hydrate")]
-pub use browser::{WebauthnUserError, authenticate, authenticate_with_prf, register};
+pub use browser::{WebauthnUserError, authenticate_with_prf, register};
 
 #[cfg(test)]
 mod tests {

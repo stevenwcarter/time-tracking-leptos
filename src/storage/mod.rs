@@ -546,6 +546,7 @@ pub async fn bodies_in_range(
 mod tests {
     use super::*;
     use crate::crypto::wire;
+    use crate::test_util::block_on;
 
     fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
         chrono::NaiveDate::from_ymd_opt(y, m, day).expect("valid date")
@@ -897,15 +898,5 @@ mod tests {
         let mut generation = Generation::default();
         let only = generation.next();
         assert!(generation.is_current(only));
-    }
-
-    /// Minimal executor — these futures never yield under `ssr`.
-    fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
-        use std::pin::pin;
-        use std::task::{Context, Poll, Waker};
-        match pin!(fut).poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(v) => v,
-            Poll::Pending => panic!("ssr storage futures must complete immediately"),
-        }
     }
 }

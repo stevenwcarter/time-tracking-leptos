@@ -16,7 +16,7 @@ use leptos::prelude::*;
 use leptos_meta::Title;
 use leptos_router::components::A;
 
-use crate::auth_ctx::AuthCtx;
+use crate::auth_ctx::{AuthCtx, forget_device_key, sign_out};
 use crate::components::encryption_panel::EncryptionPanel;
 use crate::components::header::AppHeader;
 use crate::dto::PasskeyListItem;
@@ -159,7 +159,12 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
     // and session cookies live 30 days.
     let sign_out_all = move |_| {
         leptos::task::spawn_local(async move {
-            match sign_out_everywhere().await {
+            // Through `sign_out` for the same reason the header's control
+            // is: this device's data key goes first, and goes whether or not
+            // the server manages to revoke anything (spec section 6.7).
+            // Revoking every session and leaving a working key on the device
+            // in front of you would be the wrong half of the job.
+            match sign_out(forget_device_key(), sign_out_everywhere()).await {
                 // Same local teardown as the header's sign-out: clear the
                 // signal rather than reload, so `use_persistent` re-reads
                 // from localStorage in place. This flips the page to its

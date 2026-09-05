@@ -8,7 +8,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
 
-use crate::auth_ctx::AuthCtx;
+use crate::auth_ctx::{AuthCtx, forget_device_key, sign_out};
 use crate::date::to_iso;
 use crate::server_fns::session::{logout, request_magic_link};
 
@@ -90,9 +90,17 @@ fn SignedInPanel(
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
     let status = RwSignal::new(String::new());
 
-    let sign_out = move |_| {
+    let on_sign_out = move |_| {
         spawn_local(async move {
-            match logout().await {
+            // `sign_out` forgets this device's data key first and regardless
+            // of what the server then says, which is why the whole call goes
+            // through it rather than adding a line to either arm below (spec
+            // section 6.7). The in-memory half needs nothing here: clearing
+            // `auth.user` re-runs `EncryptionCtx`'s probe, and a probe for a
+            // signed-out visitor publishes `Disabled`, which holds no key —
+            // and bumps the `Generation`, so an older probe cannot land
+            // afterwards and republish one.
+            match sign_out(forget_device_key(), logout()).await {
                 Ok(()) => {
                     // Closed first, deliberately: the popover is describing
                     // an account that is about to stop existing, and clearing
@@ -110,6 +118,11 @@ fn SignedInPanel(
                     // Silence here is the difference between a user knowing
                     // to try again and one walking away from a shared
                     // machine believing they are signed out.
+                    //
+                    // The device key is gone by now either way, so a session
+                    // that survives this reads as unlocked until the page is
+                    // reloaded and locked from then on. One unlock prompt is
+                    // the right side of that trade.
                     error!("sign-out failed: {e}");
                     status.set("Couldn't sign out. Check your connection and try again.".into());
                 }
@@ -140,7 +153,7 @@ fn SignedInPanel(
         <button
             type="button"
             class="w-full text-left text-sm text-gray-700 hover:bg-gray-50 rounded px-2 py-1.5"
-            on:click=sign_out
+            on:click=on_sign_out
         >
             "Sign out"
         </button>
@@ -254,10 +267,18 @@ fn SignInPanel() -> impl IntoView {
     }
 }
 
-/// Runs the sign-in ceremony. An empty address uses the discoverable flow,
+/// Runs the sign-in ceremony, and rides its PRF output straight into an
+/// unlock (spec section 6.2). An empty address uses the discoverable flow,
 /// which is what makes the button work with nothing typed.
+///
+/// Signing in already costs one authenticator interaction. Evaluating the
+/// PRF on *that* assertion — which is what the fixed application salt in
+/// spec section 4.2 buys — means an encrypted account is signed in and
+/// unlocked from a single Touch ID prompt, with no second ceremony and no
+/// trip through the unlock screen.
 #[cfg(feature = "hydrate")]
 async fn run_passkey_login(typed_email: String) -> Result<(), String> {
+    use crate::crypto::wire::APP_SALT;
     use crate::server_fns::passkey::{passkey_login_finish, passkey_login_start};
     use crate::webauthn_browser;
 
@@ -265,12 +286,95 @@ async fn run_passkey_login(typed_email: String) -> Result<(), String> {
     let challenge = passkey_login_start(email)
         .await
         .map_err(|e| e.to_string())?;
-    let credential = webauthn_browser::authenticate(&challenge)
+    let (credential, prf_output) = webauthn_browser::authenticate_with_prf(&challenge, APP_SALT)
         .await
         .map_err(|e| e.to_string())?;
-    passkey_login_finish(credential)
+    passkey_login_finish(credential.clone())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // Past this line the user is signed in, and nothing below may take that
+    // back. An authenticator with no PRF, a browser that ignored the
+    // extension, or a result in a shape this build did not expect all arrive
+    // here as `None` — see `authenticate_with_prf` — and all of them are an
+    // ordinary sign-in that lands in a `Locked` session the recovery code
+    // opens. Turning any of them into an error would lock the user out of
+    // the application itself, which is a far worse failure than the one this
+    // feature exists to prevent.
+    if let Some(prf_output) = prf_output {
+        unlock_after_sign_in(&credential, &prf_output).await;
+    }
+    Ok(())
+}
+
+/// Turns the sign-in assertion's PRF output into this device's data key, or
+/// gives up quietly.
+///
+/// **Returns `()`, and that is the guarantee rather than a convention:** a
+/// function with no error type cannot contribute one to the sign-in that
+/// called it, whatever is added to its body later.
+///
+/// It publishes nothing into [`EncryptionCtx`](crate::encryption_ctx::EncryptionCtx)
+/// either, because there is nothing to publish into: signing in reloads the
+/// page (see the caller), so the key's only job here is to reach the
+/// keystore, where the next load's probe picks it up as `Unlocked`. That
+/// also settles the identity question `EncryptionCtx::unlock` answers for an
+/// in-page unlock — a key must never be used for an account other than the
+/// one it was derived for. Here the address comes from `current_session`,
+/// the server's own view of the cookie it has just issued, and
+/// `SessionKey::adopt` files the keystore record under it; `keystore::get`
+/// then hands that record back only to a matching address. Guessing the
+/// address instead — from what was typed, which the discoverable flow leaves
+/// empty and which the server normalizes anyway — would file the record
+/// under a name the next load does not ask for, and the reward for one Touch
+/// ID prompt would be an unlock screen.
+#[cfg(feature = "hydrate")]
+async fn unlock_after_sign_in(credential_json: &str, prf_output: &[u8]) {
+    use crate::crypto::flow::credential_id_from_response;
+    use crate::crypto::{choose_route, unlock_with_prf};
+    use crate::server_fns::encryption::{encryption_status, encryption_wraps};
+    use crate::server_fns::session::current_session;
+
+    let Ok(Some(user)) = current_session().await else {
+        error!("signed in, but could not read back which account to unlock");
+        return;
+    };
+    let Ok(status) = encryption_status()
+        .await
+        .inspect_err(|e| error!("could not read the account's encryption status: {e}"))
+    else {
+        return;
+    };
+    // Not an error and not worth a log line: an account with no encryption
+    // has no key to unlock, so the PRF output is simply discarded (spec
+    // section 6.2).
+    if !status.enabled {
+        return;
+    }
+
+    let Ok(wraps) = encryption_wraps()
+        .await
+        .inspect_err(|e| error!("could not read the account's key wraps: {e}"))
+    else {
+        return;
+    };
+    let Some(credential_id) = credential_id_from_response(credential_json) else {
+        error!("the passkey that signed in did not identify itself to this browser");
+        return;
+    };
+    let Some(route) = choose_route(&wraps, Some(&credential_id)) else {
+        // The credential signs in but has no wrap of its own: enrolled
+        // before encryption was turned on, or its keying step never
+        // finished. `/account` labels it, and the unlock prompt offers the
+        // recovery code — neither is this function's business.
+        return;
+    };
+    // The `SessionKey` this produces is discarded, deliberately: what
+    // matters is the keystore write `unlock_with_prf` performs on the way to
+    // building it, which is what the reload's probe reads back.
+    if let Err(e) = unlock_with_prf(prf_output, &route.wrapped_key, &user).await {
+        error!("the passkey that signed in could not open this account's key: {e}");
+    }
 }
 
 #[cfg(test)]
