@@ -29,7 +29,9 @@
 //! IndexedDB types the keystore needs (spec section 7.2).
 //!
 //! No error here carries key material, PRF output, a recovery code, or
-//! plaintext: failures name the operation, never its inputs.
+//! plaintext. A failure names the operation and repeats what the browser
+//! said about it; it never repeats the operation's inputs. See [`failed`] for
+//! why the browser's own words are safe to keep and what would change that.
 
 use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue};
@@ -176,24 +178,51 @@ fn js_array(items: &[&JsValue]) -> Array {
     array
 }
 
-/// Reads the JS-side `name` of a thrown value and names the operation it came
-/// from.
+/// Reads the JS-side `name` and `message` of a thrown value and names the
+/// operation it came from.
 ///
-/// The exception's `message` is deliberately dropped. `name` is a closed set
-/// of `DOMException` identifiers — `OperationError` for a failed
-/// authentication, `InvalidAccessError` for a key used against the wrong
-/// algorithm — which is enough to tell an expected failure from a bug, while
-/// `message` is the one field an implementation could echo an argument into.
-/// Every argument in this module is key material or plaintext.
+/// **The `message` is kept — unconditionally, not only in a debug build.**
+/// It is the field an implementation could in principle echo an argument
+/// into, so the reasoning is worth stating:
+///
+/// - Every secret this module handles crosses into JS as a `Uint8Array`
+///   BufferSource: key material, PRF output, recovery-code bytes, entry
+///   plaintext. The only *strings* passed to WebCrypto are compile-time
+///   constants — `"raw"`, `"AES-GCM"`, `"AES-KW"`, `"HKDF"`, `"SHA-256"`,
+///   the usage names — and, from [`super::keystore`], the fixed database,
+///   store and record names. For key material to reach a `message`, a
+///   browser would have to format typed-array contents into an exception
+///   string, which none does.
+/// - Against that, `name` alone is often useless. Every argument-shape
+///   mistake — a malformed algorithm object, a missing field, the wrong sort
+///   of value — arrives as the same `"TypeError"`, and all of what
+///   distinguishes them lives in `message`. Those are exactly the failures
+///   this module's header says only a browser can catch, and this is the
+///   only channel it has for reporting one.
+/// - [`crate::webauthn_browser`]'s `classify` already puts the whole
+///   stringified exception into its error, so keeping `message` here follows
+///   the house rule rather than inventing a stricter one.
+///
+/// **What would invalidate this.** A change that passes secret material to
+/// WebCrypto or IndexedDB *as a string* — a JWK import instead of `"raw"`, a
+/// base64 or passphrase argument, an entry body used as a record key — makes
+/// a `message` able to quote a secret, and this decision has to be revisited
+/// at that point.
 ///
 /// Shared with [`super::keystore`], whose failures arrive as IndexedDB
-/// `DOMException`s and carry a `name` in the same way.
+/// `DOMException`s and carry both fields in the same way.
 pub(super) fn failed(operation: &str, thrown: &JsValue) -> CryptoError {
-    let name = Reflect::get(thrown, &"name".into())
-        .ok()
-        .and_then(|v| v.as_string())
-        .unwrap_or_else(|| "unknown error".to_string());
-    CryptoError(format!("{operation} failed: {name}"))
+    let text = |property: &str| {
+        Reflect::get(thrown, &property.into())
+            .ok()
+            .and_then(|value| value.as_string())
+            .filter(|value| !value.is_empty())
+    };
+    let name = text("name").unwrap_or_else(|| "unknown error".to_string());
+    CryptoError(match text("message") {
+        Some(message) => format!("{operation} failed: {name}: {message}"),
+        None => format!("{operation} failed: {name}"),
+    })
 }
 
 /// A method is missing, or is not callable, on the object it was read from.
