@@ -4,22 +4,41 @@
 //! `crypto` directly: they read this context, and the storage seam takes the
 //! answer out of it.
 //!
-//! # Why the server always renders `Unknown`
+//! # Why the seed depends on who is signed in
 //!
-//! The same reasoning as the entry tri-state in [`crate::storage::hook`],
-//! one step further out. The server *could* read `encrypted_at` cheaply —
-//! it has the session — but rendering `Locked` would put user-derived state
-//! in the SSR body, and the browser cannot tell locked from unlocked without
+//! [`EncryptionCtx::probing`] does not start every page load at `Unknown`.
+//! It starts at [`EncryptionState::Disabled`] for a signed-out visitor and
+//! at `Unknown` for a signed-in one, and the two halves have different
+//! reasons.
+//!
+//! A signed-out visitor uses `Backend::Local` (`AuthCtx::backend`), which is
+//! never encrypted (spec section 1.2). That is not a conclusion read from a
+//! row nobody has fetched yet — it is a fact about which backend
+//! `localStorage` is, true before any probe could run. Starting that
+//! visitor at `Unknown` anyway bought nothing but a read-only textarea and
+//! a "Getting ready" banner on the app's main page, for as long as wasm
+//! took to load, for a visitor who was never at risk.
+//!
+//! A signed-in visitor is the case the rest of this section is about — the
+//! same reasoning as the entry tri-state in [`crate::storage::hook`], one
+//! step further out. The server *could* read `encrypted_at` cheaply — it
+//! has the session — but rendering `Locked` would put user-derived state in
+//! the SSR body, and the browser cannot tell locked from unlocked without
 //! an async IndexedDB read anyway, so the first client render would differ
 //! regardless. [`EncryptionState::Unknown`] on both sides is the only value
-//! that hydrates (invariant E2, pinned by `app`'s
+//! that hydrates for that visitor (invariant E2, pinned by `app`'s
 //! `ssr_renders_unknown_encryption_state`).
 //!
-//! `Disabled` would hydrate just as cleanly, which is exactly why the
-//! starting value is worth being deliberate about: it is a *conclusion* —
-//! "this account has no encryption" — and asserting it about a signed-in
-//! visitor before anything has been read is what starts writing plaintext
-//! rows into an encrypted account.
+//! `Disabled` would hydrate just as cleanly for a signed-in visitor too,
+//! which is exactly why seeding it there would be wrong rather than merely
+//! unnecessary: it is a *conclusion* — "this account has no encryption" —
+//! and asserting it before anything has been read is what starts writing
+//! plaintext rows into an account that may be encrypted.
+//!
+//! Both halves are computed from [`crate::auth_ctx::initial_user`], which
+//! server and browser already derive identically from the same underlying
+//! fact — the session cookie — so seeding from it costs nothing hydration
+//! was not already paying for; see that function's doc comment.
 //!
 //! # Identity lives here
 //!
@@ -70,14 +89,26 @@ type StateSignal = RwSignal<EncryptionState, LocalStorage>;
 type StateSignal = RwSignal<EncryptionState>;
 
 /// A signal holding the value both targets start from.
-fn unknown_state() -> StateSignal {
+fn state_signal(initial: EncryptionState) -> StateSignal {
     #[cfg(feature = "hydrate")]
     {
-        RwSignal::new_local(EncryptionState::Unknown)
+        RwSignal::new_local(initial)
     }
     #[cfg(not(feature = "hydrate"))]
     {
-        RwSignal::new(EncryptionState::Unknown)
+        RwSignal::new(initial)
+    }
+}
+
+/// What a page load should seed [`EncryptionCtx`] to, from the same
+/// signed-in identity both targets already compute identically — see this
+/// module's header for why a signed-out visitor gets a conclusion instead
+/// of the probe's usual starting point.
+fn initial_state(user: Option<&str>) -> EncryptionState {
+    if user.is_some() {
+        EncryptionState::Unknown
+    } else {
+        EncryptionState::Disabled
     }
 }
 
@@ -89,7 +120,9 @@ fn unknown_state() -> StateSignal {
 /// finished (see [`Unreachable`](Self::Unreachable)).
 #[derive(Clone)]
 pub enum EncryptionState {
-    /// Before the probe resolves, and everything the server ever renders.
+    /// Before the probe resolves. What the server renders for a signed-in
+    /// visitor — the only visitor it ever probes for; see this module's
+    /// header for the signed-out seed.
     Unknown,
     /// The probe ran and could not answer: the status call failed.
     ///
@@ -103,6 +136,11 @@ pub enum EncryptionState {
     /// which is what keeps invariant E2 intact.
     Unreachable,
     /// The account has no encryption; bodies are stored in the clear.
+    ///
+    /// Also what a signed-out visitor's context seeds to, on both targets,
+    /// before anything has run — see this module's header. `Backend::Local`
+    /// is never encrypted, so nothing about that visitor needs a probe to
+    /// answer.
     Disabled,
     /// Encrypted, and this device holds no key for it.
     Locked,
@@ -243,14 +281,21 @@ pub struct EncryptionCtx {
 }
 
 impl EncryptionCtx {
-    /// Creates the context and starts the probe that resolves it.
+    /// Creates the context, seeded from `auth`, and starts the probe that
+    /// resolves it.
     ///
-    /// The context is usable immediately and reads [`EncryptionState::Unknown`]
-    /// until the probe lands; on the server it stays that way forever,
-    /// which is the whole point (see this module's header).
+    /// The seed is not always [`EncryptionState::Unknown`] — see this
+    /// module's header. It is read once, untracked, at the same moment
+    /// [`crate::auth_ctx::initial_user`] decided `auth` itself: this is the
+    /// value both targets' *first* render must agree on, not a second
+    /// reactive dependency alongside the `Effect` below, which already
+    /// re-runs the probe whenever `auth.user` changes afterward. On the
+    /// server a signed-in seed stays `Unknown` forever, since the probe
+    /// never runs there — which is the half of the whole point this
+    /// module's header was already making.
     pub fn probing(auth: AuthCtx) -> Self {
         let ctx = Self {
-            state: unknown_state(),
+            state: state_signal(initial_state(auth.user.get_untracked().as_deref())),
             keys: StoredValue::new(0),
             #[cfg(feature = "hydrate")]
             auth,
@@ -273,8 +318,6 @@ impl EncryptionCtx {
                 ctx.start_probe(auth.user.get());
             });
         }
-        #[cfg(not(feature = "hydrate"))]
-        let _ = auth;
 
         ctx
     }
@@ -401,13 +444,17 @@ impl EncryptionCtx {
     /// Builds a context already parked at `state`, bypassing the probe
     /// entirely.
     ///
-    /// Test-only, and the only way to reach `Locked` or `Unreachable` — or
-    /// to pin `Disabled` explicitly — on the host: `probing` always starts
-    /// at `Unknown`, and the `Effect` that could move it anywhere else is
-    /// `hydrate`-only. `DayView`'s and `WeekView`'s mount-gate tests need
-    /// exactly this to prove those components actually branch on
-    /// `EncryptionState`, not merely that the states exist, and
-    /// `storage::hook`'s reload test needs it to drive a transition.
+    /// Test-only, and still the only way to reach `Locked` or `Unreachable`
+    /// on the host — the `Effect` that could move `probing` there is
+    /// `hydrate`-only. It is also how a test pins `Disabled` for a
+    /// *signed-in* identity, which `probing` itself never does (a signed-in
+    /// seed always starts at `Unknown`; see this module's header) — a
+    /// signed-out `probing` reaches `Disabled` too, but only by way of
+    /// constructing an `AuthCtx` a test may not otherwise need. `DayView`'s
+    /// and `WeekView`'s mount-gate tests need exactly this to prove those
+    /// components actually branch on `EncryptionState`, not merely that the
+    /// states exist, and `storage::hook`'s reload test needs it to drive a
+    /// transition.
     ///
     /// `ssr` as well as `test`: the mount-gate call sites render with
     /// `.to_html()`, which needs `leptos`'s `ssr` feature, so this has no
@@ -416,7 +463,7 @@ impl EncryptionCtx {
     #[cfg(all(test, feature = "ssr"))]
     pub(crate) fn for_state(state: EncryptionState) -> Self {
         let ctx = Self {
-            state: unknown_state(),
+            state: state_signal(EncryptionState::Unknown),
             keys: StoredValue::new(0),
             #[cfg(feature = "hydrate")]
             auth: AuthCtx {
@@ -614,20 +661,42 @@ mod tests {
     ///
     /// What this can pin is only the starting value, not that a probe ran
     /// and found nothing: the probe is an `Effect`, `hydrate`-only, and
-    /// absent from this build entirely. The `AuthCtx` is decorative for the
-    /// same reason — a signed-in one would produce this same result here.
+    /// absent from this build entirely.
     #[test]
-    fn a_context_starts_unknown_and_refuses_writes() {
+    fn a_signed_in_context_starts_unknown_and_refuses_writes() {
         let owner = Owner::new();
         owner.with(|| {
             let auth = AuthCtx {
-                user: RwSignal::new(None),
+                user: RwSignal::new(Some("alice@example.com".to_string())),
             };
             let ctx = EncryptionCtx::probing(auth);
             assert!(matches!(ctx.state(), EncryptionState::Unknown));
             assert!(matches!(
                 ctx.state_untracked().write_key(),
                 WriteKey::Locked
+            ));
+        });
+        owner.cleanup();
+    }
+
+    /// The seed this round adds, at the unit level below `app`'s SSR tests:
+    /// a signed-out visitor uses `Backend::Local`, which is never encrypted
+    /// (spec 1.2), so nothing about their session needs the probe to
+    /// answer. Starting them at `Unknown` instead bought a read-only
+    /// textarea for as long as wasm took to load, on the app's main page,
+    /// for a visitor who was never at risk — see this module's header.
+    #[test]
+    fn a_signed_out_context_starts_disabled_and_accepts_writes() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let auth = AuthCtx {
+                user: RwSignal::new(None),
+            };
+            let ctx = EncryptionCtx::probing(auth);
+            assert!(matches!(ctx.state(), EncryptionState::Disabled));
+            assert!(matches!(
+                ctx.state_untracked().write_key(),
+                WriteKey::Plaintext
             ));
         });
         owner.cleanup();

@@ -157,23 +157,28 @@ fn DayView(date: NaiveDate) -> impl IntoView {
             <div class="w-full max-w-7xl mx-auto px-4 py-8">
                 <ImportBanner/>
                 // The gate spec section 7.4 requires: only a state the user
-                // has to act on swaps in the prompt. `Unknown` renders the
-                // entry area in its ordinary unloaded state — exactly what
-                // the server already renders for every visitor — rather than
-                // blanking it; the server is always `Unknown` (invariant
-                // E2), so blanking it would remove the entry area from every
-                // server-rendered page, not just a locked one. The cost of
-                // *not* blanking is narrower: a locked session sees the same
-                // unloaded shell for the width of the post-hydration probe
-                // before this swaps it for the prompt, since a `Locked` read
-                // fails the same way `hook::loaded_value` maps any other one
-                // — a brief flash on a rare path, not a permanent wrong
-                // answer.
+                // has to act on swaps in the prompt. `Unknown` and
+                // `Disabled` both render the entry area in its ordinary
+                // state rather than blanking it, and the server renders one
+                // or the other for every visitor — `Unknown` for a
+                // signed-in one (invariant E2), `Disabled` for a signed-out
+                // one, which needs no probe to reach (see `encryption_ctx`'s
+                // header) — so blanking either would remove the entry area
+                // from every server-rendered page, not just a locked one.
+                // The cost of *not* blanking is narrower: a locked session
+                // sees the same shell for the width of the post-hydration
+                // probe before this swaps it for the prompt, since a
+                // `Locked` read fails the same way `hook::loaded_value` maps
+                // any other one — a brief flash on a rare path, not a
+                // permanent wrong answer.
                 //
                 // Mounted is not the same as editable. `Unknown` is
-                // `WriteKey::Locked`, so `TimeEntryArea` renders its box
-                // read-only and says so until the probe lands — the server
-                // renders that same shell, which is what keeps it hydrating.
+                // `WriteKey::Locked`, so `TimeEntryArea` renders a signed-in
+                // visitor's box read-only and says so until the probe lands
+                // — the server renders that same shell, which is what keeps
+                // it hydrating. `Disabled` is `WriteKey::Plaintext`, so a
+                // signed-out visitor's box is editable immediately, on both
+                // targets.
                 //
                 // `Unreachable` joins `Locked` rather than `Unknown`, and the
                 // difference is who can end the state. `Unknown` ends by
@@ -475,6 +480,49 @@ mod tests {
         assert!(
             !html.contains("recovery code"),
             "server rendered unlock UI it cannot know is needed"
+        );
+    }
+
+    /// The bug this round fixes, at a level `ssr_renders_unknown_encryption_state`
+    /// cannot reach: a signed-out visitor is the app's main-page majority,
+    /// and their data lives in `localStorage` — `Backend::Local`, never
+    /// encrypted (spec 1.2). Before `EncryptionCtx` seeded from the
+    /// signed-in identity, every server render started at `Unknown`, so
+    /// this visitor's box was read-only and greyed out until wasm loaded and
+    /// a probe confirmed what the seed already knows for free.
+    #[test]
+    fn ssr_offers_an_editable_entry_area_when_signed_out() {
+        let html = render_app();
+        assert!(
+            !html.contains("readonly"),
+            "a signed-out visitor's session has nothing to probe for and \
+             must be editable immediately"
+        );
+        assert!(
+            !html.contains("nothing typed here would be saved yet"),
+            "a page that can already save must say nothing about not saving"
+        );
+    }
+
+    /// The half that must not regress alongside the fix above: a signed-in
+    /// visitor's account may be encrypted, so the seed still starts at
+    /// `Unknown` and the box stays read-only until the probe resolves.
+    #[test]
+    fn ssr_still_withholds_an_editable_entry_area_when_signed_in() {
+        let html = render_at("/2026-09-04", Some("alice@example.com"));
+        assert!(
+            html.contains("alice"),
+            "this render must actually be the signed-in one, or the \
+             assertions below prove nothing about a signed-in user"
+        );
+        assert!(
+            html.contains("readonly"),
+            "a signed-in visitor's account may be encrypted, so the box \
+             must stay read-only until the probe resolves"
+        );
+        assert!(
+            html.contains("nothing typed here would be saved yet"),
+            "the read-only box must say why, until the probe resolves"
         );
     }
 

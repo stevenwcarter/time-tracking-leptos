@@ -233,7 +233,6 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::*;
-    use crate::auth_ctx::AuthCtx;
 
     fn date(day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 9, day).expect("valid date")
@@ -244,10 +243,11 @@ mod tests {
     /// header), so there is nothing to drive it with here. Everything the
     /// write path touches is real.
     ///
-    /// Its `EncryptionCtx` stays on `Unknown` for the same reason: the probe
-    /// is an `Effect` too. That makes every write here a refusal, which
-    /// these tests do not mind — what they exercise is the bookkeeping `set`
-    /// does *before* spawning, and nothing polls the spawned future.
+    /// Its `EncryptionCtx` is pinned at `Unknown` via `for_state` rather
+    /// than built through `probing`, so it stays a refusal regardless of how
+    /// `probing` seeds a signed-out identity (`encryption_ctx`'s header) —
+    /// what these tests exercise is the bookkeeping `set` does *before*
+    /// spawning, and nothing polls the spawned future.
     fn persistent(generation: StoredValue<Generation>) -> Persistent {
         let (value, set_value) = signal::<Option<String>>(None);
         let date = date(4);
@@ -256,9 +256,7 @@ mod tests {
             set_value,
             key: Signal::stored(StorageKey::TimeEntry(date)),
             backend: Signal::stored(Backend::Local),
-            encryption: EncryptionCtx::probing(AuthCtx {
-                user: RwSignal::new(None),
-            }),
+            encryption: EncryptionCtx::for_state(EncryptionState::Unknown),
             generation,
         }
     }
