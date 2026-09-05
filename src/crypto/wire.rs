@@ -27,6 +27,18 @@ const INFO_PASSKEY: &[u8] = b"tt/entry-kek/passkey/v1";
 /// HKDF `info` for the recovery-code route. See [`INFO_PASSKEY`].
 const INFO_RECOVERY: &[u8] = b"tt/entry-kek/recovery/v1";
 
+/// The only KDF this build derives key-encryption keys with, and the value
+/// every stored row's `kdf` column must carry to be trusted.
+///
+/// Recorded per row (`entry_key_wrap.kdf`, spec section 5.2) for the same
+/// reason the envelope carries `alg`: a future change is a new value rather
+/// than a guess about old rows. Lives here rather than in `entry_key::store`
+/// so [`super::choose_route`] can check it too — both sides need the same
+/// string, and `entry_key` is `ssr`-only.
+pub const KDF_HKDF_SHA256: &str = "hkdf-sha256";
+/// The only key-wrap algorithm this build uses. See [`KDF_HKDF_SHA256`].
+pub const WRAP_ALG_AESKW256: &str = "aeskw256";
+
 /// HKDF salt: SHA-256 of `time-tracking-leptos/entry-key/v1`.
 ///
 /// A constant rather than a per-account value, and that is deliberate. The

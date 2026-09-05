@@ -5,14 +5,9 @@ use anyhow::{Context, Result};
 use chrono::{NaiveDateTime, Utc};
 use diesel::prelude::*;
 
-use crate::crypto::wire::WrapKind;
+use crate::crypto::wire::{KDF_HKDF_SHA256, WRAP_ALG_AESKW256, WrapKind};
 use crate::db::DbConn;
 use crate::schema::{entry_key_wrap, user};
-
-/// Recorded per row for the same reason the envelope carries `alg`: a future
-/// change becomes a new value rather than a guess about old rows.
-const KDF: &str = "hkdf-sha256";
-const WRAP_ALG: &str = "aeskw256";
 
 /// A wrap row's public read shape — one route to the account's data key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +71,8 @@ fn insert_row(
             kind: kind.as_str(),
             credential_id,
             wrapped_key,
-            kdf: KDF,
-            wrap_alg: WRAP_ALG,
+            kdf: KDF_HKDF_SHA256,
+            wrap_alg: WRAP_ALG_AESKW256,
             created_at: Utc::now().naive_utc(),
         })
         .execute(conn)

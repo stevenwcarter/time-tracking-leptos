@@ -62,11 +62,17 @@ pub struct WrapRoute {
 ///
 /// A row whose `kind` this build does not recognise is skipped rather than
 /// guessed at, so a future third kind of route cannot be mistaken for one of
-/// these two.
+/// these two. A row whose `kdf` or `wrap_alg` this build does not recognise
+/// is skipped the same way (spec section 5.2): each column names an
+/// algorithm precisely so that a future change is a new value to add support
+/// for, not a guess made under the wrong one.
 #[cfg(any(feature = "hydrate", test))]
 pub fn choose_route(wraps: &[WrapDto], credential_id: Option<&[u8]>) -> Option<WrapRoute> {
     wraps.iter().find_map(|wrap| {
         let kind = WrapKind::parse(&wrap.kind)?;
+        if wrap.kdf != wire::KDF_HKDF_SHA256 || wrap.wrap_alg != wire::WRAP_ALG_AESKW256 {
+            return None;
+        }
         let selected = match (kind, credential_id) {
             (WrapKind::Passkey, Some(id)) => wrap.credential_id.as_deref() == Some(id),
             (WrapKind::Recovery, None) => true,
@@ -401,8 +407,8 @@ mod tests {
             kind: kind.as_str().to_string(),
             credential_id: cred.map(<[u8]>::to_vec),
             wrapped_key: vec![tag; wire::WRAPPED_KEY_LEN],
-            kdf: "hkdf-sha256".to_string(),
-            wrap_alg: "aeskw256".to_string(),
+            kdf: wire::KDF_HKDF_SHA256.to_string(),
+            wrap_alg: wire::WRAP_ALG_AESKW256.to_string(),
         }
     }
 
@@ -486,5 +492,24 @@ mod tests {
             wrap(WrapKind::Passkey, Some(b"cred-b"), 2),
         ];
         assert!(choose_route(&rows, Some(b"cred")).is_none());
+    }
+
+    /// A row whose `kdf` this build does not recognise is skipped, the same
+    /// way an unrecognised `kind` is: deriving with today's HKDF-SHA256
+    /// anyway would be a guess about an algorithm the row never claimed to
+    /// use (spec section 5.2).
+    #[test]
+    fn a_row_with_an_unrecognized_kdf_is_skipped() {
+        let mut rows = vec![wrap(WrapKind::Recovery, None, 1)];
+        rows[0].kdf = "future-kdf".to_string();
+        assert!(choose_route(&rows, None).is_none());
+    }
+
+    /// The same, for `wrap_alg`.
+    #[test]
+    fn a_row_with_an_unrecognized_wrap_alg_is_skipped() {
+        let mut rows = vec![wrap(WrapKind::Recovery, None, 1)];
+        rows[0].wrap_alg = "future-wrap-alg".to_string();
+        assert!(choose_route(&rows, None).is_none());
     }
 }
