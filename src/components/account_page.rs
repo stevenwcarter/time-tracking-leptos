@@ -13,6 +13,7 @@ use crate::auth_ctx::AuthCtx;
 use crate::components::header::AppHeader;
 use crate::dto::PasskeyListItem;
 use crate::server_fns::passkey::{passkey_delete, passkey_list, passkey_rename};
+use crate::server_fns::session::sign_out_everywhere;
 
 /// Formats a passkey-management error for display.
 ///
@@ -63,6 +64,7 @@ pub fn AccountPage() -> impl IntoView {
 
 #[component]
 fn PasskeySection(email: String) -> impl IntoView {
+    let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
     // `Resource` here is safe: this route is client-navigated and never part
     // of the day view's SSR path, so it does not affect the synchronous
     // render the SSR tests rely on. Created at the top of the component,
@@ -90,6 +92,25 @@ fn PasskeySection(email: String) -> impl IntoView {
                     status.set("Passkey removed.".to_string());
                     rows.refetch();
                 }
+                Err(e) => status.set(passkey_error(e)),
+            }
+        });
+    };
+
+    // The only caller of `sign_out_everywhere` outside the test suite. The
+    // endpoint bumps `session_epoch`, which is what invalidates every token
+    // already issued — the revocation path spec §5.1 makes load-bearing.
+    // Without a control, a user who loses a device has no way to reach it,
+    // and session cookies live 30 days.
+    let sign_out_all = move |_| {
+        leptos::task::spawn_local(async move {
+            match sign_out_everywhere().await {
+                // Same local teardown as the header's sign-out: clear the
+                // signal rather than reload, so `use_persistent` re-reads
+                // from localStorage in place. This flips the page to its
+                // signed-out branch, which is the confirmation — a status
+                // line set here would be destroyed by that same flip.
+                Ok(()) => auth.user.set(None),
                 Err(e) => status.set(passkey_error(e)),
             }
         });
@@ -155,6 +176,22 @@ fn PasskeySection(email: String) -> impl IntoView {
                 let s = status.get();
                 (!s.is_empty()).then(|| view! { <p class="mt-3 text-sm text-gray-600">{s}</p> })
             }}
+
+            // Deliberately secondary to the passkey actions above: a
+            // recovery control for a lost device, not something to reach for
+            // by habit.
+            <div class="mt-8 pt-4 border-t border-gray-100">
+                <button
+                    type="button"
+                    class="text-sm text-gray-600 hover:text-gray-900 underline"
+                    on:click=sign_out_all
+                >
+                    "Sign out everywhere"
+                </button>
+                <p class="text-xs text-gray-500 mt-1">
+                    "Ends every signed-in session for this account, on every device, including this one. Use this if you've lost a device."
+                </p>
+            </div>
         </div>
     }
 }
