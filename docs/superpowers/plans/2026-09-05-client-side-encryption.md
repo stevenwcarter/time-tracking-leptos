@@ -912,16 +912,16 @@ pub struct DataKey(pub(crate) js_sys::Object);
 | `random_bytes(n: usize) -> Result<Vec<u8>, CryptoError>` | `crypto.getRandomValues(new Uint8Array(n))` |
 | `generate_dek_extractable() -> Result<Object, CryptoError>` | `crypto.subtle.generateKey({name:"AES-GCM",length:256}, true, ["encrypt","decrypt"])` |
 | `import_dek_non_extractable(raw: &[u8]) -> Result<DataKey, CryptoError>` | `crypto.subtle.importKey("raw", raw, {name:"AES-GCM"}, false, ["encrypt","decrypt"])` |
-| `derive_kek(ikm: &[u8], info: &[u8]) -> Result<Object, CryptoError>` | `const k = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveKey"]);`<br>`await crypto.subtle.deriveKey({name:"HKDF",hash:"SHA-256",salt:APP_SALT,info}, k, {name:"AES-KW",length:256}, false, ["wrapKey","unwrapKey"])` |
-| `wrap_dek(dek: &Object, kek: &Object) -> Result<Vec<u8>, CryptoError>` | `crypto.subtle.wrapKey("raw", dek, kek, "AES-KW")` → 40 bytes |
-| `unwrap_dek(wrapped: &[u8], kek: &Object, extractable: bool) -> Result<Object, CryptoError>` | `crypto.subtle.unwrapKey("raw", wrapped, kek, "AES-KW", {name:"AES-GCM",length:256}, extractable, ["encrypt","decrypt"])` |
-| `export_raw(key: &Object) -> Result<Vec<u8>, CryptoError>` | `crypto.subtle.exportKey("raw", key)` — only ever called on an extractable handle, only in §6.5 |
+| `derive_kek(ikm: &[u8], info: &[u8]) -> Result<Kek, CryptoError>` | `const k = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveKey"]);`<br>`await crypto.subtle.deriveKey({name:"HKDF",hash:"SHA-256",salt:APP_SALT,info}, k, {name:"AES-KW",length:256}, false, ["wrapKey","unwrapKey"])` |
+| `wrap_dek(dek: &RawDataKey, kek: &Kek) -> Result<Vec<u8>, CryptoError>` | `crypto.subtle.wrapKey("raw", dek, kek, "AES-KW")` → 40 bytes. Throws `InvalidAccessError` unless the wrapped key is extractable — which is why it takes `RawDataKey`. |
+| `unwrap_dek_sealed(wrapped: &[u8], kek: &Kek) -> Result<DataKey, CryptoError>` and `unwrap_dek_raw(..) -> Result<RawDataKey, CryptoError>` | `crypto.subtle.unwrapKey("raw", wrapped, kek, "AES-KW", {name:"AES-GCM",length:256}, extractable, ["encrypt","decrypt"])` |
+| `export_raw(key: &RawDataKey) -> Result<Vec<u8>, CryptoError>` | `crypto.subtle.exportKey("raw", key)`. Needed by §6.1 step 6 as well as §6.5 — an earlier draft of this plan said 6.5 only, and that was wrong. |
 | `seal(dek: &DataKey, plaintext: &str) -> Result<Sealed, CryptoError>` | fresh 12-byte nonce, then `crypto.subtle.encrypt({name:"AES-GCM",iv:nonce}, dek, utf8)` |
 | `open(dek: &DataKey, sealed: &Sealed) -> Result<String, CryptoError>` | `crypto.subtle.decrypt({name:"AES-GCM",iv:sealed.nonce}, dek, sealed.ciphertext)` then UTF-8 |
 
 **Constraints that are easy to get wrong — check each:**
 
-- `extractable` is `false` on every `unwrap_dek` call except the single §6.5 add-a-passkey path, which passes `true`. Getting this backwards defeats the entire point of decision 3 (spec E5). Make the parameter explicit and named, never a bare `bool` literal at a call site without a comment.
+- **Superseded by the implementation, which is better than this plan was.** The original design guarded extractability with a `bool`, then an `Extractable` enum. Review replaced both with newtypes: `DataKey` (sealed), `RawDataKey` (extractable), `Kek`. Choosing wrongly is now a compile error rather than something a reader must notice, and `DataKey::from_object` additionally reads the key's own `extractable` property back and refuses anything but `false` — the only mechanical guard on spec E5 available without a wasm test runner.
 - `derive_kek`'s `salt` is `APP_SALT` — pass the constant, never a fresh random value.
 - `seal` generates a **new** nonce per call. Never accept one as a parameter; that is how nonce reuse happens.
 - `open` must map a decryption failure to `CryptoError`, not panic. A failed GCM authentication is an expected outcome (wrong key, tampered row), not a bug.
