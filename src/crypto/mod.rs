@@ -389,11 +389,17 @@ mod ceremony {
 mod tests {
     use super::*;
 
-    fn wrap(kind: WrapKind, cred: Option<&[u8]>) -> WrapDto {
+    /// `tag` fills `wrapped_key` with a byte distinct from every other row's,
+    /// so a test can tell *which* row's bytes `choose_route` returned rather
+    /// than only which row's `kind`/`credential_id` it returned. Every row in
+    /// this module's tests used to share the same all-zero `wrapped_key`,
+    /// which meant an implementation that picked the right row and returned
+    /// the wrong one's bytes still passed.
+    fn wrap(kind: WrapKind, cred: Option<&[u8]>, tag: u8) -> WrapDto {
         WrapDto {
             kind: kind.as_str().to_string(),
             credential_id: cred.map(<[u8]>::to_vec),
-            wrapped_key: vec![0; wire::WRAPPED_KEY_LEN],
+            wrapped_key: vec![tag; wire::WRAPPED_KEY_LEN],
             kdf: "hkdf-sha256".to_string(),
             wrap_alg: "aeskw256".to_string(),
         }
@@ -402,15 +408,20 @@ mod tests {
     /// The credential that just asserted is the one whose wrap must be used.
     /// Picking any other passkey's wrap would derive the wrong KEK and fail
     /// to unwrap — with an error indistinguishable from a corrupt row.
+    ///
+    /// Asserts on `wrapped_key`, not just `credential_id`: `wrapped_key` is
+    /// the only field the ceremonies consume, so it is the one field a wrong
+    /// selection would corrupt without this failing.
     #[test]
     fn the_asserting_credential_selects_its_own_wrap() {
         let rows = vec![
-            wrap(WrapKind::Passkey, Some(b"cred-a")),
-            wrap(WrapKind::Passkey, Some(b"cred-b")),
-            wrap(WrapKind::Recovery, None),
+            wrap(WrapKind::Passkey, Some(b"cred-a"), 1),
+            wrap(WrapKind::Passkey, Some(b"cred-b"), 2),
+            wrap(WrapKind::Recovery, None, 3),
         ];
         let chosen = choose_route(&rows, Some(b"cred-b")).expect("route");
         assert_eq!(chosen.credential_id.as_deref(), Some(&b"cred-b"[..]));
+        assert_eq!(chosen.wrapped_key, vec![2; wire::WRAPPED_KEY_LEN]);
     }
 
     /// A passkey enrolled before encryption was enabled, or one whose
@@ -419,8 +430,8 @@ mod tests {
     #[test]
     fn a_credential_with_no_wrap_has_no_route() {
         let rows = vec![
-            wrap(WrapKind::Passkey, Some(b"cred-a")),
-            wrap(WrapKind::Recovery, None),
+            wrap(WrapKind::Passkey, Some(b"cred-a"), 1),
+            wrap(WrapKind::Recovery, None, 2),
         ];
         assert!(choose_route(&rows, Some(b"unknown")).is_none());
     }
@@ -428,18 +439,17 @@ mod tests {
     #[test]
     fn no_credential_selects_the_recovery_route() {
         let rows = vec![
-            wrap(WrapKind::Passkey, Some(b"cred-a")),
-            wrap(WrapKind::Recovery, None),
+            wrap(WrapKind::Passkey, Some(b"cred-a"), 1),
+            wrap(WrapKind::Recovery, None, 2),
         ];
-        assert_eq!(
-            choose_route(&rows, None).expect("route").kind,
-            WrapKind::Recovery
-        );
+        let chosen = choose_route(&rows, None).expect("route");
+        assert_eq!(chosen.kind, WrapKind::Recovery);
+        assert_eq!(chosen.wrapped_key, vec![2; wire::WRAPPED_KEY_LEN]);
     }
 
     #[test]
     fn an_account_with_no_recovery_wrap_has_no_recovery_route() {
-        let rows = vec![wrap(WrapKind::Passkey, Some(b"cred-a"))];
+        let rows = vec![wrap(WrapKind::Passkey, Some(b"cred-a"), 1)];
         assert!(choose_route(&rows, None).is_none());
     }
 
@@ -448,7 +458,7 @@ mod tests {
     /// under the wrong `info` and fail as a corrupt row.
     #[test]
     fn a_row_of_an_unrecognized_kind_is_skipped() {
-        let mut rows = vec![wrap(WrapKind::Recovery, None)];
+        let mut rows = vec![wrap(WrapKind::Recovery, None, 1)];
         rows[0].kind = "future".to_string();
         assert!(choose_route(&rows, None).is_none());
         assert!(choose_route(&rows, Some(b"cred-a")).is_none());
