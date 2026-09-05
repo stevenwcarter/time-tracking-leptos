@@ -11,8 +11,7 @@ use leptos::prelude::*;
 
 use crate::dto::WrapDto;
 
-/// Whether the signed-in account is encrypted, and whether it is worth the
-/// client checking for rows the migration pass has not reached yet.
+/// Whether the signed-in account is encrypted.
 ///
 /// The return type is spelled out with its full path rather than `use`d:
 /// `#[server]` generates a same-named arguments struct in this module for
@@ -22,7 +21,6 @@ use crate::dto::WrapDto;
 #[server(endpoint = "encryption/status")]
 pub async fn encryption_status() -> Result<crate::dto::EncryptionStatus, ServerFnError> {
     use crate::dto::EncryptionStatus;
-    use crate::entries::repo;
     use crate::entry_key::store;
 
     let (ctx, me) = super::require_user()?;
@@ -32,18 +30,8 @@ pub async fn encryption_status() -> Result<crate::dto::EncryptionStatus, ServerF
 
     let enabled = store::is_encrypted(&mut conn, me.id)
         .map_err(super::log_and_fail("is_encrypted", "Internal server error"))?;
-    // Only worth asking "does the account have anything at all" once it is
-    // encrypted — an unencrypted account has nothing pending by definition.
-    let unmigrated_hint = enabled
-        && repo::user_has_any_entry(&mut conn, me.id).map_err(super::log_and_fail(
-            "user_has_any_entry",
-            "Internal server error",
-        ))?;
 
-    Ok(EncryptionStatus {
-        enabled,
-        unmigrated_hint,
-    })
+    Ok(EncryptionStatus { enabled })
 }
 
 /// The signed-in user's own wraps. Scoped by `require_user`'s `me.id`, not

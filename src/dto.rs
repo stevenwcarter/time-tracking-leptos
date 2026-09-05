@@ -53,15 +53,16 @@ impl From<crate::entry_key::store::WrapRow> for WrapDto {
 
 /// The signed-in account's encryption state, as seen from the browser.
 ///
-/// `unmigrated_hint` is deliberately a hint, not a count: the server never
-/// parses an entry body (invariant E1), so it cannot know *which* rows are
-/// still v1, only whether the account has both been encrypted and has any
-/// entry at all — `true` whenever it is worth the client asking `entries_all`
-/// and running the real, pure-function check (`rows_needing_migration`)
-/// itself. It can read `true` after every row has actually been migrated;
-/// that costs one wasted client-side check, never a missed migration.
+/// Just `enabled`: a server-computed "is migration pending" hint was
+/// considered and dropped. The server never parses an entry body (invariant
+/// E1), so the best it could report was "encrypted and has any entry at
+/// all" — true forever once an account has saved anything, including long
+/// after migration finishes. Getting it exact would mean a client-written
+/// schema column recording envelope versions, which is a real compatibility
+/// surface for one rarely-visited page. `/account` instead calls
+/// `entries_all` and runs the real, pure-function check
+/// (`rows_needing_migration`) itself when it needs the count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptionStatus {
     pub enabled: bool,
-    pub unmigrated_hint: bool,
 }

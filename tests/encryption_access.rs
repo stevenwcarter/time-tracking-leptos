@@ -72,7 +72,6 @@ async fn status_reports_disabled_before_enabling_and_enabled_after() {
 
     let before = alice.encryption_status().await.expect("status");
     assert!(!before.enabled);
-    assert!(!before.unmigrated_hint);
 
     alice
         .encryption_enable(&[1; 40], b"cred-1", &[2; 40])
@@ -80,20 +79,6 @@ async fn status_reports_disabled_before_enabling_and_enabled_after() {
         .expect("enable");
     let after = alice.encryption_status().await.expect("status");
     assert!(after.enabled);
-    assert!(
-        !after.unmigrated_hint,
-        "no entries exist yet, so nothing is pending migration"
-    );
-
-    alice
-        .save_entry("2026-09-05", "9:00-10:00 code")
-        .await
-        .expect("save");
-    let with_entries = alice.encryption_status().await.expect("status");
-    assert!(
-        with_entries.unmigrated_hint,
-        "an entry now exists on an encrypted account, so it is worth checking"
-    );
 }
 
 /// Spec section 6.6. A user with one passkey and a lost recovery code could

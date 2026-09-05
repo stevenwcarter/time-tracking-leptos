@@ -441,7 +441,7 @@ Every one of these moves opaque blobs. None can derive a DEK.
 
 | Function | Signature | Notes |
 |---|---|---|
-| `encryption_status` | `() -> Result<EncryptionStatus>` | `{ enabled: bool, unmigrated_hint: bool }`. Cheap; called on every post-hydration probe. |
+| `encryption_status` | `() -> Result<EncryptionStatus>` | `{ enabled: bool }`. Cheap; called on every post-hydration probe. `/account` derives its pending-migration count from its own `entries_all` call rather than a server-computed hint. |
 | `encryption_wraps` | `() -> Result<Vec<WrapRow>>` | The signed-in user's wraps: `kind`, `credential_id`, `wrapped_key`, `kdf`, `wrap_alg`. |
 | `encryption_enable` | `(passkey_wrap: Vec<u8>, credential_id: Vec<u8>, recovery_wrap: Vec<u8>) -> Result<()>` | One transaction: sets `encrypted_at`, inserts both rows. Errors if already enabled. |
 | `encryption_add_passkey_wrap` | `(credential_id: Vec<u8>, wrapped_key: Vec<u8>) -> Result<()>` | §6.5. Rejects a credential that is not the caller's. |
