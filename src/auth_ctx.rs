@@ -56,12 +56,13 @@ impl AuthCtx {
 /// clear, and does; see [`EncryptionCtx::lock`](crate::encryption_ctx::EncryptionCtx::lock).
 pub async fn forget_device_key() {
     #[cfg(feature = "hydrate")]
-    if let Err(e) = crate::crypto::keystore::clear().await {
+    if let Err(e) = crate::crypto::forget_device_key().await {
         leptos::logging::error!("sign-out could not forget this device's data key: {e}");
     }
 }
 
-/// Signs out on this device: forget the key, then end the session.
+/// Signs out on this device: stop anything in flight, forget the key, then
+/// end the session.
 ///
 /// Both controls run through here — the account menu's "Sign out" and
 /// `/account`'s "Sign out everywhere" — because the *order* is the security
@@ -72,18 +73,30 @@ pub async fn forget_device_key() {
 /// that has to hold whether or not the server agreed the sign-out happened
 /// (spec section 6.7).
 ///
+/// `invalidate` comes first and is synchronous, which is the whole reason it
+/// is a separate step rather than folded into `forget`. It is
+/// [`EncryptionCtx::signing_out`](crate::encryption_ctx::EncryptionCtx::signing_out),
+/// and until it has run, a probe already in flight is still allowed to
+/// publish `Unlocked` — and `AuthCtx::user`, the only other thing that would
+/// invalidate it, is not cleared until `end_session` has answered. Running
+/// it after `forget` would leave that probe free to republish a key across
+/// the very delete meant to remove it.
+///
 /// The server's answer is passed straight back, so a caller still learns
 /// that its half failed and can say so. What it cannot do is make the key
 /// clearing wait on that answer.
 ///
-/// Both halves are parameters rather than calls in the body so the order is
-/// pinned by a host test: the real ones reach IndexedDB and the network,
-/// neither of which exists off the browser, so nothing about the sequence
-/// would otherwise be checkable by anything but reading it.
+/// All three steps are parameters rather than calls in the body so the order
+/// is pinned by a host test: the real ones reach a reactive context,
+/// IndexedDB and the network, none of which exists off the browser, so
+/// nothing about the sequence would otherwise be checkable by anything but
+/// reading it.
 pub async fn sign_out(
+    invalidate: impl FnOnce(),
     forget: impl Future<Output = ()>,
     end_session: impl Future<Output = Result<(), ServerFnError>>,
 ) -> Result<(), ServerFnError> {
+    invalidate();
     forget.await;
     end_session.await
 }
@@ -135,17 +148,22 @@ mod tests {
         RefCell::new(Vec::new())
     }
 
-    /// Spec section 6.7's ordering: the device key is gone before the
-    /// server is asked for anything.
+    /// Spec section 6.7's ordering: anything in flight is invalidated and
+    /// the device key is gone, both before the server is asked for
+    /// anything.
     ///
-    /// The `hydrate` half of this — the IndexedDB delete itself — has no
-    /// host equivalent and is reviewed by reading `crypto::keystore`. What
-    /// is checkable here, and is the part a later edit could quietly
-    /// change, is the sequence.
+    /// The `hydrate` halves of this — the IndexedDB delete, the probe
+    /// generation — have no host equivalent and are reviewed by reading
+    /// `crypto::keystore` and `encryption_ctx`. What is checkable here, and
+    /// is the part a later edit could quietly change, is the sequence. The
+    /// invalidation leads because a probe in flight stays allowed to publish
+    /// `Unlocked` until something bumps the counter, and publishing one
+    /// across the delete below would put the key straight back.
     #[test]
-    fn signing_out_forgets_the_device_key_before_it_ends_the_session() {
+    fn signing_out_stops_the_probe_and_forgets_the_key_before_ending_the_session() {
         let steps = trace();
         let done = block_on(sign_out(
+            || steps.borrow_mut().push("invalidate"),
             async { steps.borrow_mut().push("forget") },
             async {
                 steps.borrow_mut().push("end session");
@@ -153,7 +171,11 @@ mod tests {
             },
         ));
         assert!(done.is_ok());
-        assert_eq!(*steps.borrow(), ["forget", "end session"]);
+        assert_eq!(
+            *steps.borrow(),
+            ["invalidate", "forget", "end session"],
+            "a probe left running across the delete would republish the key it removed"
+        );
     }
 
     /// The case the control exists for. A sign-out the server refused still
@@ -167,6 +189,7 @@ mod tests {
     fn a_sign_out_the_server_refused_still_forgets_the_device_key() {
         let steps = trace();
         let done = block_on(sign_out(
+            || steps.borrow_mut().push("invalidate"),
             async { steps.borrow_mut().push("forget") },
             async {
                 steps.borrow_mut().push("end session");
@@ -179,7 +202,7 @@ mod tests {
         );
         assert_eq!(
             *steps.borrow(),
-            ["forget", "end session"],
+            ["invalidate", "forget", "end session"],
             "the key clearing must not be conditional on the server call"
         );
     }

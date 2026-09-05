@@ -623,9 +623,13 @@ pub fn EncryptionPanel(
                         // `EncryptionCtx::unlock` refuses a key for an
                         // account that is no longer the signed-in one, so a
                         // sign-out during the code screen leaves the key
-                        // unpublished rather than sealing the signed-out
-                        // page's `localStorage` under it.
-                        encryption.unlock(key);
+                        // neither published nor written to this device's
+                        // keystore, rather than sealing the signed-out
+                        // page's `localStorage` under it. Awaited because
+                        // the keystore write lives behind that check, and
+                        // because the migration below needs the key
+                        // published first.
+                        encryption.unlock(key).await;
                         run_migration();
                     }
                     Err(message) => status.set(Some(Status::Problem(message))),

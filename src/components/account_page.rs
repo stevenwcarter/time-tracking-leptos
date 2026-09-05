@@ -164,7 +164,13 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
             // the server manages to revoke anything (spec section 6.7).
             // Revoking every session and leaving a working key on the device
             // in front of you would be the wrong half of the job.
-            match sign_out(forget_device_key(), sign_out_everywhere()).await {
+            match sign_out(
+                move || encryption.signing_out(),
+                forget_device_key(),
+                sign_out_everywhere(),
+            )
+            .await
+            {
                 // Same local teardown as the header's sign-out: clear the
                 // signal rather than reload, so `use_persistent` re-reads
                 // from localStorage in place. This flips the page to its

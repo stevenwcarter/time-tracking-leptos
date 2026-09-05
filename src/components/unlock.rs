@@ -129,7 +129,11 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
                 // would be writing to a disposed signal.
                 busy.set(false);
                 match outcome {
-                    Ok(key) => encryption.unlock(key),
+                    // Awaited rather than fired and forgotten: `unlock`
+                    // writes this device's keystore behind its own identity
+                    // check, and nothing after it here depends on the
+                    // answer.
+                    Ok(key) => encryption.unlock(key).await,
                     Err(msg) => status.set(msg),
                 }
             });
@@ -172,7 +176,7 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
     let skip_reissue = move |_| {
         #[cfg(feature = "hydrate")]
         if let Some(Some(key)) = pending_key.try_update_value(Option::take) {
-            encryption.unlock(key);
+            spawn_local(async move { encryption.unlock(key).await });
         }
     };
 
@@ -201,7 +205,7 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
     let finish_after_new_code = move |_| {
         #[cfg(feature = "hydrate")]
         if let Some(Some(key)) = pending_key.try_update_value(Option::take) {
-            encryption.unlock(key);
+            spawn_local(async move { encryption.unlock(key).await });
         }
     };
 

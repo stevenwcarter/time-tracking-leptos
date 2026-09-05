@@ -25,11 +25,13 @@
 //!
 //! This module is the only place that asks *whose* key a session holds. The
 //! storage seam takes the key it is handed and tries it (see
-//! [`crate::storage`]'s header), so the three guarantees that keep a key and
-//! an account together are all below: the probe resets to `Unknown` whenever
+//! [`crate::storage`]'s header), so the guarantees that keep a key and an
+//! account together are all below: the probe resets to `Unknown` whenever
 //! `AuthCtx::user` changes, `SessionKey::restore` reads the keystore under
 //! the signed-in address, and `EncryptionCtx::unlock` refuses a key whose
-//! `SessionKey::user` is not the one signed in now.
+//! `SessionKey::user` is not the one signed in now — *before* that key is
+//! written to this device's keystore, which is the ordering that makes
+//! signing out actually take.
 
 use leptos::prelude::*;
 
@@ -44,7 +46,6 @@ use crate::storage::WriteKey;
 
 #[cfg(feature = "hydrate")]
 use crate::server_fns::encryption::encryption_status;
-#[cfg(feature = "hydrate")]
 use crate::storage::Generation;
 
 /// How the state is stored, which is the one thing in this module that has
@@ -196,9 +197,13 @@ pub struct EncryptionCtx {
     /// field's absence says so rather than a comment.
     #[cfg(feature = "hydrate")]
     auth: AuthCtx,
-    /// Shared by the first probe and every [`retry`](Self::retry), so the
-    /// two can invalidate each other.
-    #[cfg(feature = "hydrate")]
+    /// Shared by the first probe, every [`retry`](Self::retry) and
+    /// [`signing_out`](Self::signing_out), so all three can invalidate each
+    /// other.
+    ///
+    /// Ungated, unlike the probe it guards: `signing_out` is called from a
+    /// click handler that is not itself `cfg`-forked, and a counter the
+    /// server never bumps costs eight bytes.
     generation: StoredValue<Generation>,
 }
 
@@ -214,7 +219,6 @@ impl EncryptionCtx {
             keys: StoredValue::new(0),
             #[cfg(feature = "hydrate")]
             auth,
-            #[cfg(feature = "hydrate")]
             generation: StoredValue::new(Generation::default()),
         };
 
@@ -240,6 +244,52 @@ impl EncryptionCtx {
         ctx
     }
 
+    /// Invalidates every probe in flight and returns the token of the one
+    /// starting now.
+    ///
+    /// Every path that changes what a probe should answer goes through here
+    /// — [`start_probe`](Self::start_probe), [`retry`](Self::retry) and
+    /// [`signing_out`](Self::signing_out) — so there is one counter and one
+    /// rule about who may publish.
+    fn begin_probe(self) -> u64 {
+        self.generation
+            .try_update_value(Generation::next)
+            .unwrap_or_default()
+    }
+
+    /// Whether `token` still identifies the newest probe, and so may
+    /// publish.
+    ///
+    /// `try_with_value` rather than the panicking form, since this owner can
+    /// be disposed while a probe is still in flight. A fallback of `false`
+    /// degrades to "discard the answer", which is the safe direction.
+    #[cfg(any(feature = "hydrate", test))]
+    fn may_publish(self, token: u64) -> bool {
+        self.generation
+            .try_with_value(|g| g.is_current(token))
+            .unwrap_or(false)
+    }
+
+    /// Invalidates every probe in flight, because the user has asked to sign
+    /// out.
+    ///
+    /// Called at the *start* of sign-out, before the server is asked for
+    /// anything, and that timing is the whole of the point. `AuthCtx::user`
+    /// is not cleared until `logout()` answers — a full network round trip
+    /// later — and until it is, the probe's effect does not re-run and
+    /// nothing else bumps the counter. A probe already in flight when the
+    /// button was pressed therefore stays current for that entire window and
+    /// can land and publish `Unlocked` for an account the user has just
+    /// asked the device to forget, driving a keystore write behind
+    /// `crypto::forget_device_key`'s back.
+    ///
+    /// It publishes nothing itself, deliberately: a sign-out the server
+    /// refuses leaves the user signed in, and moving the state here would
+    /// strand that session on a value nothing re-runs to correct.
+    pub fn signing_out(self) {
+        let _ = self.begin_probe();
+    }
+
     /// Starts a probe for `user`, discarding any probe still in flight.
     ///
     /// The token is captured synchronously, before the `spawn_local` below,
@@ -250,10 +300,7 @@ impl EncryptionCtx {
     /// increment.
     #[cfg(feature = "hydrate")]
     fn start_probe(self, user: Option<String>) {
-        let token = self
-            .generation
-            .try_update_value(Generation::next)
-            .unwrap_or_default();
+        let token = self.begin_probe();
 
         let Some(user) = user else {
             // Signed out means `localStorage`, which is never encrypted
@@ -273,14 +320,8 @@ impl EncryptionCtx {
             let probed = probe(&user).await;
             // Only the newest probe may publish; an older one landing after
             // a sign-out, or after a retry overtook it, must be discarded
-            // rather than overwrite it. `try_with_value` rather than the
-            // panicking form, since this owner can be disposed while a
-            // probe is still in flight.
-            let is_current = self
-                .generation
-                .try_with_value(|g| g.is_current(token))
-                .unwrap_or(false);
-            if is_current {
+            // rather than overwrite it.
+            if self.may_publish(token) {
                 self.publish(probed);
             }
         });
@@ -346,7 +387,6 @@ impl EncryptionCtx {
             auth: AuthCtx {
                 user: RwSignal::new(None),
             },
-            #[cfg(feature = "hydrate")]
             generation: StoredValue::new(Generation::default()),
         };
         ctx.publish(state);
@@ -401,29 +441,59 @@ impl EncryptionCtx {
         }
     }
 
-    /// Publishes a session an unlock ceremony just opened (spec section 6.3).
+    /// Whether `key` belongs to the account signed in *right now*.
+    #[cfg(feature = "hydrate")]
+    fn is_current_account(self, key: &SessionKey) -> bool {
+        self.auth.user.get_untracked().as_deref() == Some(key.user())
+    }
+
+    /// Publishes a session an unlock ceremony just opened, and remembers it
+    /// on this device (spec sections 6.3 and 7.3).
     ///
     /// The only way anything outside this module reaches `Unlocked` other
     /// than the probe finding a key already in the keystore.
-    /// `crypto::unlock_with_prf`/`unlock_with_recovery` have already called
-    /// `SessionKey::adopt`, which writes the keystore record — this call
-    /// only tells the rest of the tree the session changed, which is what
-    /// makes the day and week views (rendered through
-    /// [`state`](Self::state)) swap the prompt for the entries.
+    ///
+    /// The keystore write happens *here*, behind the identity check below,
+    /// and not inside the ceremony that produced the key. It used to happen
+    /// there, on the way to building the `SessionKey` — before anyone had
+    /// asked whose account this was — so an unlock resolving after a
+    /// sign-out left the previous account's record on the device. Another
+    /// account could not read it (`keystore::get` checks the stored user),
+    /// but "your key is gone from this device" is exactly the promise
+    /// sign-out makes, and that broke it.
+    ///
+    /// Async for the same reason: the write has to be sequenced against the
+    /// check rather than fired past it.
     ///
     /// `hydrate`-only, like the type it takes: nothing off the browser ever
     /// holds a `SessionKey` to pass here.
     #[cfg(feature = "hydrate")]
-    pub fn unlock(self, key: SessionKey) {
+    pub async fn unlock(self, key: SessionKey) {
         // The ceremony that produced this key is async and the account menu
         // stays mounted throughout it, so the account can change underneath
-        // it — signing out is a live toggle. A key adopted for the account
+        // it — signing out is a live toggle. A key opened for the account
         // that has just left must not become this session's: on the
         // signed-out page it would seal `localStorage` rows under a key
         // nothing can restore afterwards. This is the check the storage
         // seam relies on and never repeats (see `storage`'s header).
-        if self.auth.user.get_untracked().as_deref() != Some(key.user()) {
+        if !self.is_current_account(&key) {
             error!("discarding an unlock for an account that is no longer signed in");
+            return;
+        }
+        if let Err(e) = key.remember().await {
+            error!("could not remember the data key on this device: {e}");
+        }
+        // Checked again on the far side of the write, because the write is
+        // itself an await and signing out is a live toggle for the whole of
+        // it. `crypto::forget_device_key`'s delete and this put are two
+        // IndexedDB transactions with nothing ordering them against each
+        // other, so a sign-out landing inside this window can be undone only
+        // by looking afterwards.
+        if !self.is_current_account(&key) {
+            error!("an unlock landed for an account that has since signed out; forgetting it");
+            if let Err(e) = crate::crypto::forget_device_key().await {
+                error!("could not forget the key written for a signed-out account: {e}");
+            }
             return;
         }
         self.publish(EncryptionState::Unlocked(key));
@@ -443,10 +513,14 @@ impl EncryptionCtx {
     /// Only meaningful for an encrypted account, which is the only state
     /// `/account`'s panel offers it from; publishing `Locked` for an
     /// unencrypted one would claim an encryption that does not exist.
+    ///
+    /// Goes through [`crate::crypto::forget_device_key`] rather than the
+    /// keystore directly, so an unlock ceremony still running when the user
+    /// pressed this cannot write its key back afterwards.
     #[cfg(feature = "hydrate")]
     pub async fn lock(self) -> Result<(), crate::crypto::subtle::CryptoError> {
         self.publish(EncryptionState::Locked);
-        crate::crypto::keystore::clear().await
+        crate::crypto::forget_device_key().await
     }
 }
 
@@ -550,6 +624,41 @@ mod tests {
     // implementation, which reads as coverage of the read path while
     // guarding nothing. `write_key`, above, is where the same decision is
     // genuinely discriminable, and it is tested there.
+
+    /// Extension 2 of the sign-out story, at the level the host can reach.
+    ///
+    /// Signing out clears `AuthCtx::user` only once `logout()` has answered,
+    /// so a probe already in flight when the button was pressed stays
+    /// current for a whole network round trip — long enough to land and
+    /// publish `Unlocked`, which is a key republished onto a device that has
+    /// just been told to forget one. Bumping the counter the moment the user
+    /// asks is what closes that window.
+    ///
+    /// The probe itself is `hydrate`-only, so what this drives is the
+    /// generation bookkeeping underneath it: the same `begin_probe` /
+    /// `may_publish` pair `start_probe` uses, which is the whole of the
+    /// decision about who is allowed to publish.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn signing_out_invalidates_a_probe_already_in_flight() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let ctx = EncryptionCtx::for_state(EncryptionState::Unknown);
+            let in_flight = ctx.begin_probe();
+            assert!(
+                ctx.may_publish(in_flight),
+                "the probe is the newest until something else starts"
+            );
+
+            ctx.signing_out();
+
+            assert!(
+                !ctx.may_publish(in_flight),
+                "a probe in flight when the user signed out must not publish afterwards"
+            );
+        });
+        owner.cleanup();
+    }
 
     /// The narrowing A1 turns on, at the unit level: every state without a
     /// key reduces to one identity, so a `Memo` over it stays silent across

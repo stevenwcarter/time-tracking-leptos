@@ -10,6 +10,7 @@ use leptos_router::components::A;
 
 use crate::auth_ctx::{AuthCtx, forget_device_key, sign_out};
 use crate::date::to_iso;
+use crate::encryption_ctx::EncryptionCtx;
 use crate::server_fns::session::{logout, request_magic_link};
 
 /// The local part of an address, capped, for the corner label.
@@ -88,19 +89,20 @@ fn SignedInPanel(
     open: RwSignal<bool>,
 ) -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
+    let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     let status = RwSignal::new(String::new());
 
     let on_sign_out = move |_| {
         spawn_local(async move {
-            // `sign_out` forgets this device's data key first and regardless
-            // of what the server then says, which is why the whole call goes
-            // through it rather than adding a line to either arm below (spec
-            // section 6.7). The in-memory half needs nothing here: clearing
-            // `auth.user` re-runs `EncryptionCtx`'s probe, and a probe for a
-            // signed-out visitor publishes `Disabled`, which holds no key —
-            // and bumps the `Generation`, so an older probe cannot land
-            // afterwards and republish one.
-            match sign_out(forget_device_key(), logout()).await {
+            // `sign_out` invalidates anything in flight and forgets this
+            // device's data key first, regardless of what the server then
+            // says, which is why the whole call goes through it rather than
+            // adding a line to either arm below (spec section 6.7). Clearing
+            // `auth.user` on success re-runs `EncryptionCtx`'s probe, and a
+            // probe for a signed-out visitor publishes `Disabled`, which
+            // holds no key — but that happens a round trip later, which is
+            // what `signing_out` covers.
+            match sign_out(move || encryption.signing_out(), forget_device_key(), logout()).await {
                 Ok(()) => {
                     // Closed first, deliberately: the popover is describing
                     // an account that is about to stop existing, and clearing
@@ -322,12 +324,18 @@ async fn run_passkey_login(typed_email: String) -> Result<(), String> {
 /// in-page unlock — a key must never be used for an account other than the
 /// one it was derived for. Here the address comes from `current_session`,
 /// the server's own view of the cookie it has just issued, and
-/// `SessionKey::adopt` files the keystore record under it; `keystore::get`
+/// `SessionKey::remember` files the keystore record under it; `keystore::get`
 /// then hands that record back only to a matching address. Guessing the
 /// address instead — from what was typed, which the discoverable flow leaves
 /// empty and which the server normalizes anyway — would file the record
 /// under a name the next load does not ask for, and the reward for one Touch
 /// ID prompt would be an unlock screen.
+///
+/// The comparison `EncryptionCtx::unlock` makes is not available here and
+/// cannot be: the page has not reloaded, so `AuthCtx::user` still says
+/// whatever it said before this sign-in. The guard this path *can* honour is
+/// the one inside `SessionKey::remember` — a sign-out or a "Lock now" issued
+/// since the ceremony started outranks the write.
 #[cfg(feature = "hydrate")]
 async fn unlock_after_sign_in(credential_json: &str, prf_output: &[u8]) {
     use crate::crypto::flow::credential_id_from_response;
@@ -369,11 +377,20 @@ async fn unlock_after_sign_in(credential_json: &str, prf_output: &[u8]) {
         // recovery code — neither is this function's business.
         return;
     };
-    // The `SessionKey` this produces is discarded, deliberately: what
-    // matters is the keystore write `unlock_with_prf` performs on the way to
-    // building it, which is what the reload's probe reads back.
-    if let Err(e) = unlock_with_prf(prf_output, &route.wrapped_key, &user).await {
-        error!("the passkey that signed in could not open this account's key: {e}");
+    // The key is never published anywhere — signing in reloads the page —
+    // so all that matters is that it reaches the keystore, which is what the
+    // reload's probe reads back. The write is a step of its own rather than
+    // a side effect of the unlock, so that the guard on it is visible here:
+    // `SessionKey::remember` refuses if this device has been asked to forget
+    // its key since the ceremony began, which is the only check this path
+    // can make (there is no live `AuthCtx` to compare against yet).
+    match unlock_with_prf(prf_output, &route.wrapped_key, &user).await {
+        Ok(key) => {
+            if let Err(e) = key.remember().await {
+                error!("the key the sign-in opened could not be stored on this device: {e}");
+            }
+        }
+        Err(e) => error!("the passkey that signed in could not open this account's key: {e}"),
     }
 }
 

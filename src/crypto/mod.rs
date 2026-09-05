@@ -25,6 +25,8 @@ pub mod recovery;
 pub mod subtle;
 pub mod wire;
 
+use std::cell::Cell;
+
 #[cfg(any(feature = "hydrate", test))]
 use self::wire::WrapKind;
 #[cfg(any(feature = "hydrate", test))]
@@ -35,6 +37,69 @@ pub use self::ceremony::{
     Enabled, Opener, SessionKey, UnlockError, add_passkey_route, enable, reissue_recovery,
     unlock_with_prf, unlock_with_recovery,
 };
+
+thread_local! {
+    /// How many times this page load has been told to forget the device
+    /// key. See [`Forgets`].
+    static FORGETS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many times this device had been told to forget its data key at some
+/// earlier moment: captured when a ceremony starts, checked when it writes.
+///
+/// Every unlock is several awaits long — a WebAuthn prompt, a network round
+/// trip, a WebCrypto unwrap — and both "Sign out" and "Lock now" are live
+/// toggles for all of it. Without this, a ceremony that started before
+/// either one still ends in a keystore write, and that write lands *after*
+/// the delete, leaving the device holding exactly the key the user asked it
+/// to forget. No identity check catches that: the key really does belong to
+/// the account that was signed in when the ceremony began.
+///
+/// A thread-local counter rather than a signal because it has to be readable
+/// from every path that writes the keystore, including
+/// `account_menu::unlock_after_sign_in`, which runs with no reactive context
+/// at all — the page has not reloaded yet, so there is no `AuthCtx` there to
+/// compare against either. wasm is single-threaded, so there is nothing to
+/// share the counter with; the server never touches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forgets(u64);
+
+impl Forgets {
+    /// The count as of now, to be captured at the start of a ceremony that
+    /// will end in a keystore write.
+    pub fn now() -> Self {
+        Self(FORGETS.with(Cell::get))
+    }
+
+    /// Records that this device has been asked to forget its key, which
+    /// invalidates every ceremony already under way.
+    pub fn record() {
+        FORGETS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Whether nothing has asked this device to forget its key since this
+    /// count was taken.
+    pub fn still_current(self) -> bool {
+        self == Self::now()
+    }
+}
+
+/// Forgets this device's data key, and invalidates every ceremony that would
+/// otherwise go on to write another.
+///
+/// One function does both because doing only the delete is the bug: an
+/// unlock started before the user asked to forget is still several awaits
+/// from its own keystore write, and that write would land afterwards. Both
+/// callers — sign-out and "Lock now" — go through here.
+///
+/// The count is bumped *before* the delete, because the delete is itself a
+/// round trip through IndexedDB and a ceremony finishing inside it would
+/// otherwise slip past.
+#[cfg(feature = "hydrate")]
+pub async fn forget_device_key() -> Result<(), subtle::CryptoError> {
+    Forgets::record();
+    keystore::clear().await
+}
 
 /// The unlocked data key, on a target that has no WebCrypto.
 ///
@@ -109,8 +174,7 @@ pub fn choose_route(wraps: &[WrapDto], credential_id: Option<&[u8]>) -> Option<W
 /// WebCrypto, so this module exists solely in the wasm bundle.
 #[cfg(feature = "hydrate")]
 mod ceremony {
-    use leptos::logging::error;
-
+    use super::Forgets;
     use super::keystore;
     use super::recovery::{self, CODE_BYTES, RecoveryError};
     use super::subtle::{self, CryptoError, DataKey, Kek};
@@ -128,6 +192,11 @@ mod ceremony {
     pub struct SessionKey {
         key: DataKey,
         user: String,
+        /// How many times this device had been told to forget its key when
+        /// the ceremony that produced this one began. Read only by
+        /// [`remember`](Self::remember), which is the sole keystore write in
+        /// the crate.
+        forgets: Forgets,
     }
 
     impl SessionKey {
@@ -139,40 +208,69 @@ mod ceremony {
         /// visit, a private window, cleared site data, another account's
         /// record — and means `Locked`, not a failure.
         pub async fn restore(user: &str) -> Result<Option<Self>, CryptoError> {
+            let forgets = Forgets::now();
             Ok(keystore::get(user).await?.map(|key| Self {
                 key,
                 user: user.to_string(),
+                forgets,
             }))
         }
 
-        /// Remembers `key` on this device and wraps it in a session handle.
+        /// Wraps a freshly opened data key in a session handle, writing
+        /// nothing.
         ///
-        /// A keystore write that fails is logged and otherwise ignored, which
-        /// is why this returns `Self` and not `Result`. The key is usable for
-        /// this page load either way and the only cost of not persisting it
-        /// is one more unlock prompt after a reload; refusing the user their
-        /// entries because a cache write failed would be the worse trade
-        /// (spec section 12's private-window row).
-        async fn adopt(user: &str, key: DataKey) -> Self {
-            if let Err(e) = keystore::put(user, &key).await {
-                error!("could not remember the data key on this device: {e}");
-            }
+        /// Persisting it is [`remember`](Self::remember), and the two are
+        /// deliberately not one step. Folding the write in here put it
+        /// *ahead* of the caller's own identity check, so an unlock that
+        /// resolved after a sign-out left the previous account's record on
+        /// the device — see
+        /// [`EncryptionCtx::unlock`](crate::encryption_ctx::EncryptionCtx::unlock).
+        fn held(user: &str, key: DataKey, forgets: Forgets) -> Self {
             Self {
                 key,
                 user: user.to_string(),
+                forgets,
             }
+        }
+
+        /// Remembers this key on this device, so the next load of it finds a
+        /// key and never prompts.
+        ///
+        /// Refuses when the device has been asked to forget its key since
+        /// the ceremony that produced this one started. That guard lives
+        /// here, at the write, rather than only at the one caller that can
+        /// compare accounts: `account_menu::unlock_after_sign_in` writes the
+        /// keystore too, and pre-reload it has no live `AuthCtx` to compare
+        /// against, so an identity check is not something that path can
+        /// make. What every path can honour is that a sign-out or a "Lock
+        /// now" issued after this started outranks it (spec section 6.7, and
+        /// see [`Forgets`]).
+        ///
+        /// A failure is the caller's to log and otherwise ignore: the key
+        /// works for this page load either way, and the only cost of not
+        /// persisting it is one more unlock prompt after a reload. Refusing
+        /// the user their entries because a cache write failed would be the
+        /// worse trade (spec section 12's private-window row).
+        pub async fn remember(&self) -> Result<(), CryptoError> {
+            if !self.forgets.still_current() {
+                return Err(CryptoError(
+                    "this device was asked to forget its key while the unlock was still running"
+                        .to_string(),
+                ));
+            }
+            keystore::put(&self.user, &self.key).await
         }
 
         /// The account this key belongs to.
         ///
         /// Read by `EncryptionCtx::unlock` (spec section 7.4), which refuses
-        /// a key that does not belong to the account signed in *now*. An
-        /// unlock ceremony is async and the account menu stays mounted
-        /// throughout it, so a sign-out can land in the middle; the
-        /// keystore's own user check would not catch that, because it runs
-        /// on the read that already happened. That one call is why this
-        /// accessor exists — the storage seam deliberately never asks (see
-        /// `storage`'s header).
+        /// a key that does not belong to the account signed in *now*, and
+        /// only then lets [`remember`](Self::remember) run. An unlock
+        /// ceremony is async and the account menu stays mounted throughout
+        /// it, so a sign-out can land in the middle; the keystore's own user
+        /// check would not catch that, because it runs on the read that
+        /// already happened. That one call is why this accessor exists — the
+        /// storage seam deliberately never asks (see `storage`'s header).
         pub fn user(&self) -> &str {
             &self.user
         }
@@ -300,25 +398,27 @@ mod ceremony {
     /// Turns encryption on for an account (spec section 6.1).
     ///
     /// `prf_output` is the PRF result of an assertion against the credential
-    /// being enrolled; `user` is the signed-in identity the keystore record
-    /// is filed under. The caller shows the recovery code and waits for the
-    /// user to confirm it, *then* sends the two wraps to
-    /// `encryption_enable`, and then runs the migration.
+    /// being enrolled; `user` is the signed-in identity the key belongs to.
+    /// The caller shows the recovery code and waits for the user to confirm
+    /// it, *then* sends the two wraps to `encryption_enable`, and then hands
+    /// the key to `EncryptionCtx::unlock` — which is where step 6's keystore
+    /// write happens — before running the migration.
     ///
-    /// So as shipped, spec section 6.1's steps run 1 → 2 → 3 → 6 → 5 → 4:
-    /// this function performs step 6's keystore write, and the caller holds
-    /// step 5's code screen ahead of step 4's server call. Both departures
-    /// are amended into §6.1, and both trade one failure for a better one.
+    /// So as shipped, spec section 6.1's steps run 1 → 2 → 3 → 5 → 4 → 6:
+    /// the caller holds step 5's code screen ahead of step 4's server call,
+    /// which is the one departure §6.1 is amended for. Ordering the code
+    /// screen first is what makes a lost response survivable — whichever way
+    /// the call went, the code in the user's hands is the account's.
     ///
-    /// The one that belongs here is the keystore write. Doing it now, before
-    /// the account exists server-side, risks only an orphan record: a key
-    /// stored for an account whose `encryption_enable` then failed is never
-    /// consulted, because the next probe asks `encryption_status`, is told
-    /// the account is not encrypted, and lands on `Disabled` — and a retry
-    /// replaces it. The alternative — hand the key back and trust the caller
-    /// to persist it once the server confirms — makes "forgot to store it" a
-    /// live bug whose symptom is a lockout immediately after enabling.
+    /// Nothing here reaches the keystore, deliberately. This function once
+    /// wrote the record on the way past, before the account existed
+    /// server-side and before anyone had asked whose account it was, which
+    /// is the ordering `SessionKey::remember` exists to undo.
     pub async fn enable(prf_output: &[u8], user: &str) -> Result<Enabled, CryptoError> {
+        // Captured before the first await, so a sign-out or a "Lock now"
+        // issued while this ceremony runs outranks the keystore write at the
+        // end of it (see `SessionKey::remember`).
+        let forgets = Forgets::now();
         let (recovery_code, code_bytes) = new_recovery_code()?;
 
         let raw_key = subtle::generate_dek_extractable().await?;
@@ -340,18 +440,24 @@ mod ceremony {
         };
 
         Ok(Enabled {
-            session_key: SessionKey::adopt(user, key).await,
+            session_key: SessionKey::held(user, key, forgets),
             recovery_code,
             passkey_wrap,
             recovery_wrap,
         })
     }
 
-    /// Opens a wrap into a sealed key and remembers it on this device.
+    /// Opens a wrap into a sealed key.
+    ///
+    /// Remembering it on this device is the caller's separate step, and
+    /// belongs behind whatever identity check that caller can make — see
+    /// [`SessionKey::remember`].
     async fn unlock(opener: Opener<'_>, user: &str) -> Result<SessionKey, UnlockError> {
+        // Captured before the first await, for the reason `enable` gives.
+        let forgets = Forgets::now();
         let kek = kek_for(&opener).await?;
         let key = subtle::unwrap_dek_sealed(opener.wrap(), &kek).await?;
-        Ok(SessionKey::adopt(user, key).await)
+        Ok(SessionKey::held(user, key, forgets))
     }
 
     /// Unlocks with a passkey's PRF output (spec sections 6.2 and 6.3).
@@ -431,6 +537,32 @@ mod ceremony {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guard on the keystore write, at the only level a host can reach:
+    /// the IndexedDB call itself is browser-only, but the decision in front
+    /// of it is ordinary state, and it is the part a later edit could
+    /// quietly get wrong.
+    ///
+    /// The failure it stands against is an unlock that started before the
+    /// user pressed "Sign out" and finished after it — a whole WebAuthn
+    /// prompt and network round trip later — writing the key back onto a
+    /// device that had just been told to forget it.
+    #[test]
+    fn a_forget_outranks_a_ceremony_that_started_before_it() {
+        let started = Forgets::now();
+        assert!(started.still_current(), "nothing has been forgotten yet");
+
+        Forgets::record();
+        assert!(
+            !started.still_current(),
+            "a ceremony that began before the forget must not write afterwards"
+        );
+
+        // The other direction, and the reason this is a counter rather than
+        // a latch: signing out and straight back in on the same page load
+        // must still leave the new account's key remembered.
+        assert!(Forgets::now().still_current());
+    }
 
     /// `tag` fills `wrapped_key` with a byte distinct from every other row's,
     /// so a test can tell *which* row's bytes `choose_route` returned rather
