@@ -558,8 +558,19 @@ it — the phase-1 spec's §10 convention.
   migration correctness rests entirely on this. *Guarded by:* mixed-version
   round-trip tests.
 - **E4. `store` copies its value before the `async move`.** Pre-existing;
-  `spawn_local` needs `'static`. *Guarded by:* compilation, and the doc
-  comment saying so.
+  `spawn_local` needs `'static`. *Guarded by:* compilation — **but only since
+  Task 11**, and only because of an explicit `+ use<>` on the return type.
+
+  This entry originally said "guarded by compilation" and that was **wrong**.
+  In edition 2024 an `impl Trait` return type captures every input lifetime
+  implicitly, so `-> impl Future<..>` happily accepted a body that moved the
+  owned copies inside the `async move` — the exact rearrangement E4 exists to
+  prevent. Verified both ways: with `+ use<>` that change fails `E0700`;
+  without it, it compiles clean.
+
+  A test could not have caught this either, since the broken form still works
+  at runtime for callers that outlive the future. The guard is the `use<>`
+  and nothing else — do not remove it.
 - **E5. The DEK is never stored extractable and never sent to the server.**
   *Guarded by:* inspection of `subtle.rs` and `keystore.rs`, plus the
   absence of any server function accepting key material. This is the
