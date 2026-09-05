@@ -13,8 +13,8 @@ pub const CODE_BYTES: usize = 20;
 /// Characters in a normalized code. 160 bits / 5 bits per symbol.
 pub const CODE_CHARS: usize = 32;
 
-/// Crockford base32: excludes `I`, `L`, `O`, `U` to avoid the characters
-/// people misread, plus `U` to avoid accidental obscenities.
+/// Crockford base32: excludes `I`, `L`, `O` (characters people misread) and
+/// `U` (to avoid accidental obscenities).
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// A candidate recovery code could not be normalized.
