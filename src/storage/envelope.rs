@@ -73,7 +73,15 @@ pub fn plan_read(raw: &str) -> Result<ReadPlan, EnvelopeError> {
             Ok(ReadPlan::Plaintext(env.body))
         }
         2 => Ok(ReadPlan::Sealed(wire::decode_v2(raw)?)),
-        other => Err(EnvelopeError::UnsupportedVersion(other as u8)),
+        // `EnvelopeError::UnsupportedVersion` is a `u8`, but `version` came
+        // from JSON as a `u64` — a value above 255 must be reported as
+        // malformed, never silently truncated into some other version's
+        // number by an `as` cast.
+        other => Err(u8::try_from(other)
+            .map(EnvelopeError::UnsupportedVersion)
+            .unwrap_or_else(|_| {
+                EnvelopeError::Malformed(format!("envelope version {other} is out of range"))
+            })),
     }
 }
 
@@ -131,7 +139,10 @@ mod tests {
             nonce: vec![0; wire::NONCE_LEN],
             ciphertext: vec![9, 9, 9],
         });
-        assert!(unwrap(&raw).is_err());
+        assert!(matches!(
+            unwrap(&raw),
+            Err(EnvelopeError::UnsupportedVersion(wire::V2))
+        ));
     }
 
     #[test]
@@ -177,6 +188,16 @@ mod tests {
             panic!("v2 must plan as Sealed");
         };
         assert_eq!(sealed.ciphertext, vec![9, 9, 9]);
+    }
+
+    /// `plan_read`'s v2 arm hands `raw` straight to `wire::decode_v2` with
+    /// `?`, and only `decode_v2` itself is exercised directly elsewhere —
+    /// this pins that a malformed v2 row surfaces through `plan_read` as
+    /// `EnvelopeError::Wire`, not flattened into `Malformed` on the way.
+    #[test]
+    fn a_malformed_v2_envelope_surfaces_as_a_wire_error() {
+        let raw = r#"{"v":2,"alg":"a256gcm","n":"!!!!","ct":"AAAA"}"#;
+        assert!(matches!(plan_read(raw), Err(EnvelopeError::Wire(_))));
     }
 
     /// The forward-compatibility guarantee phase 1 shipped, still holding one
