@@ -29,6 +29,8 @@ pub mod remote;
 use std::future::Future;
 
 use chrono::NaiveDate;
+#[cfg(any(feature = "hydrate", test))]
+use leptos::logging::error;
 
 use crate::date::to_iso;
 
@@ -223,6 +225,34 @@ pub async fn dates_with_entries(
     }
 }
 
+/// Unwraps each row's envelope, **skipping** (and logging) any day whose
+/// envelope fails to unwrap, rather than failing the whole range for one bad
+/// day.
+///
+/// Collecting into a `Result` here would scope a single corrupt envelope to
+/// the entire week — `WeekBody` would fall back to an empty `Vec` and render
+/// "Nothing logged this week." even when six of seven days are fine. That is
+/// a worse blast radius than the per-day path: `hook::loaded_value` scopes a
+/// decode failure to the one key it belongs to, so this does too, just at
+/// range width instead of single-key width. Pure and free of `web_sys`, so
+/// unlike its two callers this is host-tested directly.
+///
+/// `test` as well as `hydrate`, same as `local`'s decision logic just below:
+/// its only non-test call site is inside `bodies_in_range`'s `hydrate`
+/// branch, so an `ssr`-only build has no caller for it at all.
+#[cfg(any(feature = "hydrate", test))]
+fn unwrap_bodies(raw: Vec<(NaiveDate, String)>) -> Vec<(NaiveDate, String)> {
+    raw.into_iter()
+        .filter_map(|(date, env)| match envelope::unwrap(&env) {
+            Ok(body) => Some((date, body)),
+            Err(err) => {
+                error!("skipping {date}: envelope failed to unwrap: {err}");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Every stored body in `[from, to]`, unwrapped. Feeds the week view.
 ///
 /// Separate from [`dates_with_entries`] because the two answer different
@@ -239,16 +269,7 @@ pub async fn bodies_in_range(
             Backend::Local => local::bodies_in_range(from, to).await?,
             Backend::Remote => remote::bodies_in_range(from, to).await?,
         };
-        raw.into_iter()
-            .map(|(date, env)| {
-                envelope::unwrap(&env)
-                    .map(|body| (date, body))
-                    .map_err(|source| StorageError::Envelope {
-                        key: StorageKey::TimeEntry(date).as_key(),
-                        source,
-                    })
-            })
-            .collect()
+        Ok(unwrap_bodies(raw))
     }
     #[cfg(not(feature = "hydrate"))]
     {
@@ -341,6 +362,33 @@ mod tests {
                 "{backend:?} must not return entries during SSR"
             );
         }
+    }
+
+    /// The regression this guards against: one corrupt envelope must cost
+    /// only its own day, not the whole range.
+    #[test]
+    fn a_bad_envelope_is_skipped_but_the_rest_of_the_range_survives() {
+        let good = envelope::wrap("9-10 code1");
+        let rows = vec![
+            (d(2026, 9, 1), good.clone()),
+            (d(2026, 9, 2), "not an envelope".to_string()),
+            (d(2026, 9, 3), good),
+        ];
+        let kept = unwrap_bodies(rows);
+        assert_eq!(
+            kept.iter().map(|(date, _)| *date).collect::<Vec<_>>(),
+            vec![d(2026, 9, 1), d(2026, 9, 3)],
+            "the corrupt day must be dropped, not the whole week"
+        );
+    }
+
+    #[test]
+    fn every_valid_envelope_is_kept() {
+        let rows = vec![
+            (d(2026, 9, 1), envelope::wrap("a")),
+            (d(2026, 9, 2), envelope::wrap("b")),
+        ];
+        assert_eq!(unwrap_bodies(rows).len(), 2);
     }
 
     /// Pins invariant I2 for a range load: the *older* of two overlapping
