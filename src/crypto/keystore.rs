@@ -51,9 +51,9 @@ use super::subtle::{CryptoError, DataKey, failed, js_object};
 
 /// The database this feature owns; nothing else in the app uses IndexedDB.
 const DB_NAME: &str = "tt-keys";
-/// Raising this reruns `onupgradeneeded` on every device. There is nothing
-/// to migrate yet, and a bump is also the only way `onblocked` below can
-/// fire, so it is not a free change.
+/// Raising this reruns `onupgradeneeded` on every device, and makes every
+/// connection still open at the old version block the upgrade until it
+/// closes. There is nothing to migrate yet, so it is not a free change.
 const DB_VERSION: u32 = 1;
 /// The one object store.
 const STORE: &str = "keys";
@@ -120,10 +120,17 @@ fn settle(request: &IdbRequest) -> Promise {
 /// only place the store can be created; without it every later transaction
 /// fails with `NotFoundError`.
 ///
-/// `onblocked` fires instead of either when another connection is holding an
-/// older version open. It is unreachable while [`DB_VERSION`] stays at 1 and
-/// every call closes its connection, but it is wired to `reject` anyway,
-/// because unhandled it is the one path that would hang instead of failing.
+/// `onblocked` fires instead of either when this open needs a version change
+/// and another connection is still holding an older version open. Note that
+/// a device's *first* open is itself a version change — 0 to 1 — so this is
+/// not simply "unreachable until [`DB_VERSION`] is bumped", the way an
+/// earlier comment here had it. What keeps it unreachable today is narrower
+/// and less comfortable: a database that does not exist yet can have no
+/// other connection to block against, and once it exists at version 1 an
+/// open at version 1 is not a version change at all. That rests on the
+/// connection queue serializing opens, which is the specification's promise
+/// and not this file's — so the handler is wired to `reject` regardless,
+/// because unhandled it is the one path that would hang instead of fail.
 async fn open_db() -> Result<IdbDatabase, CryptoError> {
     let window = web_sys::window().ok_or_else(|| CryptoError("no window".to_string()))?;
     let factory = window
