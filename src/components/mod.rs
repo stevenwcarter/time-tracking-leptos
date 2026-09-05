@@ -3,6 +3,7 @@
 pub mod account_menu;
 pub mod account_page;
 pub mod calendar;
+pub mod encryption_panel;
 pub mod header;
 pub mod import_banner;
 pub mod projects;

@@ -428,6 +428,26 @@ impl EncryptionCtx {
         }
         self.publish(EncryptionState::Unlocked(key));
     }
+
+    /// Forgets this device's key, on purpose (spec section 6.7).
+    ///
+    /// Publishes `Locked` *before* awaiting the keystore, so the in-memory
+    /// key is dropped the moment the user asks rather than whenever
+    /// IndexedDB gets round to it. The two halves matter separately: the
+    /// publish is what stops this page reading and writing entries, and the
+    /// clear is what stops the next page load picking the key straight back
+    /// up. A failed clear is therefore worth telling the user about — this
+    /// returns the error rather than logging it, because "locked until you
+    /// reload" is not what they asked for.
+    ///
+    /// Only meaningful for an encrypted account, which is the only state
+    /// `/account`'s panel offers it from; publishing `Locked` for an
+    /// unencrypted one would claim an encryption that does not exist.
+    #[cfg(feature = "hydrate")]
+    pub async fn lock(self) -> Result<(), crate::crypto::subtle::CryptoError> {
+        self.publish(EncryptionState::Locked);
+        crate::crypto::keystore::clear().await
+    }
 }
 
 /// The two reads behind the probe, in the order that avoids the second one

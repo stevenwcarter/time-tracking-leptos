@@ -11,6 +11,23 @@ pub struct PasskeyListItem {
     pub name: String,
     pub added: String,
     pub last_used: Option<String>,
+    /// The credential's own id, so the encryption panel can join this row
+    /// against [`WrapDto::credential_id`] and say whether this passkey has
+    /// a route to the account's data key (spec section 6.5).
+    ///
+    /// Not a new disclosure: `encryption_wraps` already returns the caller
+    /// their own credential ids, and both calls are scoped to the signed-in
+    /// user.
+    pub credential_id: Vec<u8>,
+    /// What the browser reported about PRF support when this credential was
+    /// enrolled.
+    ///
+    /// Distinct from "has a wrap", and the panel needs both. A passkey with
+    /// no wrap and `prf_capable = false` can *never* unlock; one with no
+    /// wrap and `prf_capable = true` simply has not been given a key yet,
+    /// which is a thing the user can fix. Reporting the two the same way
+    /// would either offer a repair that cannot work or hide one that can.
+    pub prf_capable: bool,
 }
 
 /// One route to the account's data key, as seen from the browser.

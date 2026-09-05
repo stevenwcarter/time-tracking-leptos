@@ -1,8 +1,15 @@
-//! `/account` — passkey management.
+//! `/account` — passkey management, and the encryption panel beside it.
 //!
-//! A route rather than a popover: it is the natural home for phase 2's
-//! encryption settings, and a link somebody can be sent when a passkey
-//! misbehaves.
+//! A route rather than a popover: it is the natural home for the encryption
+//! settings, and a link somebody can be sent when a passkey misbehaves.
+//!
+//! The two halves are coupled in one direction that matters. On an encrypted
+//! account a passkey is not just a way in — it is a route to the data key —
+//! so adding or removing one changes what
+//! [`EncryptionPanel`](crate::components::encryption_panel::EncryptionPanel)
+//! has to say. They share a `reload` counter rather than each fetching on
+//! their own schedule, so the page cannot show a passkey in one list and not
+//! the other.
 
 use leptos::either::{Either, EitherOf3};
 use leptos::prelude::*;
@@ -10,8 +17,10 @@ use leptos_meta::Title;
 use leptos_router::components::A;
 
 use crate::auth_ctx::AuthCtx;
+use crate::components::encryption_panel::EncryptionPanel;
 use crate::components::header::AppHeader;
 use crate::dto::PasskeyListItem;
+use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 use crate::server_fns::passkey::{passkey_delete, passkey_list, passkey_rename};
 use crate::server_fns::session::sign_out_everywhere;
 
@@ -37,6 +46,10 @@ fn passkey_error(e: ServerFnError) -> String {
 #[component]
 pub fn AccountPage() -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
+    // Lifted here rather than owned by either section, because both write it
+    // and both read it: the passkey list bumps it after an add or a remove,
+    // and the encryption panel bumps it after keying a credential.
+    let reload = RwSignal::new(0u32);
 
     view! {
         <Title text="Account — Time Tracker"/>
@@ -55,7 +68,10 @@ pub fn AccountPage() -> impl IntoView {
                             </A>
                         </div>
                     }),
-                    Some(email) => Either::Right(view! { <PasskeySection email=email/> }),
+                    Some(email) => Either::Right(view! {
+                        <PasskeySection email=email reload=reload/>
+                        <EncryptionPanel reload=reload/>
+                    }),
                 }}
             </div>
         </div>
@@ -63,26 +79,59 @@ pub fn AccountPage() -> impl IntoView {
 }
 
 #[component]
-fn PasskeySection(email: String) -> impl IntoView {
+fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
+    let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     // `Resource` here is safe: this route is client-navigated and never part
     // of the day view's SSR path, so it does not affect the synchronous
     // render the SSR tests rely on. Created at the top of the component,
     // never inside a closure, so SSR's render walk cannot construct it twice.
-    let rows = Resource::new(|| (), |_| async { passkey_list().await });
+    //
+    // Sourced from `reload` rather than refetched by hand, so the encryption
+    // panel's writes refresh this list too — one trigger, both halves.
+    let rows = Resource::new(move || reload.get(), |_| async { passkey_list().await });
     let status = RwSignal::new(String::new());
+    // Whether the account is encrypted, which changes what adding a passkey
+    // costs and therefore what has to be said before it starts.
+    let encrypted = Memo::new(move |_| {
+        matches!(
+            encryption.state(),
+            EncryptionState::Locked | EncryptionState::Unlocked(_)
+        )
+    });
+    let confirm_add = RwSignal::new(false);
+
+    let refresh = move || reload.update(|n| *n += 1);
 
     let add = move |_| {
+        confirm_add.set(false);
         #[cfg(feature = "hydrate")]
-        leptos::task::spawn_local(async move {
-            match run_registration().await {
-                Ok(()) => {
-                    status.set("Passkey added.".to_string());
-                    rows.refetch();
+        {
+            let Some(user) = auth.user.get_untracked() else {
+                return;
+            };
+            let encrypted = encrypted.get_untracked();
+            leptos::task::spawn_local(async move {
+                match run_registration().await {
+                    Ok(new_credential) => {
+                        if encrypted {
+                            // Shown *during* the two assertions, not after:
+                            // the browser is about to ask twice and the
+                            // prompts themselves cannot say which passkey
+                            // to choose.
+                            status.set(
+                                "Passkey added. Two more prompts: first a passkey that can \
+                                 already open your entries, then the new one."
+                                    .to_string(),
+                            );
+                        }
+                        status.set(finish_added_passkey(&user, encrypted, new_credential).await);
+                        refresh();
+                    }
+                    Err(e) => status.set(crate::webauthn_browser::friendly_error(e)),
                 }
-                Err(e) => status.set(crate::webauthn_browser::friendly_error(e)),
-            }
-        });
+            });
+        }
     };
 
     let remove = move |id: i32| {
@@ -90,8 +139,14 @@ fn PasskeySection(email: String) -> impl IntoView {
             match passkey_delete(id).await {
                 Ok(()) => {
                     status.set("Passkey removed.".to_string());
-                    rows.refetch();
+                    refresh();
                 }
+                // Includes spec section 6.6's refusal to remove the last
+                // passkey that can unlock an encrypted account. That message
+                // names the recovery code and the alternative, so it is
+                // shown as it stands rather than collapsed into a generic
+                // failure — `webauthn_browser::friendly_error` passes it
+                // through by prefix.
                 Err(e) => status.set(passkey_error(e)),
             }
         });
@@ -121,7 +176,7 @@ fn PasskeySection(email: String) -> impl IntoView {
             match passkey_rename(id, name).await {
                 Ok(()) => {
                     status.set("Passkey renamed.".to_string());
-                    rows.refetch();
+                    refresh();
                 }
                 Err(e) => status.set(passkey_error(e)),
             }
@@ -165,13 +220,58 @@ fn PasskeySection(email: String) -> impl IntoView {
                 })}
             </Suspense>
 
-            <button
-                type="button"
-                class="mt-6 bg-blue-600 text-white text-sm font-semibold rounded px-4 py-2 hover:bg-blue-700"
-                on:click=add
-            >
-                "Add a passkey"
-            </button>
+            // On an encrypted account, adding a passkey is not one gesture:
+            // the new credential has to be created, then keyed, and keying
+            // it needs an assertion against a credential that can already
+            // unlock plus one against the new one (spec section 6.5). Three
+            // prompts, always — said here rather than sprung one at a time.
+            {move || match (encrypted.get(), confirm_add.get()) {
+                (true, false) => EitherOf3::A(view! {
+                    <button
+                        type="button"
+                        class="mt-6 bg-blue-600 text-white text-sm font-semibold rounded px-4 py-2 hover:bg-blue-700"
+                        on:click=move |_| confirm_add.set(true)
+                    >
+                        "Add a passkey"
+                    </button>
+                }),
+                (true, true) => EitherOf3::B(view! {
+                    <div class="mt-6 rounded border border-gray-200 bg-gray-50 p-3">
+                        <p class="text-sm text-gray-700 mb-1">
+                            "Your entries are encrypted, so this takes three passkey prompts: \
+                             one to create the new passkey, one against a passkey that can \
+                             already open your entries, and one against the new one."
+                        </p>
+                        <p class="text-xs text-gray-500 mb-3">
+                            "If it stops partway, the new passkey still signs you in — the \
+                             encryption panel below will offer to give it an unlock key."
+                        </p>
+                        <button
+                            type="button"
+                            class="bg-blue-600 text-white text-sm font-semibold rounded px-4 py-2 hover:bg-blue-700 mr-2"
+                            on:click=add
+                        >
+                            "Continue"
+                        </button>
+                        <button
+                            type="button"
+                            class="text-sm text-gray-600 hover:text-gray-900 px-2 py-2"
+                            on:click=move |_| confirm_add.set(false)
+                        >
+                            "Cancel"
+                        </button>
+                    </div>
+                }),
+                (false, _) => EitherOf3::C(view! {
+                    <button
+                        type="button"
+                        class="mt-6 bg-blue-600 text-white text-sm font-semibold rounded px-4 py-2 hover:bg-blue-700"
+                        on:click=add
+                    >
+                        "Add a passkey"
+                    </button>
+                }),
+            }}
             {move || {
                 let s = status.get();
                 (!s.is_empty()).then(|| view! { <p class="mt-3 text-sm text-gray-600">{s}</p> })
@@ -252,27 +352,63 @@ fn PasskeyRow(
 }
 
 /// Runs the registration ceremony, including the round trip to
-/// `passkey_register_finish`.
+/// `passkey_register_finish`, and reports which credential was created.
 ///
 /// `webauthn_browser::register` returns `(credential_json, prf_capable)` —
 /// both values are threaded straight into `passkey_register_finish`
 /// unmodified. `prf_capable` cannot be recovered from the credential JSON
 /// alone (`toJSON()` omits extension results), so dropping or defaulting it
 /// here would silently record every passkey enrolled through this page as
-/// not-PRF-capable, forcing phase 2 to conclude none of them can derive an
-/// encryption key.
+/// not-PRF-capable, and the encryption panel would conclude none of them can
+/// derive a key.
+///
+/// The credential id is `Ok(None)`, never `Err`, when the response cannot be
+/// parsed: the passkey exists by then, and reporting a failure would tell
+/// the user to add another one. What is lost is only the ability to key it
+/// in the same gesture, which the encryption panel's per-passkey control
+/// recovers.
 #[cfg(feature = "hydrate")]
-async fn run_registration() -> Result<(), String> {
+async fn run_registration() -> Result<Option<Vec<u8>>, String> {
+    use crate::crypto::flow::credential_id_from_response;
     use crate::server_fns::passkey::{passkey_register_finish, passkey_register_start};
     use crate::webauthn_browser;
 
     let challenge = passkey_register_start().await.map_err(|e| e.to_string())?;
     // `prf_capable` comes from getClientExtensionResults(), which toJSON()
-    // does not include. Phase 1 only records it (spec section 9.3).
+    // does not include. It is recorded now and read by the encryption panel
+    // (spec section 9.3 of the phase-1 design, section 6.5 here).
     let (credential, prf_capable) = webauthn_browser::register(&challenge)
         .await
         .map_err(|e| e.to_string())?;
-    passkey_register_finish(credential, prf_capable)
+    passkey_register_finish(credential.clone(), prf_capable)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(credential_id_from_response(&credential))
+}
+
+/// Continues an enrolment into spec section 6.5's wrap step when the account
+/// is encrypted, and reports what the user is left holding.
+///
+/// Every outcome says whether the passkey signs the user in (it always
+/// does), and separately whether it opens their entries (it may not). Those
+/// are two different capabilities on an encrypted account, and a message
+/// that says only "Passkey added" would let somebody believe they had gained
+/// a second way back in when they had not.
+#[cfg(feature = "hydrate")]
+async fn finish_added_passkey(user: &str, encrypted: bool, credential: Option<Vec<u8>>) -> String {
+    if !encrypted {
+        return "Passkey added.".to_string();
+    }
+    let Some(credential) = credential else {
+        return "Passkey added, but this browser couldn't tell which credential it is, so it \
+                has no unlock key yet. Use “Give it an unlock key” below."
+            .to_string();
+    };
+    match crate::crypto::flow::add_passkey_key(user, &credential).await {
+        Ok(()) => "Passkey added, and it can open your entries.".to_string(),
+        Err(message) => format!(
+            "Passkey added, but it has no unlock key yet, so it won't open your entries: \
+             {message} Use “Give it an unlock key” below to try again."
+        ),
+    }
 }

@@ -378,6 +378,8 @@ pub async fn passkey_list() -> Result<Vec<PasskeyListItem>, ServerFnError> {
             name: row.display_name(),
             added: row.created_at.format("%b %-d, %Y").to_string(),
             last_used: row.last_used_at.map(|t| t.format("%b %-d, %Y").to_string()),
+            credential_id: row.credential_id,
+            prf_capable: row.prf_capable,
         })
         .collect())
 }

@@ -353,98 +353,56 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
     }
 }
 
-/// The WebAuthn/WebCrypto ceremonies, and the one piece of wire-parsing they
-/// need that neither `webauthn_browser` nor `crypto` already does.
+/// This prompt's two routes to the data key, and spec section 6.4's offer
+/// of a fresh code after the second one.
+///
+/// Thin over [`crate::crypto::flow`], which owns the steps the `/account`
+/// encryption panel runs too — the assertion and the recovery re-issue. What
+/// stays here is the wording: every failure below is phrased for somebody
+/// who is shut out and looking for a way back in, which is not what the same
+/// failure means on `/account`.
 ///
 /// Browser-only, like the rest of spec section 6: every function here
 /// reaches WebAuthn, WebCrypto, or both.
 #[cfg(feature = "hydrate")]
 mod ceremony {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use leptos::logging::error;
-    use leptos::prelude::ServerFnError;
-
-    use crate::crypto::wire::APP_SALT;
+    use crate::crypto::flow::{self, AssertionError};
     use crate::crypto::{
-        Opener, SessionKey, UnlockError, choose_route, reissue_recovery, unlock_with_prf,
-        unlock_with_recovery,
+        Opener, SessionKey, UnlockError, choose_route, unlock_with_prf, unlock_with_recovery,
     };
-    use crate::server_fns::encryption::{encryption_replace_recovery_wrap, encryption_wraps};
-    use crate::server_fns::passkey::{passkey_login_finish, passkey_login_start};
-    use crate::webauthn_browser;
-
-    /// A network or server failure unrelated to WebAuthn itself — reaching
-    /// `encryption_wraps`/`encryption_replace_recovery_wrap`, whose own
-    /// errors are already the generic "Internal server error" `log_and_fail`
-    /// produces (the specific cause is logged server-side, not sent here).
-    fn server_unreachable(_: ServerFnError) -> String {
-        "Couldn't reach the server. Check your connection and try again.".to_string()
-    }
-
-    /// Pulls the credential id back out of an assertion response, so
-    /// `choose_route` can tell which passkey's wrap to open.
-    ///
-    /// `toJSON()`'s `rawId` is the browser's base64url encoding of the same
-    /// bytes webauthn-rs stores as `entry_key_wrap.credential_id` — reading
-    /// it back out here is the only way this component learns which
-    /// credential just asserted, since `passkey_login_finish` reports only
-    /// success or failure, not which row it verified.
-    fn credential_id_from_response(response_json: &str) -> Option<Vec<u8>> {
-        let value: serde_json::Value = serde_json::from_str(response_json).ok()?;
-        let raw_id = value.get("rawId")?.as_str()?;
-        URL_SAFE_NO_PAD.decode(raw_id).ok()
-    }
+    use crate::server_fns::encryption::encryption_wraps;
 
     /// The passkey route (spec section 6.3): an assertion verified the same
     /// way passkey sign-in verifies one, with the PRF extension evaluated
     /// alongside it.
     ///
-    /// Reuses `passkey_login_start`/`passkey_login_finish` rather than a
-    /// dedicated pair — the ceremony is identical, and the only side effect
-    /// finishing it has that an already-signed-in session didn't already
-    /// have is a refreshed session token, which is harmless.
+    /// Every failure that is not the unwrap itself points at the recovery
+    /// code, because that route works when this one does not — including on
+    /// a browser with no PRF support at all.
     pub async fn unlock_with_passkey(user: &str) -> Result<SessionKey, String> {
-        let challenge = passkey_login_start(Some(user.to_string()))
-            .await
-            .map_err(|e| webauthn_browser::friendly_error(e.to_string()))?;
+        // The credential id is kept apart from `choose_route`'s `None`,
+        // rather than folded into it: `None` there means "the user chose the
+        // recovery route", and a `rawId` that could not be parsed is not
+        // that. Sharing one representation would send the passkey path off
+        // to open the *recovery* wrap with a PRF output — the unwrap would
+        // fail, so the user is never told a wrong thing succeeded, but they
+        // would be told the wrong reason it failed.
+        let assertion = flow::assert_with_prf(user).await.map_err(|err| match err {
+            AssertionError::Ceremony(message) => message,
+            AssertionError::NoPrf => "That passkey didn't provide an unlock key on this \
+                                      browser. Try your recovery code instead."
+                .to_string(),
+            AssertionError::Unidentified => "That passkey didn't identify itself to this \
+                                             browser. Try your recovery code instead."
+                .to_string(),
+        })?;
 
-        let (response, prf_output) = webauthn_browser::authenticate_with_prf(&challenge, APP_SALT)
-            .await
-            .map_err(|e| webauthn_browser::friendly_error(e.to_string()))?;
-
-        passkey_login_finish(response.clone())
-            .await
-            .map_err(|e| webauthn_browser::friendly_error(e.to_string()))?;
-
-        let Some(prf_output) = prf_output else {
-            return Err(
-                "That passkey didn't provide an unlock key on this browser. Try your \
-                 recovery code instead."
-                    .to_string(),
-            );
-        };
-
-        let wraps = encryption_wraps().await.map_err(server_unreachable)?;
-        // Branched here rather than handed to `choose_route` as the
-        // `Option` it takes. `None` there means "the user chose the recovery
-        // route", and a `rawId` this could not parse is not that: sharing
-        // one representation would send the passkey path off to open the
-        // *recovery* wrap with a PRF output. The unwrap would fail, so the
-        // user is never told a wrong thing succeeded — but they would be
-        // told the wrong reason it failed.
-        let Some(credential_id) = credential_id_from_response(&response) else {
-            return Err(
-                "That passkey didn't identify itself to this browser. Try your recovery \
-                 code instead."
-                    .to_string(),
-            );
-        };
-        let route = choose_route(&wraps, Some(&credential_id)).ok_or_else(|| {
+        let wraps = encryption_wraps().await.map_err(flow::server_unreachable)?;
+        let route = choose_route(&wraps, Some(&assertion.credential_id)).ok_or_else(|| {
             "That passkey can't unlock this account. Try your recovery code instead.".to_string()
         })?;
 
-        unlock_with_prf(&prf_output, &route.wrapped_key, user)
+        unlock_with_prf(&assertion.prf_output, &route.wrapped_key, user)
             .await
             .map_err(|_| "That passkey couldn't unlock this account.".to_string())
     }
@@ -462,7 +420,7 @@ mod ceremony {
         typed: &str,
         user: &str,
     ) -> Result<(SessionKey, String, Vec<u8>), String> {
-        let wraps = encryption_wraps().await.map_err(server_unreachable)?;
+        let wraps = encryption_wraps().await.map_err(flow::server_unreachable)?;
         let route = choose_route(&wraps, None)
             .ok_or_else(|| "This account has no recovery code set up.".to_string())?;
 
@@ -476,52 +434,16 @@ mod ceremony {
         Ok((key, typed.to_string(), route.wrapped_key))
     }
 
-    /// Stores a re-issued recovery wrap, retrying once with the identical
-    /// bytes.
+    /// Spec section 6.4's offer, reopening the route that just succeeded.
     ///
-    /// The failure this exists for is a *lost response*, not a lost request.
-    /// If the replace commits and the reply never arrives, the client
-    /// reports "couldn't reach the server" and sends the user back to the
-    /// offer screen believing their old code still works — while the server
-    /// now holds a wrap derived from a code they were never shown. They find
-    /// out when they have lost every passkey and reach for the recovery
-    /// code, at which point the entries are unreadable for good. Low
-    /// probability, total consequence, and it defeats the one safety net the
-    /// design rests on.
-    ///
-    /// `encryption_replace_recovery_wrap` is idempotent for a given wrap
-    /// (see its own doc), which is what makes a retry safe: the second call
-    /// either finds the work already done or finishes it, and either way the
-    /// account ends up holding the code the user is about to be shown.
-    async fn store_recovery_wrap(wrapped_key: Vec<u8>) -> Result<(), String> {
-        match encryption_replace_recovery_wrap(wrapped_key.clone()).await {
-            Ok(()) => Ok(()),
-            Err(first) => {
-                error!("storing the re-issued recovery wrap failed, retrying once: {first}");
-                encryption_replace_recovery_wrap(wrapped_key)
-                    .await
-                    .map_err(server_unreachable)
-            }
-        }
-    }
-
-    /// Spec section 6.4's offer: wraps the data key under a fresh code and
-    /// replaces the stored recovery wrap.
-    ///
-    /// `old_code`/`old_wrap` reopen the route that just succeeded — the only
-    /// way to get the raw key back out, since the `SessionKey` the caller is
-    /// already holding cannot yield it (invariant E5).
+    /// `old_code`/`old_wrap` are the only way to get the raw key back out,
+    /// since the `SessionKey` the caller is already holding cannot yield it
+    /// (invariant E5).
     pub async fn reissue_recovery_code(old_code: &str, old_wrap: &[u8]) -> Result<String, String> {
-        let opener = Opener::Recovery {
+        flow::reissue(&Opener::Recovery {
             code: old_code,
             wrap: old_wrap,
-        };
-        let (new_code, new_wrap) = reissue_recovery(&opener).await.map_err(|_| {
-            "Couldn't generate a new recovery code. Your current one still works.".to_string()
-        })?;
-
-        store_recovery_wrap(new_wrap).await?;
-
-        Ok(new_code)
+        })
+        .await
     }
 }

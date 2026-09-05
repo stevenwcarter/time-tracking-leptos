@@ -8,6 +8,12 @@
 //! that is both load-bearing and pure — [`choose_route`], which says *which*
 //! stored wrap to open.
 
+/// The ceremony steps that need the authenticator and the server at once,
+/// shared by every component that runs one. `test` as well as `hydrate`:
+/// `flow::credential_id_from_response` is pure and host-tested, the same
+/// split `storage::local` makes for the same reason.
+#[cfg(any(feature = "hydrate", test))]
+pub mod flow;
 /// Per-device storage of the unlocked data key. Browser-only: IndexedDB has
 /// no host equivalent, so this module exists solely in the wasm bundle.
 #[cfg(feature = "hydrate")]
