@@ -4,6 +4,13 @@ pub mod app;
 pub mod auth_ctx;
 pub mod clipboard;
 pub mod components;
+// Depends on the optional `base64` dependency, which only `ssr` and
+// `hydrate` enable, so — unlike `webauthn_browser` below — this cannot be
+// `test`-gated in place of one of those: a plain `cargo test` with neither
+// feature would fail to find `base64`. Host tests reach it via `--features
+// ssr`, which is how this crate's `cargo test` is always run.
+#[cfg(any(feature = "ssr", feature = "hydrate"))]
+pub mod crypto;
 pub mod date;
 pub mod dto;
 pub mod server_fns;
