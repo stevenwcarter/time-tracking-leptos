@@ -297,8 +297,22 @@ insert the wrap row.
 
 This needs the raw DEK, which the non-extractable keystore copy cannot
 provide. The DEK is therefore re-unwrapped **extractable** from an existing
-route in that moment, used, and dropped. If the session is `Locked`, the user
-is asked to unlock first.
+route in that moment, used, and dropped.
+
+**Corrected during implementation.** An earlier draft said "if the session is
+`Locked`, the user is asked to unlock first", implying an unlocked session
+avoids the extra prompt. It does not. Being unlocked means holding a *sealed*
+`DataKey`, which by construction cannot yield its bytes — so the raw key must
+be re-derived from an existing credential's PRF output no matter what the
+session state is.
+
+Adding a passkey to an encrypted account therefore costs **three**
+authenticator interactions, always: creation of the new credential, an
+assertion against an **existing** credential to re-derive the raw key, and an
+assertion against the **new** credential to get its PRF output. That is a
+direct consequence of the non-extractability decision, not an implementation
+shortcoming, and the UI must set the expectation up front rather than
+springing three prompts on the user one at a time.
 
 A passkey enrolled with `prf_capable = false` gets no wrap and cannot unlock.
 `/account` says so on that row rather than letting the user believe otherwise.
