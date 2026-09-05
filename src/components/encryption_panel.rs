@@ -27,7 +27,7 @@
 //! probes on its own, so on the server it renders the "checking" branch for
 //! everybody (invariant E2) and hydrates against itself.
 
-use leptos::either::{Either, EitherOf3, EitherOf4};
+use leptos::either::{Either, EitherOf5};
 use leptos::prelude::*;
 
 use crate::auth_ctx::AuthCtx;
@@ -45,9 +45,9 @@ use crate::storage::envelope::{ReadPlan, plan_read};
 use leptos::task::spawn_local;
 
 #[cfg(feature = "hydrate")]
-use crate::crypto::SessionKey;
-#[cfg(feature = "hydrate")]
 use crate::storage::Generation;
+#[cfg(feature = "hydrate")]
+use ceremony::PendingEnable;
 
 /// What the account's encryption state means for this panel, with the key
 /// itself dropped.
@@ -55,9 +55,10 @@ use crate::storage::Generation;
 /// A `Copy + PartialEq` reduction of [`EncryptionState`] so the load effect
 /// below can hang off a `Memo` and re-run when the *situation* changes
 /// rather than on every republish of the same one. It also keeps
-/// [`SessionKey`] — which is neither `Send` nor `Sync`, and uninhabited off
-/// the browser — out of the panel's branching entirely; the one place that
-/// needs the key reads it back out of the context at the moment it acts.
+/// [`SessionKey`](crate::crypto::SessionKey) — which is neither `Send` nor
+/// `Sync`, and uninhabited off the browser — out of the panel's branching
+/// entirely; the one place that needs the key reads it back out of the
+/// context at the moment it acts.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// The probe has not answered yet. Everything the server renders.
@@ -243,11 +244,8 @@ impl Overview {
 
 /// Where the panel is in a flow it started itself.
 ///
-/// Outranks [`Phase`] in the view, because the recovery-code screen has to
-/// survive the state change that produced it: publishing the new key flips
-/// the account to `Unlocked`, and if that decided what was on screen the
-/// code would vanish before it could be read. The same trap `UnlockPrompt`
-/// documents, one ceremony further along.
+/// Half of what decides the screen; [`Phase`] is the other half, and
+/// [`Screen::of`] says which wins.
 ///
 /// `#[cfg_attr]`'d for the same reason as `UnlockPrompt`'s `Mode`: the two
 /// code-bearing variants are built only by browser-side ceremonies, so a
@@ -258,11 +256,108 @@ enum Mode {
     /// Showing whatever the account's state calls for.
     #[default]
     Idle,
-    /// The code minted by the enable ceremony. Confirming it publishes the
-    /// key and starts the migration.
+    /// The code minted by the enable ceremony, held while the server still
+    /// knows nothing. Confirming it is what turns encryption on: the
+    /// server call, then the key, then the migration.
     NewCode(String),
     /// A re-issued code. Confirming it just closes.
     ReissuedCode(String),
+}
+
+/// Which of the two code screens is up.
+///
+/// The heading, the sentence under it and the confirm label are the entire
+/// difference between them, so they hang off the variant rather than off
+/// two near-identical call sites. Pairing them removes the chance of a card
+/// built with the other one's words: "your previous code no longer works"
+/// over a code minted for an account that has never had one would be a lie,
+/// and the enable card's label is what tells the user that pressing it is
+/// the thing that turns encryption on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CodeKind {
+    /// Minted by the enable ceremony, with the server not yet told.
+    New,
+    /// Minted by a re-issue, replacing one that has stopped working.
+    Reissued,
+}
+
+impl CodeKind {
+    fn heading(self) -> &'static str {
+        match self {
+            CodeKind::New => "Save your recovery code",
+            CodeKind::Reissued => "Your new recovery code",
+        }
+    }
+
+    fn intro(self) -> &'static str {
+        match self {
+            CodeKind::New => {
+                "This is the only thing that opens your entries if you lose every passkey. It \
+                 is shown once — leaving this page without it means generating a replacement \
+                 from this panel while you still have a passkey that works."
+            }
+            CodeKind::Reissued => {
+                "Your previous code no longer works. This one is shown once and never again."
+            }
+        }
+    }
+
+    fn confirm(self) -> &'static str {
+        match self {
+            CodeKind::New => "I've saved it — finish turning on encryption",
+            CodeKind::Reissued => "I've saved it",
+        }
+    }
+}
+
+/// What the panel is showing, once the flow it is running and the state of
+/// the account have been reconciled.
+///
+/// The reconciliation is a value rather than a nested `match` in the view so
+/// that the one thing it decides can be pinned by a test on the host. What
+/// it decides is that a code on screen outranks the account's state, and
+/// neither code-bearing mode lines up with a phase that would render it:
+/// `NewCode` is shown while the account is still `Off`, because the server
+/// is not told until the user confirms, and `ReissuedCode` while it is
+/// `Unlocked`. If `Phase` won, each would be painted over by the section for
+/// that phase — the enable pitch or the manage view — and the code would be
+/// minted, stored as the account's only backup, and never seen. Nothing
+/// would fail; the ceremony would report success. The same trap
+/// `UnlockPrompt` documents, one ceremony further along.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Screen {
+    /// A recovery code, shown once.
+    Code { code: String, kind: CodeKind },
+    /// The probe has not answered. Everything the server renders.
+    Checking,
+    /// The probe failed and will not retry itself.
+    Unreachable,
+    /// The pitch, the warning and the gate.
+    Enable,
+    /// An encrypted account, from a device that may or may not hold the key.
+    Manage { unlocked: bool },
+}
+
+impl Screen {
+    fn of(mode: Mode, phase: Phase) -> Self {
+        match mode {
+            Mode::NewCode(code) => Screen::Code {
+                code,
+                kind: CodeKind::New,
+            },
+            Mode::ReissuedCode(code) => Screen::Code {
+                code,
+                kind: CodeKind::Reissued,
+            },
+            Mode::Idle => match phase {
+                Phase::Checking => Screen::Checking,
+                Phase::Unreachable => Screen::Unreachable,
+                Phase::Off => Screen::Enable,
+                Phase::Locked => Screen::Manage { unlocked: false },
+                Phase::Unlocked => Screen::Manage { unlocked: true },
+            },
+        }
+    }
 }
 
 /// The one line the panel talks back through.
@@ -324,13 +419,13 @@ pub fn EncryptionPanel(
 
     let phase = Memo::new(move |_| Phase::of(&encryption.state()));
 
-    // Bridges the enable ceremony's two clicks. Publishing the key the
-    // moment `encryption_enable` returns would flip the account to
-    // `Unlocked` and re-render this panel into its manage view, taking the
-    // recovery code off the screen before the user had confirmed — or even
-    // read — it.
+    // Bridges the enable ceremony's two clicks: everything computed before
+    // the server hears about it waits here while the recovery code is on
+    // screen. Nothing is encrypted until the second click, which is the
+    // point — a lost response to `encryption_enable` then finds the user
+    // already holding the code that went live with it.
     #[cfg(feature = "hydrate")]
-    let pending_key = StoredValue::<Option<SessionKey>, LocalStorage>::new_local(None);
+    let pending_enable = StoredValue::<Option<PendingEnable>, LocalStorage>::new_local(None);
 
     // Browser-only in full: every call inside reaches the network, and the
     // server has nothing to render from the answer anyway (it is always
@@ -424,11 +519,12 @@ pub fn EncryptionPanel(
             };
             busy.set(true);
             spawn_local(async move {
-                let outcome = ceremony::enable_encryption(&user).await;
+                let outcome = ceremony::begin_enable(&user).await;
                 busy.set(false);
                 match outcome {
-                    Ok((key, code)) => {
-                        pending_key.set_value(Some(key));
+                    Ok(pending) => {
+                        let code = pending.recovery_code().to_string();
+                        pending_enable.set_value(Some(pending));
                         mode.set(Mode::NewCode(code));
                     }
                     Err(message) => status.set(Some(Status::Problem(message))),
@@ -437,19 +533,49 @@ pub fn EncryptionPanel(
         }
     };
 
+    // Spec section 6.1's step 4, reached only once the user has said they
+    // have the code step 5 showed them. Running the server call here rather
+    // than before the code screen is what makes a lost response survivable:
+    // whichever way it went, the code in the user's hands is the account's.
+    //
+    // The key is published on the same answer that turns the account on, so
+    // there is no stretch of time in which the server considers the account
+    // encrypted while `EncryptionCtx` still says `Disabled` — which is
+    // `WriteKey::Plaintext`, and so a v1 row written into an encrypted
+    // account, the downgrade invariant E7 exists to prevent. Deferring the
+    // publication to a later click would open exactly that window, and the
+    // probe does not re-run on its own to close it.
     let confirm_new_code = move || {
-        mode.set(Mode::Idle);
         #[cfg(feature = "hydrate")]
         {
-            let Some(Some(key)) = pending_key.try_update_value(Option::take) else {
+            // Taken, not read: a second click while the call is in flight
+            // finds nothing and does nothing, rather than enabling twice.
+            let Some(Some(pending)) = pending_enable.try_update_value(Option::take) else {
                 return;
             };
-            // `EncryptionCtx::unlock` refuses a key for an account that is
-            // no longer the signed-in one, so a sign-out during the code
-            // screen leaves the key unpublished rather than sealing the
-            // signed-out page's `localStorage` under it.
-            encryption.unlock(key);
-            run_migration();
+            busy.set(true);
+            status.set(Some(Status::Note("Turning on encryption…".to_string())));
+            spawn_local(async move {
+                let outcome = ceremony::commit_enable(pending).await;
+                busy.set(false);
+                // The code comes down only on an answer, either way. A
+                // failed call leaves the pitch and the message rather than a
+                // card whose button no longer does anything.
+                mode.set(Mode::Idle);
+                match outcome {
+                    Ok(key) => {
+                        status.set(None);
+                        // `EncryptionCtx::unlock` refuses a key for an
+                        // account that is no longer the signed-in one, so a
+                        // sign-out during the code screen leaves the key
+                        // unpublished rather than sealing the signed-out
+                        // page's `localStorage` under it.
+                        encryption.unlock(key);
+                        run_migration();
+                    }
+                    Err(message) => status.set(Some(Status::Problem(message))),
+                }
+            });
         }
     };
 
@@ -550,74 +676,62 @@ pub fn EncryptionPanel(
             {move || status.get().map(|line| view! {
                 <p class=line.class()>{line.message().to_string()}</p>
             })}
-            {move || match mode.get() {
-                Mode::NewCode(code) => EitherOf3::A(view! {
+            {move || match Screen::of(mode.get(), phase.get()) {
+                Screen::Code { code, kind } => EitherOf5::A(view! {
                     <RecoveryCodeCard
                         code=code
-                        heading="Save your recovery code"
-                        intro="This is the only thing that opens your entries if you lose every \
-                               passkey. It is shown once — leaving this page without it means \
-                               generating a replacement from this panel while you still have a \
-                               passkey that works."
-                        confirm="I've saved it — finish turning on encryption"
-                        on_confirm=confirm_new_code
+                        heading=kind.heading()
+                        intro=kind.intro()
+                        confirm=kind.confirm()
+                        on_confirm=move || match kind {
+                            CodeKind::New => confirm_new_code(),
+                            CodeKind::Reissued => dismiss_code(),
+                        }
                     />
                 }),
-                Mode::ReissuedCode(code) => EitherOf3::B(view! {
-                    <RecoveryCodeCard
-                        code=code
-                        heading="Your new recovery code"
-                        intro="Your previous code no longer works. This one is shown once and \
-                               never again."
-                        confirm="I've saved it"
-                        on_confirm=dismiss_code
+                // What the server renders for everybody, and what the
+                // browser renders until the probe lands (invariant E2).
+                Screen::Checking => EitherOf5::B(view! {
+                    <div>
+                        <h2 class="text-lg font-semibold text-gray-800 mb-1">"Encryption"</h2>
+                        <p class="text-sm text-gray-500">"Checking this account…"</p>
+                    </div>
+                }),
+                Screen::Unreachable => EitherOf5::C(view! {
+                    <div>
+                        <h2 class="text-lg font-semibold text-gray-800 mb-1">"Encryption"</h2>
+                        <p class="text-sm text-gray-600 mb-4">
+                            "We couldn't tell whether this account's entries are encrypted. \
+                             Nothing is being saved until we can — guessing wrong would \
+                             store your entries in the clear."
+                        </p>
+                        <button
+                            type="button"
+                            class="bg-blue-600 text-white text-sm font-semibold rounded px-4 py-2 hover:bg-blue-700"
+                            on:click=move |_| retry_probe()
+                        >
+                            "Try again"
+                        </button>
+                    </div>
+                }),
+                Screen::Enable => EitherOf5::D(view! {
+                    <EnableSection
+                        overview=overview
+                        understood=understood
+                        busy=busy
+                        on_enable=turn_on
                     />
                 }),
-                Mode::Idle => EitherOf3::C(match phase.get() {
-                    // What the server renders for everybody, and what the
-                    // browser renders until the probe lands (invariant E2).
-                    Phase::Checking => EitherOf4::A(view! {
-                        <div>
-                            <h2 class="text-lg font-semibold text-gray-800 mb-1">"Encryption"</h2>
-                            <p class="text-sm text-gray-500">"Checking this account…"</p>
-                        </div>
-                    }),
-                    Phase::Unreachable => EitherOf4::B(view! {
-                        <div>
-                            <h2 class="text-lg font-semibold text-gray-800 mb-1">"Encryption"</h2>
-                            <p class="text-sm text-gray-600 mb-4">
-                                "We couldn't tell whether this account's entries are encrypted. \
-                                 Nothing is being saved until we can — guessing wrong would \
-                                 store your entries in the clear."
-                            </p>
-                            <button
-                                type="button"
-                                class="bg-blue-600 text-white text-sm font-semibold rounded px-4 py-2 hover:bg-blue-700"
-                                on:click=move |_| retry_probe()
-                            >
-                                "Try again"
-                            </button>
-                        </div>
-                    }),
-                    Phase::Off => EitherOf4::C(view! {
-                        <EnableSection
-                            overview=overview
-                            understood=understood
-                            busy=busy
-                            on_enable=turn_on
-                        />
-                    }),
-                    encrypted @ (Phase::Locked | Phase::Unlocked) => EitherOf4::D(view! {
-                        <ManageSection
-                            unlocked=encrypted == Phase::Unlocked
-                            overview=overview
-                            busy=busy
-                            on_lock=lock_now
-                            on_reissue=new_recovery_code
-                            on_migrate=run_migration
-                            on_give_key=give_key
-                        />
-                    }),
+                Screen::Manage { unlocked } => EitherOf5::E(view! {
+                    <ManageSection
+                        unlocked=unlocked
+                        overview=overview
+                        busy=busy
+                        on_lock=lock_now
+                        on_reissue=new_recovery_code
+                        on_migrate=run_migration
+                        on_give_key=give_key
+                    />
                 }),
             }}
         </div>
@@ -729,8 +843,8 @@ fn EnableSection(
                      a fresh prompt."
                 </li>
                 <li>
-                    "You're shown a recovery code, once. Save it before you close the page — it \
-                     is never shown again."
+                    "You're shown a recovery code, once, before encryption is switched on. \
+                     Save it before you go on — it is never shown again."
                 </li>
                 <li>"Entries you've already saved are re-encrypted in place. Nothing is deleted."</li>
                 <li>
@@ -949,7 +1063,7 @@ fn RouteRow(
 mod ceremony {
     use super::{MigrationScan, Overview, classify, migration_scan};
     use crate::crypto::flow::{self, PrfAssertion};
-    use crate::crypto::{Opener, SessionKey, choose_route, enable};
+    use crate::crypto::{Enabled, Opener, SessionKey, choose_route, enable};
     use crate::server_fns::encryption::{encryption_enable, encryption_wraps};
     use crate::server_fns::entries::{entries_all, entry_save_many};
     use crate::server_fns::passkey::passkey_list;
@@ -982,24 +1096,36 @@ mod ceremony {
         })
     }
 
-    /// Turns encryption on (spec section 6.1), returning the unlocked key
-    /// and the recovery code to show once.
+    /// The enable ceremony, paused with the recovery code on screen.
     ///
-    /// `crypto::enable` has already written this device's keystore record by
-    /// the time `encryption_enable` is called — see its own doc for why that
-    /// inversion is the safe direction. If the server call fails, that
-    /// record is inert: the next probe asks the server, is told the account
-    /// is not encrypted, and lands on `Disabled`.
+    /// Everything the account needs already exists — a data key, both wraps,
+    /// a code, and this device's keystore record — and the server still
+    /// knows none of it, so the account is *not* encrypted. That gap is the
+    /// point of the type: it holds the ceremony open across the one-time
+    /// display of the code, so the user has saved it before the transaction
+    /// that makes it their only backup.
+    pub struct PendingEnable {
+        enabled: Enabled,
+        /// The credential that asserted, filed alongside its own wrap.
+        credential_id: Vec<u8>,
+    }
+
+    impl PendingEnable {
+        /// The code to show once, before committing to it.
+        pub fn recovery_code(&self) -> &str {
+            &self.enabled.recovery_code
+        }
+    }
+
+    /// Everything turning encryption on does before the server hears about
+    /// it: spec section 6.1's steps 1 to 3, plus step 6's keystore write,
+    /// which `crypto::enable` performs on the way through (see its doc).
     ///
-    /// The failure worth spelling out is the *lost response*, the same shape
-    /// `flow::reissue`'s retry exists for and the one case a retry cannot
-    /// fix: if the transaction commits and the reply never arrives, the
-    /// account is encrypted under a recovery code the user was never shown.
-    /// It is recoverable — this device still holds the key, so the manage
-    /// view can mint a replacement — but only by somebody who knows to. So
-    /// the error says so, rather than reporting a generic failure for an
-    /// operation that may well have succeeded.
-    pub async fn enable_encryption(user: &str) -> Result<(SessionKey, String), String> {
+    /// Abandoning a `PendingEnable` — closing the tab on the code screen —
+    /// costs nothing. `encrypted_at` is unset, so the next probe reports
+    /// `Disabled`, the keystore record is never consulted, and the code the
+    /// user may have saved simply opens nothing.
+    pub async fn begin_enable(user: &str) -> Result<PendingEnable, String> {
         let PrfAssertion {
             credential_id,
             prf_output,
@@ -1011,18 +1137,43 @@ mod ceremony {
             .await
             .map_err(|_| "This browser couldn't generate an encryption key.".to_string())?;
 
+        Ok(PendingEnable {
+            enabled,
+            credential_id,
+        })
+    }
+
+    /// Step 4, run only once the user has confirmed they hold the code —
+    /// which is why it comes *after* step 5 (spec section 6.1's second
+    /// amendment).
+    ///
+    /// The failure worth spelling out is the *lost response*, the same shape
+    /// `flow::reissue`'s retry exists for and the one case a retry cannot
+    /// fix: the transaction commits and the reply never arrives. Ordering
+    /// the code screen first is what makes that survivable — if it committed,
+    /// the code the user just saved is the account's live one; if it did not,
+    /// they saved a code for an account that is not encrypted, and the next
+    /// attempt mints another. The caller cannot tell those apart from here,
+    /// so the message says how to find out and what each answer means.
+    pub async fn commit_enable(pending: PendingEnable) -> Result<SessionKey, String> {
+        let PendingEnable {
+            enabled,
+            credential_id,
+        } = pending;
+
         encryption_enable(enabled.passkey_wrap, credential_id, enabled.recovery_wrap)
             .await
             .map_err(|err| {
                 format!(
-                    "{} If encryption now shows as on for this account, generate a new \
-                     recovery code below straight away — the code from this attempt was \
-                     never shown to you.",
+                    "{} We couldn't confirm encryption was turned on. Reload this page and \
+                     read this panel: if it says encryption is on, the code you just saved is \
+                     the right one — keep it. If it still offers to turn encryption on, \
+                     nothing was changed and you can try again.",
                     crate::webauthn_browser::friendly_error(err.to_string())
                 )
             })?;
 
-        Ok((enabled.session_key, enabled.recovery_code))
+        Ok(enabled.session_key)
     }
 
     /// Spec section 6.4's re-issue, opened with a passkey rather than the
@@ -1228,6 +1379,70 @@ mod tests {
         assert_eq!(scan, MigrationScan::default());
     }
 
+    /// The precedence the whole recovery story hangs on. A code on screen
+    /// has to outrank the account's state, and neither code-bearing mode
+    /// lines up with a phase that would render it: `NewCode` is shown while
+    /// the account is still `Off`, `ReissuedCode` while it is `Unlocked`. If
+    /// `Phase` won, the panel would paint the enable pitch or the manage
+    /// view over a code that had just been made the account's only backup —
+    /// and nothing would fail, because the ceremony would have succeeded.
+    #[test]
+    fn a_code_on_screen_outranks_the_account_state() {
+        for phase in [
+            Phase::Checking,
+            Phase::Unreachable,
+            Phase::Off,
+            Phase::Locked,
+            Phase::Unlocked,
+        ] {
+            assert_eq!(
+                Screen::of(Mode::NewCode("K7M2".to_string()), phase),
+                Screen::Code {
+                    code: "K7M2".to_string(),
+                    kind: CodeKind::New,
+                },
+            );
+            assert_eq!(
+                Screen::of(Mode::ReissuedCode("K7M2".to_string()), phase),
+                Screen::Code {
+                    code: "K7M2".to_string(),
+                    kind: CodeKind::Reissued,
+                },
+            );
+        }
+    }
+
+    /// And with no ceremony of its own running, the panel shows what the
+    /// account's state calls for — including the `Checking` branch the
+    /// server renders for everybody (invariant E2).
+    #[test]
+    fn an_idle_panel_follows_the_account_state() {
+        assert_eq!(Screen::of(Mode::Idle, Phase::Checking), Screen::Checking);
+        assert_eq!(
+            Screen::of(Mode::Idle, Phase::Unreachable),
+            Screen::Unreachable
+        );
+        assert_eq!(Screen::of(Mode::Idle, Phase::Off), Screen::Enable);
+        assert_eq!(
+            Screen::of(Mode::Idle, Phase::Locked),
+            Screen::Manage { unlocked: false }
+        );
+        assert_eq!(
+            Screen::of(Mode::Idle, Phase::Unlocked),
+            Screen::Manage { unlocked: true }
+        );
+    }
+
+    /// The two cards say different things, and saying the wrong one is a
+    /// lie the user cannot check: "your previous code no longer works" over
+    /// a first code would send somebody looking for a code they never had.
+    #[test]
+    fn each_code_screen_carries_its_own_words() {
+        assert!(CodeKind::New.confirm().contains("turning on encryption"));
+        assert!(CodeKind::Reissued.intro().contains("no longer works"));
+        assert!(!CodeKind::New.intro().contains("no longer works"));
+    }
+
     /// Renders the whole panel the way the server would, with the context
     /// parked at `state` — the only way to reach anything but `Unknown` on
     /// the host, since the probe that moves it is `hydrate`-only.
@@ -1367,6 +1582,10 @@ mod tests {
         assert!(
             html.contains("three passkey prompts"),
             "the cost of adding a passkey later must be set up front"
+        );
+        assert!(
+            html.contains("before encryption is switched on"),
+            "the code is promised before the switch, because that is the order it runs in"
         );
     }
 

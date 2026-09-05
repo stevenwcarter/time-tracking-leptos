@@ -232,31 +232,58 @@ that the recovery code is the only backup.
 3. Derive both KEKs; wrap the DEK twice.
 4. `encryption_enable(passkey_wrap, credential_id, recovery_wrap)` — one
    server call, one transaction: sets `user.encrypted_at` and inserts both
-   wrap rows. Fails if `encrypted_at` is already set.
+   wrap rows. Fails if `encrypted_at` is already set. **Runs after step 5**
+   — see the amendments below.
 5. Show the recovery code. The user must actively confirm they have saved it
    before the dialog closes; there is a "copy" control, and the code is never
-   shown again.
+   shown again. **Runs before step 4.**
 6. Re-import the DEK non-extractable, store it in the keystore (§7.3), and
-   run the migration (§8).
+   run the migration (§8). **The keystore half runs before step 4** as well;
+   the migration still runs last.
 
-**Amended during implementation.** `crypto::enable` performs step 6's
-keystore write itself, before the caller reaches step 4, so the ordering
-above is not what ships. That is deliberate: the alternative — returning the
-sealed key and trusting the caller to persist it after the server confirms —
-makes "forgot to call `keystore::put`" a live bug whose symptom is a user
-being locked out immediately after enabling, which is both worse and likelier
-than what the current order risks.
+**Amended during implementation, twice.** The steps keep the numbers above —
+other documents and several doc comments cite them — but the order they run
+in is `1 → 2 → 3 → 6(keystore) → 5 → 4 → 6(migration)`. Neither departure is
+cosmetic; each trades one failure for a strictly better one.
 
-What the current order risks is an orphan key: one stored for an account
-whose `encryption_enable` then failed. It is inert. `encrypted_at` is unset,
-so the next probe reports `Disabled` and nothing ever reads the record; a
-retry overwrites it, and sign-out clears it. Persisting local state for
-unconfirmed server state is normally worth avoiding, but here the local state
-does nothing without the server state.
+*The keystore write moved before the server call.* `crypto::enable` performs
+it itself, rather than returning the sealed key for the caller to persist
+once the server confirms. The alternative makes "forgot to call
+`keystore::put`" a live bug whose symptom is a user locked out immediately
+after enabling, which is both worse and likelier than what this order risks.
 
-If step 4 fails, nothing has changed server-side and the ceremony is simply
-retried. If the browser is closed between 4 and 6, the account is encrypted
-with zero rows migrated, which §8 resumes.
+What this order risks is an orphan key: one stored for an account whose
+`encryption_enable` then failed. It is inert. `encrypted_at` is unset, so the
+next probe reports `Disabled` and nothing ever reads the record; a retry
+overwrites it, and sign-out clears it. Persisting local state for unconfirmed
+server state is normally worth avoiding, but here the local state does
+nothing without the server state.
+
+*The recovery code moved before the server call too.* Step 5 is shown, and
+confirmed, while the server still knows nothing; the user's confirmation is
+what triggers step 4. The failure this closes is the lost response — the
+transaction commits and the reply never arrives — which under the original
+order left the account encrypted with its only recovery route derived from a
+code the user had never seen. Nothing would look wrong: they still hold a
+working passkey. It would surface the day that passkey was gone, as
+permanent, total loss.
+
+Reordering makes both outcomes of a lost response correct. If the call
+committed, the user is holding the code that is live. If it did not, they
+saved a code for an account that is not encrypted — harmless, opens nothing,
+and the next attempt mints a replacement. Because the client cannot tell
+which happened, the error copy says so and says how to check: reload
+`/account` and read the panel; encryption showing as on means the saved code
+is the right one, and encryption still offering to be turned on means
+nothing changed.
+
+An abandoned ceremony — the tab closed on the code screen — is the same
+harmless case: no server call was made, so nothing is encrypted.
+
+If step 4 fails visibly, nothing has changed server-side and the ceremony is
+retried from step 1, minting a fresh code. If the browser is closed between
+4 and the migration, the account is encrypted with zero rows migrated, which
+§8 resumes.
 
 ### 6.2 Unlock, riding on sign-in
 
@@ -652,6 +679,7 @@ it — the phase-1 spec's §10 convention.
 | Situation | Behaviour |
 |---|---|
 | Enable interrupted after wraps written | Account encrypted, 0 rows migrated. `/account` offers to finish. All rows still readable. |
+| `encryption_enable` committed, response lost | The recovery code is shown and confirmed *before* that call (§6.1), so the user is holding the code that went live with it. The panel reports that it could not confirm, and says how to check. Under the original order this was the worst failure in the feature: an account encrypted under a code nobody had ever seen, with a working passkey hiding it until the day that passkey was gone. It is the re-issue row below without the working old code that makes that one survivable. |
 | Migration interrupted | Mixed v1/v2. All rows readable. Resumes on demand. |
 | Wrong recovery code | AES-KW unwrap fails; "That recovery code didn't work." No lockout counter — the code is 160 bits. |
 | Passkey lost, code lost | Data is unreadable, permanently, by everyone. Stated in the enable dialog in those words. |

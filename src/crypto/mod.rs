@@ -301,15 +301,23 @@ mod ceremony {
     ///
     /// `prf_output` is the PRF result of an assertion against the credential
     /// being enrolled; `user` is the signed-in identity the keystore record
-    /// is filed under. The caller sends the two wraps to `encryption_enable`,
-    /// shows the recovery code, and then runs the migration.
+    /// is filed under. The caller shows the recovery code and waits for the
+    /// user to confirm it, *then* sends the two wraps to
+    /// `encryption_enable`, and then runs the migration.
     ///
-    /// That server call happens *after* this function has written the
-    /// keystore record, inverting spec section 6.1's step order. The
-    /// inversion is harmless: a key stored for an account whose
-    /// `encryption_enable` then failed is never consulted, because the next
-    /// probe asks `encryption_status`, is told the account is not encrypted,
-    /// and lands on `Disabled` — and a retry replaces the record.
+    /// So as shipped, spec section 6.1's steps run 1 → 2 → 3 → 6 → 5 → 4:
+    /// this function performs step 6's keystore write, and the caller holds
+    /// step 5's code screen ahead of step 4's server call. Both departures
+    /// are amended into §6.1, and both trade one failure for a better one.
+    ///
+    /// The one that belongs here is the keystore write. Doing it now, before
+    /// the account exists server-side, risks only an orphan record: a key
+    /// stored for an account whose `encryption_enable` then failed is never
+    /// consulted, because the next probe asks `encryption_status`, is told
+    /// the account is not encrypted, and lands on `Disabled` — and a retry
+    /// replaces it. The alternative — hand the key back and trust the caller
+    /// to persist it once the server confirms — makes "forgot to store it" a
+    /// live bug whose symptom is a lockout immediately after enabling.
     pub async fn enable(prf_output: &[u8], user: &str) -> Result<Enabled, CryptoError> {
         let (recovery_code, code_bytes) = new_recovery_code()?;
 
