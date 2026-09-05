@@ -9,7 +9,7 @@ use leptos_router::hooks::use_navigate;
 
 use crate::auth_ctx::AuthCtx;
 use crate::date::{format_long, month_bounds, to_iso};
-use crate::storage::dates_with_entries;
+use crate::storage::{Generation, dates_with_entries};
 
 /// The month's days laid out Monday-first, padded with `None` so each row of
 /// seven is a calendar week.
@@ -55,18 +55,39 @@ pub fn DatePicker(date: NaiveDate) -> impl IntoView {
     // current on mount.
     let marked = RwSignal::new(Vec::<NaiveDate>::new());
     let backend = auth.backend();
+    let generation = StoredValue::new(Generation::default());
     Effect::new(move |_| {
         let backend = backend.get();
         let (from, to) = month_bounds(date);
+        // Captured synchronously, before the `spawn_local` below: sign-out
+        // is a live, no-reload toggle (`AccountMenu` flips `AuthCtx::user`
+        // in place), so this effect can re-run — and start a second,
+        // differently-backed fetch — while an earlier one is still in
+        // flight. Reading the token back out *after* the await would race
+        // that second run for the increment; capturing it now does not.
+        let token = generation
+            .try_update_value(Generation::next)
+            .unwrap_or_default();
         spawn_local(async move {
             // A failed lookup means no dots, never a broken calendar: the
             // picker's job is navigation, and the marks are only a
             // convenience.
-            marked.set(
-                dates_with_entries(backend, from, to)
-                    .await
-                    .unwrap_or_default(),
-            );
+            let fetched = dates_with_entries(backend, from, to)
+                .await
+                .unwrap_or_default();
+            // `try_with_value`, not the panicking form: this component's
+            // owner — and so this `StoredValue` — can already be disposed
+            // by the time this resolves, e.g. the user navigated to
+            // another day while the fetch was in flight. And only publish
+            // if this is still the newest fetch: an earlier, slower load
+            // (e.g. a signed-in `Remote` fetch outlasting a signed-out
+            // `Local` one) must not overwrite a newer backend's dots.
+            let is_current = generation
+                .try_with_value(|g| g.is_current(token))
+                .unwrap_or(false);
+            if is_current {
+                marked.set(fetched);
+            }
         });
     });
 
