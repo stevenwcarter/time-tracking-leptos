@@ -539,8 +539,21 @@ Two round trips, resumable, no schema change:
    call, one transaction.
 
 Resumability falls out of §5.1: dispatch is per-row, so re-running the pass
-simply finds fewer v1 rows. If the migration is interrupted, `/account` shows
+simply finds fewer v1 rows. A v2 row is skipped outright rather than
+re-sealed — re-sealing means decrypting first, which is work with nothing to
+gain and data to lose. If the migration is interrupted, `/account` shows
 "N days still unencrypted" and offers to finish.
+
+The classification is a value, `MigrationPlan`, with two halves: the rows to
+re-write and the dates of rows this build could not read at all. The second
+half is reported **by date**, never as a count, and never dropped. Unlike the
+week view — where skipping one unreadable day out of seven is the right blast
+radius — a failed read here is a one-time event with no automatic remedy: the
+next pass finds the same row and does the same nothing. The user has to go
+and look at that day, which means being told which day it is.
+
+The pass reports per-row progress while it seals, because one WebCrypto round
+trip per row makes a large account a long wait with nothing on screen.
 
 `entries_all` returns the whole account in one response. For this
 application's data volume that is the right trade against the alternative

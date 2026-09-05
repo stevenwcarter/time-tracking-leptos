@@ -183,42 +183,65 @@ fn classify(row: PasskeyListItem, wraps: &[WrapDto]) -> PasskeyRoute {
     }
 }
 
-/// What one pass over `entries_all()` found.
+/// One row the migration is going to re-write.
 ///
-/// The server cannot produce this: answering "how many rows are still
+/// A struct rather than the `(String, String)` it arrived as: both halves
+/// are `String`, and the pass carries them together through a seal step
+/// before handing them back to `entry_save_many`. Swapping them there would
+/// compile, and would file every entry under a date made of its own text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
+struct PendingRow {
+    date: String,
+    /// The plaintext, already unwrapped from its v1 envelope.
+    body: String,
+}
+
+/// What one pass over `entries_all()` found, and so what the migration will
+/// and will not touch.
+///
+/// The server cannot produce this: answering "which rows are still
 /// plaintext" means reading each row's envelope version, which is parsing a
-/// body, which invariant E1 forbids outright. So the count comes from the
-/// browser doing the classification itself (spec section 8).
+/// body, which invariant E1 forbids outright. So the classification happens
+/// in the browser (spec section 8).
+///
+/// The two halves are separate because they need different handling and
+/// different words on screen. `pending` is work the pass does; `unreadable`
+/// is work it refuses to do, and reports instead.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
-struct MigrationScan {
-    /// `(date, plaintext body)` for every row still stored as v1.
-    pending: Vec<(String, String)>,
-    /// Dates of rows this build could not interpret at all. Counted rather
-    /// than skipped silently: a row nobody is told about stays plaintext
-    /// forever.
+struct MigrationPlan {
+    /// Every row still stored as v1, with the body ready to seal.
+    pending: Vec<PendingRow>,
+    /// The dates of rows this build could not interpret at all — named, not
+    /// counted. Guessing at one would destroy it, and skipping it silently
+    /// would leave it plaintext forever with nobody told which day it was.
     unreadable: Vec<String>,
 }
 
-/// Sorts `entries_all()`'s rows into the ones the migration must re-write
-/// and the ones it cannot touch.
-///
-/// Pure, and the only part of the migration a host test can reach — sealing
-/// a body goes through WebCrypto, which has no host equivalent. Dispatch is
-/// on each row's own envelope version, never on account state, which is what
-/// makes the pass resumable: run it again and it simply finds fewer v1 rows
-/// (spec E3, section 8).
-#[cfg(any(feature = "hydrate", test))]
-fn migration_scan(rows: Vec<(String, String)>) -> MigrationScan {
-    let mut scan = MigrationScan::default();
-    for (date, raw) in rows {
-        match plan_read(&raw) {
-            Ok(ReadPlan::Plaintext(body)) => scan.pending.push((date, body)),
-            Ok(ReadPlan::Sealed(_)) => {}
-            Err(_) => scan.unreadable.push(date),
+impl MigrationPlan {
+    /// Sorts `entries_all()`'s rows into the ones the migration must
+    /// re-write and the ones it must leave alone.
+    ///
+    /// Pure, and the only part of the migration a host test can reach —
+    /// sealing a body goes through WebCrypto, which has no host equivalent.
+    /// Dispatch is on each row's own envelope version, never on account
+    /// state, which is what makes the pass resumable: run it again and it
+    /// simply finds fewer v1 rows. A v2 row is left strictly alone rather
+    /// than re-sealed, because re-sealing means decrypting first and a bug
+    /// on that path destroys data (spec E3, section 8).
+    #[cfg(any(feature = "hydrate", test))]
+    fn of(rows: Vec<(String, String)>) -> Self {
+        let mut plan = Self::default();
+        for (date, raw) in rows {
+            match plan_read(&raw) {
+                Ok(ReadPlan::Plaintext(body)) => plan.pending.push(PendingRow { date, body }),
+                Ok(ReadPlan::Sealed(_)) => {}
+                Err(_) => plan.unreadable.push(date),
+            }
         }
+        plan
     }
-    scan
 }
 
 /// Everything the panel fetches about the account in one go.
@@ -229,7 +252,10 @@ struct Overview {
     /// Whether a recovery wrap this build can open is on file.
     has_recovery_wrap: bool,
     unencrypted_days: usize,
-    unreadable_days: usize,
+    /// The dates of rows nothing here can read. Dates rather than a count:
+    /// this is the one thing on the panel the user has to act on by hand,
+    /// and "2 days couldn't be read" tells them nothing about which two.
+    unreadable_dates: Vec<String>,
 }
 
 impl Overview {
@@ -487,20 +513,49 @@ pub fn EncryptionPanel(
                 // a sign-out that landed while this was queued is seen.
                 let state = encryption.state_untracked();
                 let outcome = match state.key() {
-                    Some(key) => ceremony::migrate(key).await,
+                    // Sealing is one WebCrypto round trip per row, so a
+                    // large account spends a while here with nothing to
+                    // show for it. The callback lands between rows, on the
+                    // await that yields to the event loop, so the line on
+                    // screen actually moves.
+                    Some(key) => {
+                        ceremony::migrate(key, |at| {
+                            status.set(Some(Status::Note(format!(
+                                "Encrypting your entries… day {} of {}.",
+                                at.day, at.total,
+                            ))));
+                        })
+                        .await
+                    }
                     None => Err("This device is locked, so nothing could be re-encrypted \
                                  yet."
                         .to_string()),
                 };
                 busy.set(false);
                 match outcome {
-                    Ok(0) => status.set(Some(Status::Note(
-                        "Everything is already encrypted.".to_string(),
-                    ))),
-                    Ok(count) => {
-                        status.set(Some(Status::Note(format!("Encrypted {}.", days(count)))))
-                    }
                     Err(message) => status.set(Some(Status::Problem(message))),
+                    Ok(done) if done.unreadable.is_empty() => {
+                        status.set(Some(Status::Note(match done.encrypted {
+                            0 => "Everything is already encrypted.".to_string(),
+                            count => format!("Encrypted {}.", days(count)),
+                        })));
+                    }
+                    // A row the pass could not read is the one outcome that
+                    // needs the user, so it is reported as a problem even
+                    // when the rest of the account went through — and by
+                    // date, because "look at these two days" is the only
+                    // action available to them.
+                    Ok(done) => {
+                        let encrypted = match done.encrypted {
+                            0 => String::new(),
+                            count => format!("Encrypted {}. ", days(count)),
+                        };
+                        status.set(Some(Status::Problem(format!(
+                            "{encrypted}{} could not be read at all and stayed unencrypted: {}.",
+                            days(done.unreadable.len()),
+                            done.unreadable.join(", "),
+                        ))));
+                    }
                 }
                 reload.update(|n| *n += 1);
             });
@@ -981,11 +1036,16 @@ fn ManageSection(
                                 }}
                             </div>
                         })}
-                        {(overview.unreadable_days > 0).then(|| view! {
+                        // Named, not counted. This is the only thing on the
+                        // panel the user has to go and look at by hand, and
+                        // a bare number tells them nothing about where.
+                        {(!overview.unreadable_dates.is_empty()).then(|| view! {
                             <p class="text-sm text-red-700 mb-2">
                                 {format!(
-                                    "{} could not be read at all. Nothing was changed there.",
-                                    days(overview.unreadable_days),
+                                    "{} could not be read at all, and nothing was changed \
+                                     there: {}.",
+                                    days(overview.unreadable_dates.len()),
+                                    overview.unreadable_dates.join(", "),
                                 )}
                             </p>
                         })}
@@ -1061,7 +1121,7 @@ fn RouteRow(
 /// Browser-only, like the rest of spec section 6.
 #[cfg(feature = "hydrate")]
 mod ceremony {
-    use super::{MigrationScan, Overview, classify, migration_scan};
+    use super::{MigrationPlan, Overview, classify};
     use crate::crypto::flow::{self, PrfAssertion};
     use crate::crypto::{Enabled, Opener, SessionKey, choose_route, enable};
     use crate::server_fns::encryption::{encryption_enable, encryption_wraps};
@@ -1082,17 +1142,17 @@ mod ceremony {
         } else {
             Vec::new()
         };
-        let scan = if encrypted {
-            migration_scan(entries_all().await.map_err(flow::server_unreachable)?)
+        let plan = if encrypted {
+            MigrationPlan::of(entries_all().await.map_err(flow::server_unreachable)?)
         } else {
-            MigrationScan::default()
+            MigrationPlan::default()
         };
 
         Ok(Overview {
             routes: rows.into_iter().map(|row| classify(row, &wraps)).collect(),
             has_recovery_wrap: choose_route(&wraps, None).is_some(),
-            unencrypted_days: scan.pending.len(),
-            unreadable_days: scan.unreadable.len(),
+            unencrypted_days: plan.pending.len(),
+            unreadable_dates: plan.unreadable,
         })
     }
 
@@ -1200,34 +1260,75 @@ mod ceremony {
         .await
     }
 
+    /// Which row the sealing loop is on, for the line on screen.
+    ///
+    /// A pair rather than two `usize` arguments, which a caller could swap
+    /// without the compiler minding and which would then count backwards.
+    /// `day` is the row being worked on, not the row finished — it is
+    /// reported before the seal so the first one is visible too.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Progress {
+        pub day: usize,
+        pub total: usize,
+    }
+
+    /// What one migration pass did, and what it declined to touch.
+    pub struct MigrationOutcome {
+        /// How many days this pass re-wrote as v2.
+        pub encrypted: usize,
+        /// The dates it could not read, and so left exactly as they were.
+        /// Carried out rather than dropped: this is the pass's only chance
+        /// to tell anyone, and a later run will find the same rows and say
+        /// the same thing to nobody.
+        pub unreadable: Vec<String>,
+    }
+
     /// Re-encrypts every row still stored as v1, in one transaction (spec
-    /// section 8).
+    /// section 8), calling `progress` as it reaches each row.
     ///
     /// Resumable by construction: a run that never reaches `entry_save_many`
     /// changes nothing, and a run that does leaves fewer v1 rows for the
-    /// next one to find. Rows this build cannot read at all are not sent —
-    /// they are counted and reported by the overview instead, because
-    /// guessing at one would destroy it.
-    pub async fn migrate(key: &SessionKey) -> Result<usize, String> {
+    /// next one to find. A v2 row is never re-sent — re-sealing one means
+    /// decrypting it first, work with nothing to gain and data to lose.
+    /// Rows this build cannot read at all are not sent either, for the same
+    /// reason, and come back named in the outcome.
+    pub async fn migrate(
+        key: &SessionKey,
+        progress: impl Fn(Progress),
+    ) -> Result<MigrationOutcome, String> {
         let rows = entries_all().await.map_err(flow::server_unreachable)?;
-        let scan = migration_scan(rows);
-        if scan.pending.is_empty() {
-            return Ok(0);
+        let plan = MigrationPlan::of(rows);
+        let unreadable = plan.unreadable;
+        if plan.pending.is_empty() {
+            return Ok(MigrationOutcome {
+                encrypted: 0,
+                unreadable,
+            });
         }
 
-        let mut sealed = Vec::with_capacity(scan.pending.len());
-        for (date, body) in scan.pending {
-            let wrapped = envelope::wrap(&body, Some(key)).await.map_err(|_| {
-                format!("Couldn't encrypt the entry for {date}; nothing was saved.")
+        let total = plan.pending.len();
+        let mut sealed = Vec::with_capacity(total);
+        for (index, row) in plan.pending.into_iter().enumerate() {
+            progress(Progress {
+                day: index + 1,
+                total,
+            });
+            let wrapped = envelope::wrap(&row.body, Some(key)).await.map_err(|_| {
+                format!(
+                    "Couldn't encrypt the entry for {}; nothing was saved.",
+                    row.date
+                )
             })?;
-            sealed.push((date, wrapped));
+            sealed.push((row.date, wrapped));
         }
 
-        let count = sealed.len();
         entry_save_many(sealed)
             .await
             .map_err(flow::server_unreachable)?;
-        Ok(count)
+        Ok(MigrationOutcome {
+            encrypted: total,
+            unreadable,
+        })
     }
 }
 
@@ -1314,41 +1415,53 @@ mod tests {
         assert!(capable.has_capable_passkey());
     }
 
-    /// The count the panel reports, and the selection the migration acts on.
-    /// A v2 row re-sent through the pass would be decrypted and re-sealed
-    /// for nothing, and a bug in that path destroys data — so "already
-    /// encrypted" must be excluded, not merely harmless.
+    fn pending(date: &str, body: &str) -> PendingRow {
+        PendingRow {
+            date: date.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    fn sealed_row(ciphertext: Vec<u8>) -> String {
+        wire::encode_v2(&wire::Sealed {
+            nonce: vec![0; wire::NONCE_LEN],
+            ciphertext,
+        })
+    }
+
+    /// The selection the migration acts on, and the count the panel reports
+    /// from it. A v2 row re-sent through the pass would be decrypted and
+    /// re-sealed for nothing, and a bug in that path destroys data — so
+    /// "already encrypted" must be excluded, not merely harmless.
     #[test]
     fn only_plaintext_rows_are_pending() {
-        let sealed = wire::encode_v2(&wire::Sealed {
-            nonce: vec![0; wire::NONCE_LEN],
-            ciphertext: vec![1, 2, 3],
-        });
-        let scan = migration_scan(vec![
+        let plan = MigrationPlan::of(vec![
             ("2026-09-01".to_string(), wrap_v1("morning")),
-            ("2026-09-02".to_string(), sealed),
+            ("2026-09-02".to_string(), sealed_row(vec![1, 2, 3])),
             ("2026-09-03".to_string(), wrap_v1("")),
         ]);
 
         assert_eq!(
-            scan.pending,
+            plan.pending,
             vec![
-                ("2026-09-01".to_string(), "morning".to_string()),
+                pending("2026-09-01", "morning"),
                 // An empty body is a real saved state, not an absence, and
                 // leaving it as the account's one v1 row would keep the
                 // panel reporting unfinished work forever.
-                ("2026-09-03".to_string(), String::new()),
+                pending("2026-09-03", ""),
             ]
         );
-        assert!(scan.unreadable.is_empty());
+        assert!(plan.unreadable.is_empty());
     }
 
-    /// A row nobody can interpret is named, not dropped. Silently skipping
-    /// it would leave it plaintext forever with nothing to say so — the one
-    /// outcome a one-shot migration cannot recover from on a later run.
+    /// A row nobody can interpret is named, not dropped and not reduced to
+    /// a number. Silently skipping it would leave it plaintext forever with
+    /// nothing to say so, and a count would tell the user something is
+    /// wrong without telling them where to look — the one outcome a
+    /// one-shot migration cannot recover from on a later run.
     #[test]
     fn an_unreadable_row_is_reported_rather_than_skipped() {
-        let scan = migration_scan(vec![
+        let plan = MigrationPlan::of(vec![
             ("2026-09-01".to_string(), "not an envelope".to_string()),
             (
                 "2026-09-02".to_string(),
@@ -1358,10 +1471,10 @@ mod tests {
         ]);
 
         assert_eq!(
-            scan.unreadable,
+            plan.unreadable,
             vec!["2026-09-01".to_string(), "2026-09-02".to_string()]
         );
-        assert_eq!(scan.pending.len(), 1);
+        assert_eq!(plan.pending, vec![pending("2026-09-03", "real")]);
     }
 
     /// Resumability at the boundary: an account with nothing left to do
@@ -1369,14 +1482,10 @@ mod tests {
     /// re-write every row for no reason.
     #[test]
     fn an_account_with_no_plaintext_rows_needs_no_work() {
-        assert_eq!(migration_scan(Vec::new()), MigrationScan::default());
+        assert_eq!(MigrationPlan::of(Vec::new()), MigrationPlan::default());
 
-        let sealed = wire::encode_v2(&wire::Sealed {
-            nonce: vec![0; wire::NONCE_LEN],
-            ciphertext: vec![4],
-        });
-        let scan = migration_scan(vec![("2026-09-01".to_string(), sealed)]);
-        assert_eq!(scan, MigrationScan::default());
+        let plan = MigrationPlan::of(vec![("2026-09-01".to_string(), sealed_row(vec![4]))]);
+        assert_eq!(plan, MigrationPlan::default());
     }
 
     /// The precedence the whole recovery story hangs on. A code on screen
@@ -1710,6 +1819,29 @@ mod tests {
             "a locked device cannot seal anything and must not be offered the pass"
         );
         assert!(locked.contains("Unlock this device to finish"));
+    }
+
+    /// Spec section 8's report, at the view. A row that failed to read is a
+    /// one-time event with no automatic remedy: the pass will find it again
+    /// and again and change nothing. So the panel names the days rather
+    /// than counting them, which is the difference between the user being
+    /// able to go and look and the user only knowing that something,
+    /// somewhere, did not migrate.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn unreadable_days_are_named_not_counted() {
+        let html = render_manage(
+            true,
+            Overview {
+                has_recovery_wrap: true,
+                unreadable_dates: vec!["2026-09-01".to_string(), "2026-09-04".to_string()],
+                ..Overview::default()
+            },
+        );
+        assert!(html.contains("2 days could not be read"));
+        for date in ["2026-09-01", "2026-09-04"] {
+            assert!(html.contains(date), "`{date}` was reduced to a count");
+        }
     }
 
     /// A finished account is not nagged: no count, no resume control, and no
