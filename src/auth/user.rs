@@ -18,6 +18,9 @@ pub struct User {
     pub email: String,
     pub session_epoch: i64,
     pub created_at: chrono::NaiveDateTime,
+    /// When the account switched to client-side encryption; `None` means
+    /// its entries are still plaintext (see `entry_key::store`).
+    pub encrypted_at: Option<chrono::NaiveDateTime>,
 }
 
 #[derive(Insertable)]

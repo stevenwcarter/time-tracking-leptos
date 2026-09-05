@@ -31,6 +31,9 @@ time-tracking-parser = { git = "https://github.com/stevenwcarter/time-tracking-p
 chrono = { version = "0.4", default-features = false, features = [
   "clock", "std", "serde", "wasmbind",
 ] }
+# Shared between hydrate and ssr — the phase-2 envelope is read and written
+# by both the browser and the server.
+base64 = { version = "0.22", optional = true }
 
 # Hydrate-only (wasm).
 console_error_panic_hook = { version = "0.1", optional = true }
@@ -59,6 +62,17 @@ web-sys = { version = "0.3.77", optional = true, features = [
   "PublicKeyCredentialCreationOptions",
   "PublicKeyCredentialDescriptor",
   "PublicKeyCredentialRequestOptions",
+  "IdbFactory",
+  "IdbOpenDbRequest",
+  "IdbDatabase",
+  "IdbTransaction",
+  "IdbTransactionMode",
+  "IdbObjectStore",
+  "IdbRequest",
+  "IdbVersionChangeEvent",
+  "Event",
+  "EventTarget",
+  "DomException",
 ] }
 
 # SSR-only (server binary).
@@ -78,7 +92,6 @@ lettre = { version = "0.11", default-features = false, features = [
   "smtp-transport", "tokio1-rustls-tls", "builder",
 ], optional = true }
 ring = { version = "0.17", optional = true }
-base64 = { version = "0.22", optional = true }
 hex = { version = "0.4", optional = true }
 # v5: a stable per-user UUID for WebAuthn registration, derived from the
 # user's email so re-registering never creates a second WebAuthn "user".
@@ -108,6 +121,16 @@ webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false, f
 # `Persistent::set` for real, and `spawn_local` panics in a debug build with no
 # global executor set. The pool is never polled; the spawned future just parks.
 any_spawner = { version = "0.3", features = ["futures-executor"] }
+# Host-side second implementation of the wire format. WebCrypto exists only
+# in a browser and this project has no wasm test runner, so these let an
+# ordinary `cargo test` decrypt an envelope the browser would have written
+# and produce one the browser must be able to read — pinning nonce
+# placement, tag inclusion, base64 alphabet and HKDF inputs against a
+# different implementation rather than against ourselves (spec section 10).
+aes-gcm = "0.10"
+aes-kw = "0.2"
+hkdf = "0.12"
+sha2 = "0.10"
 
 [features]
 default = []
@@ -118,6 +141,7 @@ hydrate = [
   "dep:wasm-bindgen-futures",
   "dep:js-sys",
   "dep:web-sys",
+  "dep:base64",
 ]
 ssr = [
   "leptos/ssr",

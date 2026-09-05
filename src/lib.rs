@@ -25,6 +25,8 @@ pub mod email;
 #[cfg(feature = "ssr")]
 pub mod entries;
 #[cfg(feature = "ssr")]
+pub mod entry_key;
+#[cfg(feature = "ssr")]
 pub mod passkey;
 #[cfg(feature = "ssr")]
 pub mod rate_limit;

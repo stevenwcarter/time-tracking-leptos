@@ -10,6 +10,7 @@ diesel::table! {
         email -> Text,
         session_epoch -> BigInt,
         created_at -> Timestamp,
+        encrypted_at -> Nullable<Timestamp>,
     }
 }
 
@@ -46,11 +47,26 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    entry_key_wrap (id) {
+        id -> Integer,
+        user_id -> Integer,
+        kind -> Text,
+        credential_id -> Nullable<Binary>,
+        wrapped_key -> Binary,
+        kdf -> Text,
+        wrap_alg -> Text,
+        created_at -> Timestamp,
+    }
+}
+
 diesel::joinable!(time_entry -> user (user_id));
 diesel::joinable!(passkey_credential -> user (user_id));
+diesel::joinable!(entry_key_wrap -> user (user_id));
 diesel::allow_tables_to_appear_in_same_query!(
     user,
     time_entry,
     magic_link_token,
     passkey_credential,
+    entry_key_wrap,
 );
