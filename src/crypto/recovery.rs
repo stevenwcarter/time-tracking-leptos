@@ -194,4 +194,20 @@ mod tests {
     fn the_code_carries_one_hundred_and_sixty_bits() {
         assert_eq!(CODE_BYTES * 8, 160);
     }
+
+    /// The one test in this module that a symmetric bit-addressing bug cannot
+    /// survive. Every other byte-level test here is a round-trip or an
+    /// equivalence check, and both pass happily when `format_code` and
+    /// `normalize` are wrong in the same direction. This value was derived three
+    /// times independently — by hand in Python, against the standard library's
+    /// RFC 4648 base32 with the alphabet remapped, and by bit-shifting — before
+    /// being written down.
+    #[test]
+    fn a_known_input_produces_a_known_code() {
+        let bytes: [u8; CODE_BYTES] = core::array::from_fn(|i| (i + 1) as u8);
+        assert_eq!(
+            format_code(&bytes),
+            "0410-6105-0R3G-G28A-1C60-T3GF-208H-44RM"
+        );
+    }
 }
