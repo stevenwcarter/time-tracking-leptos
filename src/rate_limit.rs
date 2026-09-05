@@ -11,7 +11,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Magic-link requests: 5 immediately, then one back every 30s.
-const MAGIC_CAPACITY: u32 = 5;
+///
+/// `pub` so the tests that pin the limit can name it rather than restating
+/// the number, and drift into asserting a quota that is no longer the one
+/// the app enforces.
+pub const MAGIC_CAPACITY: u32 = 5;
 const MAGIC_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 
 struct Bucket {

@@ -12,6 +12,7 @@ use crate::auth::user;
 use crate::context::AppCtx;
 use crate::db::DbConn;
 use crate::email::{self, OutboundEmail};
+use crate::rate_limit;
 use crate::server::cookie;
 use crate::session::{self, COOKIE_NAME, MAX_AGE_SECONDS};
 
@@ -64,7 +65,26 @@ fn sign_in_response(email: &str, epoch: i64) -> Response {
 /// This is the single most common support case — a user clicking yesterday's
 /// email — and turning it into "here's a new link" rather than a dead end is
 /// most of the value of having the branch at all.
+///
+/// Rate limited on both keys, exactly as `request_magic_link` is: this is the
+/// *second* path that can put a link in someone's inbox, and a spent link URL
+/// is not a secret — it survives in forwarded mail, shared browser history,
+/// and proxy logs. Unlimited, anyone holding one could mail-bomb its owner
+/// and grow `magic_link_token` without bound.
 fn reissue(ctx: &AppCtx, conn: &mut DbConn, email: &str) -> Response {
+    let ip = ctx.client_ip.as_deref().unwrap_or("unknown");
+    // Two independent buckets, checked in the same order and with the same
+    // short-circuit as `request_magic_link`: by IP so one host cannot spray
+    // many addresses, by address so rotating IPs cannot flood one victim.
+    if !rate_limit::check_ip(ip) || !rate_limit::check_email(email) {
+        tracing::debug!("magic-link reissue over quota");
+        // Byte-identical to the accepted response, minting and sending
+        // nothing. A refusal that looked different would turn this route
+        // into an oracle for whether an address is being limited, and would
+        // hand an attacker a signal to pace against.
+        return html_page(StatusCode::OK, sent_page(email));
+    }
+
     let ttl = magic_link::ttl();
     let minted = magic_link::mint(conn, email, ttl);
 
@@ -87,15 +107,7 @@ fn reissue(ctx: &AppCtx, conn: &mut DbConn, email: &str) -> Response {
                     tracing::error!("reissued magic-link email failed: {e:?}");
                 }
             });
-            let body = page(
-                "Check your email",
-                &format!(
-                    "That link had already been used or had expired, so we've sent a \
-                     fresh one to <strong>{}</strong>.",
-                    escape_html(&email::mask(email))
-                ),
-            );
-            (StatusCode::OK, body)
+            (StatusCode::OK, sent_page(email))
         }
         Err(e) => {
             tracing::error!("could not reissue magic link: {e:?}");
@@ -110,6 +122,27 @@ fn reissue(ctx: &AppCtx, conn: &mut DbConn, email: &str) -> Response {
         }
     };
 
+    html_page(status, body)
+}
+
+/// The "we've sent you a fresh link" page.
+///
+/// One function, two call sites — the send and the rate-limited refusal —
+/// which is what makes those two responses identical by construction rather
+/// than by two authors keeping the same wording in step.
+fn sent_page(email: &str) -> String {
+    page(
+        "Check your email",
+        &format!(
+            "That link had already been used or had expired, so we've sent a \
+             fresh one to <strong>{}</strong>.",
+            escape_html(&email::mask(email))
+        ),
+    )
+}
+
+/// Wraps a rendered body in an HTML response.
+fn html_page(status: StatusCode, body: String) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
