@@ -370,8 +370,13 @@ mod ceremony {
     /// Wraps the data key under a newly enrolled passkey's KEK (spec 6.5).
     ///
     /// Returns the blob for `encryption_add_passkey_wrap`. `existing` is any
-    /// route this device can open right now; a locked session has to be
-    /// unlocked first, rather than handed an opener it cannot use.
+    /// route this device can open right now — an `Opener` is required
+    /// regardless of whether the session is locked or unlocked, because an
+    /// unlocked session holds only a *sealed* [`SessionKey`], which cannot
+    /// yield the raw bytes `wrapKey` needs. Adding a passkey therefore costs
+    /// three authenticator interactions every time: creating the new
+    /// credential, asserting against `existing`'s credential to re-derive the
+    /// raw key, and asserting against the new credential for its PRF output.
     pub async fn add_passkey_route(
         existing: &Opener<'_>,
         new_prf_output: &[u8],

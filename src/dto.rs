@@ -20,6 +20,15 @@ pub struct PasskeyListItem {
 /// future build writes and this one does not know still deserializes, and
 /// `crypto::choose_route` skips that row instead of the whole response
 /// failing to parse.
+///
+/// That forward compatibility runs one direction only: an *older* client
+/// reading a row a *newer* server wrote. On a rollback — an older server
+/// reading a row a newer client's server-side counterpart already wrote —
+/// `entry_key::store`'s `WrapRecord::into_wrap_row` parses `kind` back into
+/// `WrapKind` before this type ever gets built, and returns `Err` on an
+/// unrecognized one. `list_wraps` propagates that `Err` for the whole call,
+/// so one row of an unknown kind fails the entire response rather than being
+/// skipped the way `choose_route` skips it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapDto {
     pub kind: String,
