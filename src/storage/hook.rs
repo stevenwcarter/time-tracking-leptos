@@ -341,24 +341,6 @@ mod tests {
         owner.cleanup();
     }
 
-    /// The complement: with no write racing it, a load still publishes.
-    /// Bumping the generation unconditionally somewhere on the read path
-    /// would discard every load and leave the UI blank forever.
-    #[test]
-    fn an_unraced_load_still_publishes() {
-        let owner = Owner::new();
-        owner.with(|| {
-            let generation = StoredValue::new(Generation::default());
-            let in_flight = begin_operation(generation);
-            assert!(
-                generation
-                    .try_with_value(|g| g.is_current(in_flight))
-                    .unwrap_or(false)
-            );
-        });
-        owner.cleanup();
-    }
-
     /// The regression this guards against: the probe resolving must not
     /// restart the load. A restart blanks the value and republishes what
     /// storage holds, so anything typed since the load began — while the
@@ -454,5 +436,10 @@ mod tests {
 
     // `Generation`'s own behaviour (a stale load is discarded, a single
     // load is always current) is pinned once in `storage::tests`, where the
-    // type now lives — it is shared with `week_view`'s range load.
+    // type now lives — it is shared with `week_view`'s range load. A local
+    // `an_unraced_load_still_publishes` used to restate the second of those
+    // here; it called `begin_operation` and asserted the token was current,
+    // touching neither the read path nor `Persistent`, so it was a verbatim
+    // duplicate of `storage::a_single_load_is_always_current` wearing this
+    // module's name.
 }

@@ -257,6 +257,28 @@ pub enum KeyIdentity {
     Key(u64),
 }
 
+/// Which identity a state reduces to, given how many keys this page load
+/// has published.
+///
+/// Lifted out of [`EncryptionCtx::key_identity`] because that method cannot
+/// be driven both ways on the host: its only key-bearing state needs a
+/// [`SessionKey`], which is uninhabited off the browser, so a test over the
+/// states a host *can* build passes just as well against
+/// `fn key_identity(self) -> KeyIdentity { KeyIdentity::NoKey }`.
+///
+/// That implementation is not a hypothetical — it is the failure the whole
+/// `Memo` narrowing risks, and it fails quietly. `use_persistent`'s load
+/// subscribes to this, so if unlocking never produced a *new* identity the
+/// load would not re-run and a user who had just unlocked would go on seeing
+/// an empty day until they navigated somewhere else.
+fn identity_of(has_key: bool, keys: u64) -> KeyIdentity {
+    if has_key {
+        KeyIdentity::Key(keys)
+    } else {
+        KeyIdentity::NoKey
+    }
+}
+
 /// This account's encryption state, shared across the component tree.
 #[derive(Clone, Copy)]
 pub struct EncryptionCtx {
@@ -594,17 +616,13 @@ impl EncryptionCtx {
     /// storage load subscribes to instead of [`state`](Self::state).
     ///
     /// See [`KeyIdentity`] for why the load must not track the state's
-    /// shape.
+    /// shape, and [`identity_of`] for why the decision itself lives outside
+    /// this method.
     pub fn key_identity(self) -> KeyIdentity {
-        match self.state.get() {
-            EncryptionState::Unlocked(_) => {
-                KeyIdentity::Key(self.keys.try_get_value().unwrap_or_default())
-            }
-            EncryptionState::Unknown
-            | EncryptionState::Unreachable
-            | EncryptionState::Disabled
-            | EncryptionState::Locked => KeyIdentity::NoKey,
-        }
+        identity_of(
+            self.state.get().key().is_some(),
+            self.keys.try_get_value().unwrap_or_default(),
+        )
     }
 
     /// Whether `key` belongs to the account signed in *right now*.
@@ -985,11 +1003,45 @@ mod tests {
         owner.cleanup();
     }
 
-    /// The narrowing A1 turns on, at the unit level: every state without a
-    /// key reduces to one identity, so a `Memo` over it stays silent across
-    /// a transition between them. The reload that a notification would
-    /// trigger is what erased a keystroke made while the probe was still
-    /// running — `storage::hook` pins that end of it.
+    /// The narrowing A1 turns on, driven both ways — which is the whole
+    /// reason [`identity_of`] exists as a function rather than as three
+    /// match arms inside `key_identity`. Walking only the keyless states
+    /// would pass against an implementation that returned `NoKey` for
+    /// everything, and that implementation is the failure this guards.
+    ///
+    /// Each assertion is one half of the `Memo`'s job. Collapsing the
+    /// keyless states is what stops the probe resolving from restarting the
+    /// load — the restart that blanked a keystroke made while the probe was
+    /// still running (`storage::hook` pins that end of it). Telling two keys
+    /// apart is what makes an unlock re-run the load at all; without it a
+    /// user who had just unlocked would keep seeing an empty day.
+    #[test]
+    fn a_key_reads_as_a_new_identity_and_a_keyless_state_never_does() {
+        assert_eq!(identity_of(false, 0), KeyIdentity::NoKey);
+        assert_eq!(
+            identity_of(false, 7),
+            KeyIdentity::NoKey,
+            "the counter must not leak into a state that holds no key"
+        );
+        assert_eq!(identity_of(true, 1), KeyIdentity::Key(1));
+        assert_ne!(
+            identity_of(true, 1),
+            identity_of(true, 2),
+            "two unlocks must read as two keys, or the load that would reveal the second \
+             never re-runs"
+        );
+    }
+
+    /// The half of the same decision that `key_identity` itself owns: which
+    /// states have a key at all. Every state a host can build must reduce to
+    /// one identity, so a `Memo` over it stays silent across a transition
+    /// between them.
+    ///
+    /// `Unlocked` is absent because it needs a `SessionKey`, uninhabited
+    /// here — which is exactly why the arm that tells keys apart is tested
+    /// through `identity_of` above rather than through this. The counter's
+    /// own increment, in `publish`, has no host test for the same reason and
+    /// is guarded by reading.
     #[cfg(feature = "ssr")]
     #[test]
     fn every_keyless_state_shares_one_key_identity() {

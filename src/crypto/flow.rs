@@ -230,6 +230,30 @@ async fn open_existing_route(
     }
 }
 
+/// Refuses an assertion that did not come from the credential this step is
+/// for.
+///
+/// A named step with its own test rather than an inline `!=` inside
+/// [`add_passkey_key`], which is browser-only and so unreachable from
+/// `cargo test` in a project with no wasm runner. It is the only thing
+/// standing between "the wrap was filed under whichever credential happened
+/// to answer" and a success message: `target` would stay keyless while
+/// something else quietly gained a route, and the user would be told it
+/// worked.
+///
+/// A byte-for-byte comparison, length included. A prefix match would accept
+/// a shorter credential id as the longer one it starts with — the plausible
+/// way to get this wrong — so the test drives that case specifically.
+#[cfg(any(feature = "hydrate", test))]
+fn must_be_target(answered: &[u8], target: &[u8]) -> Result<(), String> {
+    if answered == target {
+        return Ok(());
+    }
+    Err("That wasn't the passkey this step is for. Start again and choose it when your \
+         browser asks for it."
+        .to_string())
+}
+
 /// Gives `target` its own route to the account's data key (spec 6.5).
 ///
 /// `wrapKey` needs the raw data key, and neither this device's keystore copy
@@ -264,13 +288,7 @@ pub async fn add_passkey_key(user: &str, target: &[u8], source: KeySource) -> Re
     let existing = open_existing_route(user, source, &wraps).await?;
 
     let fresh = assert_with_prf(user).await.map_err(assertion_message)?;
-    if fresh.credential_id != target {
-        return Err(
-            "That wasn't the passkey this step is for. Start again and choose it when \
-                    your browser asks for it."
-                .to_string(),
-        );
-    }
+    must_be_target(&fresh.credential_id, target)?;
 
     let wrapped = add_passkey_route(&existing.opener(), &fresh.prf_output)
         .await
@@ -360,6 +378,36 @@ mod tests {
         assert_eq!(
             credential_id_from_response(json),
             Some(vec![0xff, 0xfe, 0xfd])
+        );
+    }
+
+    /// The guard that keeps a wrap and its credential together. Adding a
+    /// passkey asks for two assertions and the user picks from a browser
+    /// list, so answering with the wrong one is an ordinary mistake rather
+    /// than an attack — and the outcome without this check is the bad kind
+    /// of silent: the new passkey stays keyless, some other credential gains
+    /// a second route it did not need, and the panel reports success.
+    ///
+    /// The prefix case is the one worth spelling out. A comparison that
+    /// stopped at the shorter length would accept `[1, 2]` as `[1, 2, 3]`,
+    /// and credential ids are opaque byte strings with no fixed length.
+    #[test]
+    fn only_the_credential_this_step_is_for_may_answer() {
+        assert!(must_be_target(b"cred-a", b"cred-a").is_ok());
+
+        let wrong = must_be_target(b"cred-b", b"cred-a").expect_err("a different credential");
+        assert!(
+            wrong.contains("wasn't the passkey this step is for"),
+            "the refusal must say which step went wrong: {wrong}"
+        );
+
+        assert!(
+            must_be_target(&[1, 2], &[1, 2, 3]).is_err(),
+            "a prefix is a different credential, not the same one"
+        );
+        assert!(
+            must_be_target(&[1, 2, 3], &[1, 2]).is_err(),
+            "and so is an extension of one"
         );
     }
 
