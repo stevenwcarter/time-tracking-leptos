@@ -70,7 +70,7 @@ impl From<crate::entry_key::store::WrapRow> for WrapDto {
 
 /// The signed-in account's encryption state, as seen from the browser.
 ///
-/// Just `enabled`: a server-computed "is migration pending" hint was
+/// No migration hint: a server-computed "is migration pending" flag was
 /// considered and dropped. The server never parses an entry body (invariant
 /// E1), so the best it could report was "encrypted and has any entry at
 /// all" — true forever once an account has saved anything, including long
@@ -79,7 +79,22 @@ impl From<crate::entry_key::store::WrapRow> for WrapDto {
 /// surface for one rarely-visited page. `/account` instead calls
 /// `entries_all` and runs the real, pure-function check
 /// (`rows_needing_migration`) itself when it needs the count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptionStatus {
+    /// Whose account this answer is about.
+    ///
+    /// The probe's two halves ask two different sources: this call answers
+    /// for whoever the *session cookie* names, while the keystore is read
+    /// under the address the *tab* is showing. Those are the same account
+    /// right up until a second tab signs in as somebody else, at which
+    /// point the cookie changes under this tab and nothing re-runs the
+    /// probe to notice. Carrying the address back makes the mismatch
+    /// checkable at the one place both halves meet
+    /// (`encryption_ctx::probe`), instead of leaving a tab free to seal one
+    /// account's rows under another account's key.
+    ///
+    /// Discloses nothing: the caller had to present that session to be
+    /// answered at all, and the header already renders the address.
+    pub account: String,
     pub enabled: bool,
 }

@@ -193,7 +193,8 @@ pub fn ImportBanner() -> impl IntoView {
                 // and a key would have nothing to open.
                 let bodies = bodies_in_range(Backend::Local, first, last, None)
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .rows;
 
                 let mut copied = 0;
                 for (date, body) in bodies {

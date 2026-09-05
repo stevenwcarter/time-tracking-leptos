@@ -788,6 +788,34 @@ it — the phase-1 spec's §10 convention.
   constant-pinning tests that assert their exact bytes, in the same spirit as
   `legacy_key_matches_the_dioxus_key`.
 
+- **E8. Nothing may assume `EncryptionCtx` is fresh; a stored row outranks
+  it.** Added after review, because both E7 and the mount gate had quietly
+  been relying on the opposite. `EncryptionCtx` is computed once per page
+  load and re-probed only when `AuthCtx::user` changes — there is no
+  `visibilitychange`, `focus`, `storage` or `BroadcastChannel` listener
+  anywhere — so a tab left open while encryption is enabled elsewhere goes
+  on reporting `Disabled` indefinitely. `Disabled` is `WriteKey::Plaintext`
+  and mounts an editable entry area, and `DayView`'s gate cannot correct it
+  because the gate keys off that same state.
+
+  What settles it is the row. `StorageError::Locked` can only arise from a
+  v2 row read by a session with no key, which is exactly
+  `EncryptionState::Locked`, so it is proof rather than a hint. *Guarded
+  by:* `hook::loaded_value` refusing to collapse `Locked` into an empty
+  value (`a_sealed_row_is_never_shown_as_nothing_saved`), `bodies_in_range`
+  carrying the same fact out of a range read as `RangeRead::sealed`, and
+  `EncryptionCtx::sealed_row_seen` re-probing from `Disabled`
+  (`a_sealed_row_moves_a_session_that_thinks_it_is_unencrypted`, and its
+  complement for the states it must leave alone).
+
+  The probe's own two halves are checked against each other for the same
+  reason: `encryption_status` answers for whoever the session cookie names,
+  while the keystore is read under the address the tab is showing, and the
+  two part company the moment a second tab signs in as somebody else.
+  `EncryptionStatus` therefore carries the account it answered for, and a
+  mismatch publishes `Unreachable` — which refuses writes — rather than a
+  conclusion about an account this tab is not showing.
+
 ## 12. Failure modes
 
 | Situation | Behaviour |

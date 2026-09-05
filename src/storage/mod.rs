@@ -544,6 +544,22 @@ fn keep_row<T>(date: NaiveDate, read: Result<T, StorageError>) -> Option<(NaiveD
     }
 }
 
+/// What one pass of [`decide_rows`] made of a range.
+///
+/// The flag travels with the rows because dropping a sealed row is not the
+/// same kind of loss as dropping a corrupt one. A corrupt row is a fact
+/// about that row; a sealed row is a fact about the *session* — it can only
+/// exist in an encrypted account, and only a session with no key can fail to
+/// open it — so it is the evidence that settles whether this page load's
+/// idea of the account is still true (see
+/// [`crate::encryption_ctx::EncryptionCtx::sealed_row_seen`]).
+#[cfg(any(feature = "hydrate", test))]
+struct DecidedRows<'a, K> {
+    rows: Vec<(NaiveDate, RowRead<'a, K>)>,
+    /// Whether at least one row was sealed against a session holding no key.
+    sealed: bool,
+}
+
 /// Decides every row of a range read, dropping (and logging) the ones that
 /// cannot be read at all.
 ///
@@ -558,12 +574,17 @@ fn keep_row<T>(date: NaiveDate, read: Result<T, StorageError>) -> Option<(NaiveD
 fn decide_rows<'a, K>(
     rows: Vec<(NaiveDate, String)>,
     session: Option<&'a K>,
-) -> Vec<(NaiveDate, RowRead<'a, K>)> {
-    rows.into_iter()
+) -> DecidedRows<'a, K> {
+    let mut sealed = false;
+    let rows = rows
+        .into_iter()
         .filter_map(|(date, raw)| {
-            keep_row(date, decide_row(&raw, session, StorageKey::TimeEntry(date)))
+            let read = decide_row(&raw, session, StorageKey::TimeEntry(date));
+            sealed |= matches!(read, Err(StorageError::Locked { .. }));
+            keep_row(date, read)
         })
-        .collect()
+        .collect();
+    DecidedRows { rows, sealed }
 }
 
 /// Opens every decided row, dropping (and logging) the ones that will not
@@ -592,6 +613,21 @@ where
     bodies
 }
 
+/// Every stored body a range read could open, and whether it had to leave
+/// any sealed.
+///
+/// The rows alone would be a lie by omission on a session whose state is out
+/// of date: a week of sealed days comes back empty and renders as "Nothing
+/// logged this week." The flag is what lets the caller tell that apart from
+/// a genuinely empty week and say so.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RangeRead {
+    pub rows: Vec<(NaiveDate, String)>,
+    /// Whether at least one row in the range was sealed against this
+    /// session. See [`DecidedRows`].
+    pub sealed: bool,
+}
+
 /// Every stored body in `[from, to]`, unwrapped and opened. Feeds the week
 /// view.
 ///
@@ -608,19 +644,23 @@ pub async fn bodies_in_range(
     from: NaiveDate,
     to: NaiveDate,
     session: Option<&SessionKey>,
-) -> Result<Vec<(NaiveDate, String)>, StorageError> {
+) -> Result<RangeRead, StorageError> {
     #[cfg(feature = "hydrate")]
     {
         let raw = match backend {
             Backend::Local => local::bodies_in_range(from, to).await?,
             Backend::Remote => remote::bodies_in_range(from, to).await?,
         };
-        Ok(open_rows(decide_rows(raw, session), open_row).await)
+        let decided = decide_rows(raw, session);
+        Ok(RangeRead {
+            rows: open_rows(decided.rows, open_row).await,
+            sealed: decided.sealed,
+        })
     }
     #[cfg(not(feature = "hydrate"))]
     {
         let _ = (backend, from, to, session);
-        Ok(Vec::new())
+        Ok(RangeRead::default())
     }
 }
 
@@ -804,7 +844,7 @@ mod tests {
                     d(2026, 9, 6),
                     None
                 )),
-                Ok(Vec::new()),
+                Ok(RangeRead::default()),
                 "{backend:?} must not return entries during SSR"
             );
         }
@@ -883,7 +923,7 @@ mod tests {
         ];
         let kept = decide_rows(rows, None::<&u8>);
         assert_eq!(
-            kept.iter().map(|(date, _)| *date).collect::<Vec<_>>(),
+            kept.rows.iter().map(|(date, _)| *date).collect::<Vec<_>>(),
             vec![d(2026, 9, 1), d(2026, 9, 3)],
             "the corrupt day must be dropped, not the whole week"
         );
@@ -895,7 +935,7 @@ mod tests {
             (d(2026, 9, 1), envelope::wrap_v1("a")),
             (d(2026, 9, 2), envelope::wrap_v1("b")),
         ];
-        assert_eq!(decide_rows(rows, None::<&u8>).len(), 2);
+        assert_eq!(decide_rows(rows, None::<&u8>).rows.len(), 2);
     }
 
     /// The same blast-radius rule for the failure this task introduces. A
@@ -909,12 +949,19 @@ mod tests {
             (d(2026, 9, 2), sealed(7)),
             (d(2026, 9, 3), envelope::wrap_v1("b")),
         ];
+        let decided = decide_rows(rows, None::<&u8>);
         assert_eq!(
-            decide_rows(rows, None::<&u8>)
+            decided
+                .rows
                 .iter()
                 .map(|(date, _)| *date)
                 .collect::<Vec<_>>(),
             vec![d(2026, 9, 1), d(2026, 9, 3)]
+        );
+        assert!(
+            decided.sealed,
+            "a row this session could not open must be reported, not only dropped: a week \
+             that came back short reads as an empty week"
         );
     }
 
@@ -943,10 +990,14 @@ mod tests {
             (d(2026, 9, 3), envelope::wrap_v1("b")),
         ];
         let decided = decide_rows(rows, Some(&SESSION));
-        assert_eq!(decided.len(), 3, "every row must survive the first pass");
+        assert_eq!(decided.rows.len(), 3, "every row must survive the first pass");
+        assert!(
+            !decided.sealed,
+            "a session holding a key met no sealed row, whatever the opener then did"
+        );
 
         assert_eq!(
-            block_on(open_rows(decided, open_or_fail)),
+            block_on(open_rows(decided.rows, open_or_fail)),
             vec![
                 (d(2026, 9, 1), "a".to_string()),
                 (d(2026, 9, 3), "b".to_string())
@@ -964,7 +1015,7 @@ mod tests {
             (d(2026, 9, 2), envelope::wrap_v1("b")),
         ];
         assert_eq!(
-            block_on(open_rows(decide_rows(rows, None::<&u8>), open_or_fail)),
+            block_on(open_rows(decide_rows(rows, None::<&u8>).rows, open_or_fail)),
             vec![
                 (d(2026, 9, 1), "a".to_string()),
                 (d(2026, 9, 2), "b".to_string())
@@ -983,7 +1034,7 @@ mod tests {
             (d(2026, 9, 2), sealed(7)),
             (d(2026, 9, 3), envelope::wrap_v1("b")),
         ];
-        let decided = decide_rows(rows, Some(&SESSION));
+        let decided = decide_rows(rows, Some(&SESSION)).rows;
         assert_eq!(decided.len(), 3, "a half-migrated range must lose no rows");
         assert!(matches!(&decided[0].1, RowRead::Plaintext(b) if b == "a"));
         assert!(

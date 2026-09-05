@@ -11,7 +11,12 @@ use leptos::prelude::*;
 
 use crate::dto::WrapDto;
 
-/// Whether the signed-in account is encrypted.
+/// Whether the signed-in account is encrypted, and which account that is.
+///
+/// The address is part of the answer rather than assumed by the caller: the
+/// session cookie decides who this is about, and a browser tab that was
+/// opened before somebody else signed in has no other way to find out it is
+/// now asking about a different account (see [`crate::dto::EncryptionStatus`]).
 ///
 /// The return type is spelled out with its full path rather than `use`d:
 /// `#[server]` generates a same-named arguments struct in this module for
@@ -31,7 +36,10 @@ pub async fn encryption_status() -> Result<crate::dto::EncryptionStatus, ServerF
     let enabled = store::is_encrypted(&mut conn, me.id)
         .map_err(super::log_and_fail("is_encrypted", "Internal server error"))?;
 
-    Ok(EncryptionStatus { enabled })
+    Ok(EncryptionStatus {
+        account: me.email,
+        enabled,
+    })
 }
 
 /// The signed-in user's own wraps. Scoped by `require_user`'s `me.id`, not

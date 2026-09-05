@@ -317,7 +317,7 @@ impl EncryptionCtx {
                 // changes the answer. Signing in reloads the page instead,
                 // so this effect meets that one as a fresh page load rather
                 // than as a change.
-                ctx.start_probe(auth.user.get());
+                ctx.start_probe(auth.user.get(), EncryptionState::Unknown);
             });
         }
 
@@ -370,16 +370,24 @@ impl EncryptionCtx {
         let _ = self.begin_probe();
     }
 
-    /// Starts a probe for `user`, discarding any probe still in flight.
+    /// Starts a probe for `user`, discarding any probe still in flight, and
+    /// parks the state at `meanwhile` until it answers.
     ///
     /// The token is captured synchronously, before the `spawn_local` below,
     /// for the reason `week_view`'s range load spells out: this can be
-    /// called again — from the effect, or from [`retry`](Self::retry) —
-    /// while an earlier probe is still awaiting the server, and reading the
-    /// token back out after the await would race that later run for the
-    /// increment.
+    /// called again — from the effect, from [`retry`](Self::retry), or from
+    /// [`sealed_row_seen`](Self::sealed_row_seen) — while an earlier probe
+    /// is still awaiting the server, and reading the token back out after
+    /// the await would race that later run for the increment.
+    ///
+    /// `meanwhile` is a parameter because the two reasons to probe start
+    /// from different amounts of knowledge. An ordinary probe knows nothing
+    /// and parks at [`EncryptionState::Unknown`]; a probe started because a
+    /// sealed row turned up has already been shown that the account is
+    /// encrypted, and parking that one at `Unknown` would throw the
+    /// evidence away for the width of a round trip.
     #[cfg(feature = "hydrate")]
-    fn start_probe(self, user: Option<String>) {
+    fn start_probe(self, user: Option<String>, meanwhile: EncryptionState) {
         let token = self.begin_probe();
 
         let Some(user) = user else {
@@ -394,7 +402,7 @@ impl EncryptionCtx {
         // reached for the previous account never survives into the next
         // one's render — the same reset `use_persistent` does when its key
         // changes.
-        self.publish(EncryptionState::Unknown);
+        self.publish(meanwhile);
 
         spawn_local(async move {
             let probed = probe(&user).await;
@@ -425,7 +433,64 @@ impl EncryptionCtx {
         // Untracked: this runs from a click handler rather than an effect,
         // so there is no dependency worth registering — and registering one
         // would make the handler's owner a subscriber of `AuthCtx`.
-        self.start_probe(self.auth.user.get_untracked());
+        self.start_probe(self.auth.user.get_untracked(), EncryptionState::Unknown);
+    }
+
+    /// Records that the storage seam met a row this session holds no key
+    /// for, and re-probes if that contradicts what the state says.
+    ///
+    /// This is the branch that keeps a long-lived tab honest. The state is
+    /// computed once per page load and re-probed only when `AuthCtx::user`
+    /// changes, so a tab left open while encryption is switched on
+    /// elsewhere — a second tab, another device — goes on reporting
+    /// [`EncryptionState::Disabled`] indefinitely. `Disabled` is
+    /// [`crate::storage::WriteKey::Plaintext`] and mounts an editable entry
+    /// area, so every day the migration has already sealed reads back as
+    /// [`crate::storage::StorageError::Locked`] and, if the seam collapsed
+    /// that to "nothing saved", would be shown as an empty box the next
+    /// keystroke overwrites for good.
+    ///
+    /// A sealed row is the evidence that settles it. Only an encrypted
+    /// account can hold one, and only a session with no key can fail to
+    /// open it — which is exactly [`EncryptionState::Locked`], so the probe
+    /// parks there rather than at `Unknown` while it confirms. The probe
+    /// still runs, because the row cannot say whether this *device* has a
+    /// key waiting in its keystore, and finding one is what turns the
+    /// unlock prompt back into the day.
+    ///
+    /// Every other state is left alone, and each for its own reason:
+    /// `Unknown` already has a probe on the way to the same answer;
+    /// `Locked` is the answer; `Unreachable` refuses writes and offers the
+    /// user a retry, and re-probing behind their back would trade a
+    /// truthful "we could not tell" for a spinner; and `Unlocked` cannot
+    /// produce a locked read at all.
+    pub fn sealed_row_seen(self) {
+        // Ungated so the storage seam can report the row from code that
+        // compiles on every target; the seam's load never runs on the
+        // server (`storage::hook`'s effect is browser-only), so what an
+        // `ssr` build gets is a no-op it never calls.
+        #[cfg(any(feature = "hydrate", test))]
+        {
+            if !matches!(self.state_untracked(), EncryptionState::Disabled) {
+                return;
+            }
+            #[cfg(feature = "hydrate")]
+            {
+                error!("a sealed row reached a session that believes this account is unencrypted");
+                // Parked at `Locked` rather than `Unknown` while the probe
+                // runs: the row has already proved that much, and throwing
+                // it away for the width of a round trip is what leaves the
+                // editable box on screen.
+                self.start_probe(self.auth.user.get_untracked(), EncryptionState::Locked);
+            }
+            // Off the browser there is no probe to start and no keystore to
+            // read, so the evidence is all there is to act on. The two
+            // arms publish the same state by different means, which is why
+            // the host test below pins the decision — which states act on a
+            // sealed row — rather than the mechanism.
+            #[cfg(not(feature = "hydrate"))]
+            self.publish(EncryptionState::Locked);
+        }
     }
 
     /// Publishes `state`, giving a newly unlocked key an identity of its
@@ -619,9 +684,31 @@ impl EncryptionCtx {
 
 /// The two reads behind the probe, in the order that avoids the second one
 /// whenever the first already settles the answer.
+///
+/// They ask two different sources about `user`, and the first of them
+/// answers for whoever the session cookie names rather than for `user`
+/// itself. Those are the same account until a second tab signs in as
+/// somebody else, at which point this tab's cookie changes underneath it and
+/// nothing re-runs this to notice. So the answer is checked against the
+/// account it was asked about before any of it is believed: publishing a
+/// conclusion drawn from one account's row while the keystore is read under
+/// another's is how one account's key comes to seal the other's entries.
 #[cfg(feature = "hydrate")]
 async fn probe(user: &str) -> EncryptionState {
     let status = match encryption_status().await {
+        Ok(status) if status.account != user => {
+            // Not `Disabled` and not `Locked`: neither is a fact about the
+            // account this tab is showing, and one of them writes plaintext.
+            // `Unreachable` says what is true — nothing was learned about
+            // *this* account — and refuses every write until something is.
+            // The retry it offers will keep landing here for as long as the
+            // cookie disagrees, which is the honest outcome: a tab whose
+            // session has been replaced needs a reload, not a spinner.
+            error!(
+                "this tab's session now belongs to another account; refusing to answer for it"
+            );
+            return EncryptionState::Unreachable;
+        }
         Ok(status) => status,
         Err(err) => {
             // Not `Disabled`. That is a conclusion about the account, and
@@ -791,6 +878,69 @@ mod tests {
                 !ctx.may_publish(in_flight),
                 "a probe in flight when the user signed out must not publish afterwards"
             );
+        });
+        owner.cleanup();
+    }
+
+    /// The branch that keeps a long-lived tab honest, at the level the host
+    /// can reach.
+    ///
+    /// `Disabled` is the state a tab holds when encryption was switched on
+    /// somewhere else after it loaded, and it is the dangerous one: it
+    /// writes plaintext and mounts an editable box. A sealed row proves it
+    /// wrong — only an encrypted account can hold one — and the state has to
+    /// move on that evidence, because nothing else will: the probe re-runs
+    /// on an `AuthCtx::user` change and there is no such change here.
+    ///
+    /// What this pins is the decision, not the mechanism. In the browser the
+    /// state moves by way of a fresh probe parked at `Locked`; here it moves
+    /// by a direct publish. Both arms answer the same question first — which
+    /// states a sealed row contradicts — and that is what an edit could
+    /// quietly get wrong.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn a_sealed_row_moves_a_session_that_thinks_it_is_unencrypted() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let ctx = EncryptionCtx::for_state(EncryptionState::Disabled);
+            assert!(matches!(
+                ctx.state_untracked().write_key(),
+                WriteKey::Plaintext
+            ));
+
+            ctx.sealed_row_seen();
+
+            assert!(
+                matches!(ctx.state(), EncryptionState::Locked),
+                "a row this session could not open must not leave it writing plaintext"
+            );
+            assert!(matches!(
+                ctx.state_untracked().write_key(),
+                WriteKey::Locked
+            ));
+        });
+        owner.cleanup();
+    }
+
+    /// The complement, and the reason this is a narrowing rather than a
+    /// blanket move. `Unknown` already has a probe on the way to the same
+    /// answer, and `Unreachable` is a conclusion the user was told about and
+    /// offered a retry for — overwriting either would trade a truthful state
+    /// for one this evidence does not establish (this device may well hold a
+    /// key).
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn a_sealed_row_leaves_a_state_that_already_refuses_writes_alone() {
+        let owner = Owner::new();
+        owner.with(|| {
+            for state in [EncryptionState::Unknown, EncryptionState::Unreachable] {
+                let ctx = EncryptionCtx::for_state(state);
+                ctx.sealed_row_seen();
+                assert!(
+                    !matches!(ctx.state(), EncryptionState::Locked),
+                    "a state that already refuses writes must not be overwritten"
+                );
+            }
         });
         owner.cleanup();
     }

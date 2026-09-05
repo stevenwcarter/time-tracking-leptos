@@ -103,18 +103,50 @@ impl Persistent {
     }
 }
 
+/// What a finished read leaves the day showing.
+///
+/// Two outcomes rather than a `String`, because one read failure must not
+/// be shown as "nothing saved": see [`loaded_value`].
+#[derive(Debug, PartialEq, Eq)]
+enum Loaded {
+    /// The text to publish — found, genuinely empty, or a failure it is safe
+    /// to render as empty.
+    Value(String),
+    /// The row is sealed and this session holds no key for it. There is
+    /// content here and the user cannot be shown it.
+    Sealed,
+}
+
 /// Collapses a storage read into the loaded state.
 ///
 /// Both "nothing stored" and "the read failed" become loaded-and-empty:
 /// leaving the value unloaded on error would strand the UI blank forever.
 /// A read failure is still logged first, so a corrupt value does not
 /// silently masquerade as "nothing saved".
-fn loaded_value(read: Result<Option<String>, StorageError>) -> String {
+///
+/// [`StorageError::Locked`] is the one failure that must not take that
+/// route, and the reason is what happens *next*. It means the row holds real
+/// ciphertext, so rendering it as "nothing saved" hands the user an empty
+/// box over a day that has content in it — and if the session believes the
+/// account is unencrypted, that box is editable and the next keystroke
+/// replaces the ciphertext with a plaintext row. The content is then gone,
+/// with the user having been shown nothing to suggest there was any. Every
+/// other error leaves the stored row exactly where it is.
+///
+/// The mount gate in `DayView` normally makes this unreachable, but it keys
+/// off the session state while the evidence is in the row: when the state is
+/// stale the gate does not fire, which is precisely when this matters (see
+/// [`EncryptionCtx::sealed_row_seen`]).
+fn loaded_value(read: Result<Option<String>, StorageError>) -> Loaded {
     match read {
-        Ok(value) => value.unwrap_or_default(),
+        Ok(value) => Loaded::Value(value.unwrap_or_default()),
+        Err(StorageError::Locked { key }) => {
+            error!("`{key}` is sealed and this session holds no key for it");
+            Loaded::Sealed
+        }
         Err(err) => {
             error!("failed to load persisted value, treating as empty: {err}");
-            String::new()
+            Loaded::Value(String::new())
         }
     }
 }
@@ -203,17 +235,23 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
         set_value.set(None);
 
         spawn_local(async move {
-            // A v2 row with no key to open it reads as
-            // `StorageError::Locked`, which `loaded_value` logs and shows as
-            // empty — the same as any other read failure.
             let loaded = loaded_value(load(backend, key, session.key()).await);
             // Discard if a newer load started while this one was in flight,
             // or if this component has since been unmounted.
             let is_current = generation
                 .try_with_value(|g| g.is_current(token))
                 .unwrap_or(false);
-            if is_current {
-                set_value.set(Some(loaded));
+            if !is_current {
+                return;
+            }
+            match loaded {
+                Loaded::Value(value) => set_value.set(Some(value)),
+                // Left unloaded — blank, not "nothing saved" — and reported
+                // to the context, which is the only thing that can correct
+                // a session state the row has just contradicted. Once it
+                // does, the gate above swaps this day for the unlock
+                // prompt, and an unlock re-runs this load with a key.
+                Loaded::Sealed => encryption.sealed_row_seen(),
             }
         });
     });
@@ -370,17 +408,48 @@ mod tests {
 
     #[test]
     fn found_value_is_loaded_as_is() {
-        assert_eq!(loaded_value(Ok(Some("saved".to_string()))), "saved");
+        assert_eq!(
+            loaded_value(Ok(Some("saved".to_string()))),
+            Loaded::Value("saved".to_string())
+        );
     }
 
     #[test]
     fn nothing_stored_becomes_loaded_and_empty() {
-        assert_eq!(loaded_value(Ok(None)), "");
+        assert_eq!(loaded_value(Ok(None)), Loaded::Value(String::new()));
     }
 
     #[test]
     fn read_failure_becomes_loaded_and_empty() {
-        assert_eq!(loaded_value(Err(StorageError::Unavailable)), "");
+        assert_eq!(
+            loaded_value(Err(StorageError::Unavailable)),
+            Loaded::Value(String::new())
+        );
+    }
+
+    /// The one read failure that must not be shown as "nothing saved", and
+    /// the only data-destroying path either half of this seam has.
+    ///
+    /// A sealed row means the day *has* content. Collapsing it to an empty
+    /// string renders "No projects found" over real ciphertext, and — on a
+    /// session that still believes the account is unencrypted, which is what
+    /// a tab left open across an enable elsewhere believes — hands the user
+    /// an editable box whose first keystroke replaces that ciphertext with a
+    /// plaintext row. Nothing downstream would flag it: a v1 row is exactly
+    /// what an un-migrated account legitimately holds.
+    ///
+    /// Asserted against the empty value specifically, not merely "not the
+    /// text", because empty is the answer that does the damage.
+    #[test]
+    fn a_sealed_row_is_never_shown_as_nothing_saved() {
+        let sealed = loaded_value(Err(StorageError::Locked {
+            key: StorageKey::TimeEntry(date(4)).as_key(),
+        }));
+        assert_eq!(
+            sealed,
+            Loaded::Sealed,
+            "a row this session cannot open must not read as an empty day"
+        );
     }
 
     // `Generation`'s own behaviour (a stale load is discarded, a single

@@ -21,7 +21,7 @@ use crate::components::unlock::{UnlockPrompt, UnlockReason};
 use crate::date::{parse_iso, to_iso, week_bounds};
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 use crate::storage::hook::session_identity;
-use crate::storage::{Backend, Generation, StorageError, bodies_in_range};
+use crate::storage::{Backend, Generation, RangeRead, StorageError, bodies_in_range};
 
 /// A week's totals, ready to render.
 ///
@@ -75,12 +75,16 @@ pub fn aggregate(rows: &[(NaiveDate, String)]) -> WeekTotals {
 /// Collapses a range read into rows, logging (rather than propagating) a
 /// failure — the same "loaded and empty beats stuck blank" tradeoff
 /// `hook::loaded_value` makes for a single day.
-fn loaded_rows(read: Result<Vec<(NaiveDate, String)>, StorageError>) -> Vec<(NaiveDate, String)> {
+///
+/// A failed range read is not sealed: nothing was read, so nothing was found
+/// sealed either, and claiming otherwise would have a dropped request move
+/// the account's encryption state.
+fn loaded_rows(read: Result<RangeRead, StorageError>) -> RangeRead {
     match read {
-        Ok(rows) => rows,
+        Ok(read) => read,
         Err(err) => {
             error!("failed to load week range, treating as empty: {err}");
-            Vec::new()
+            RangeRead::default()
         }
     }
 }
@@ -151,8 +155,8 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
             // A row this session cannot open is skipped like any other
             // unreadable one, costing its own day and no more — so a week
             // read while locked comes out short rather than wrong.
-            let rows = loaded_rows(bodies_in_range(backend, start, end, session.key()).await);
-            let computed = aggregate(&rows);
+            let read = loaded_rows(bodies_in_range(backend, start, end, session.key()).await);
+            let computed = aggregate(&read.rows);
             // `try_with_value`, not the panicking form: this component's
             // owner — and so this `StoredValue` — can already be disposed
             // by the time this resolves, e.g. the user navigated to
@@ -160,8 +164,18 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
             let is_current = generation
                 .try_with_value(|g| g.is_current(token))
                 .unwrap_or(false);
-            if is_current {
-                totals.set(Some(computed));
+            if !is_current {
+                return;
+            }
+            totals.set(Some(computed));
+            // Short is not the same as empty, and only the seam knows which
+            // this was. A session that believes the account is unencrypted
+            // would otherwise render a week of sealed days as "Nothing
+            // logged this week." and go on offering an editable day view
+            // behind it; reporting the sealed row is what moves the state
+            // and puts the unlock prompt up instead.
+            if read.sealed {
+                encryption.sealed_row_seen();
             }
         });
     });
@@ -381,13 +395,33 @@ mod tests {
 
     #[test]
     fn a_successful_range_read_is_returned_as_is() {
-        let rows = vec![(d(2026, 9, 1), "9-10 code1".to_string())];
-        assert_eq!(loaded_rows(Ok(rows.clone())), rows);
+        let read = RangeRead {
+            rows: vec![(d(2026, 9, 1), "9-10 code1".to_string())],
+            sealed: false,
+        };
+        assert_eq!(loaded_rows(Ok(read.clone())), read);
     }
 
+    /// Both halves, and the second is the one that matters: a sealed row is
+    /// evidence about the *session*, and it has to survive the collapse that
+    /// throws the failure away, or a week of sealed days goes on rendering
+    /// as an empty week.
+    #[test]
+    fn a_sealed_row_survives_the_collapse() {
+        let read = RangeRead {
+            rows: vec![(d(2026, 9, 1), "9-10 code1".to_string())],
+            sealed: true,
+        };
+        assert!(loaded_rows(Ok(read)).sealed);
+    }
+
+    /// A read that never happened found nothing sealed either: reporting one
+    /// would let a dropped request move the account's encryption state.
     #[test]
     fn a_failed_range_read_becomes_empty() {
-        assert_eq!(loaded_rows(Err(StorageError::Unavailable)), Vec::new());
+        let read = loaded_rows(Err(StorageError::Unavailable));
+        assert_eq!(read.rows, Vec::new());
+        assert!(!read.sealed, "a failed read learned nothing about the account");
     }
 }
 
