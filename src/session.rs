@@ -129,6 +129,41 @@ fn session_key() -> Vec<u8> {
     .clone()
 }
 
+/// `None` counts as an unset `SESSION_KEY`; `Some("")` counts the same way —
+/// an `.env` copied verbatim from `.env.example` leaves the variable
+/// *present* but empty, not absent, and that must be rejected identically.
+/// Split out from [`ensure_session_key_configured`] so that rule has a unit
+/// test that does not depend on the real process environment.
+fn session_key_problem(value: Option<&str>) -> Option<&'static str> {
+    match value {
+        Some(key) if !key.is_empty() => None,
+        _ => Some("SESSION_KEY must be set to a non-empty value in release builds"),
+    }
+}
+
+/// Fails fast, with an actionable message naming the variable, when
+/// `SESSION_KEY` is unset or empty in a release build.
+///
+/// Debug builds are exempt — [`session_key`] already falls back to an
+/// ephemeral, randomly generated key there (with its own warning), so
+/// `cargo leptos watch` needs no `.env` at all. `main` calls this once at
+/// startup, before serving any traffic, so a misconfigured deployment gets
+/// one clear error naming the variable instead of the panic buried inside
+/// `session_key`'s `OnceLock` initializer — which stays in place as a
+/// backstop for any future caller that reaches `issue`/`verify` without
+/// going through startup at all.
+#[cfg(feature = "ssr")]
+pub fn ensure_session_key_configured() -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let value = std::env::var("SESSION_KEY").ok();
+    match session_key_problem(value.as_deref()) {
+        Some(msg) => Err(msg.to_string()),
+        None => Ok(()),
+    }
+}
+
 #[cfg(feature = "ssr")]
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
@@ -234,6 +269,16 @@ mod tests {
             verify_at(&tok, now + 60, b"a-completely-different-key"),
             Err(SessionError::BadSignature)
         );
+    }
+
+    /// Pins the rule the security fix depends on: a present-but-empty
+    /// `SESSION_KEY` (what `.env.example` copied verbatim produces) must be
+    /// rejected exactly like an absent one, not treated as configured.
+    #[test]
+    fn session_key_problem_treats_empty_as_absent() {
+        assert!(session_key_problem(None).is_some());
+        assert!(session_key_problem(Some("")).is_some());
+        assert!(session_key_problem(Some("a-real-secret")).is_none());
     }
 
     #[test]

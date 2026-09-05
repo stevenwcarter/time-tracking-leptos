@@ -37,8 +37,8 @@ mode, because sign-in depends on it.
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `DATABASE_URL` | no | `./data/time-tracking.db` | SQLite file path. Its parent directory is created on first run. |
-| `SESSION_KEY` | **yes, in release builds** | none — the binary refuses to start without it | Signs session cookies. In a debug build an ephemeral key is generated instead, with a warning; sessions from it do not survive a restart. |
-| `PASSKEY_STATE_KEY` | no | falls back to `SESSION_KEY` | Signs in-flight WebAuthn ceremony state. Set it separately from `SESSION_KEY` so one leaked secret cannot forge the other — a domain tag keeps the two signatures apart even when they share a value. |
+| `SESSION_KEY` | **yes, in release builds** | none — the binary logs an error naming the variable and exits if it is unset or empty | Signs session cookies. In a debug build an ephemeral key is generated instead, with a warning; sessions from it do not survive a restart. That debug fallback does not extend to passkey ceremonies — see `PASSKEY_STATE_KEY`. |
+| `PASSKEY_STATE_KEY` | no | falls back to `SESSION_KEY` | Signs in-flight WebAuthn ceremony state. Set it separately from `SESSION_KEY` so one leaked secret cannot forge the other — a domain tag keeps the two signatures apart even when they share a value. Unlike `SESSION_KEY`, there is no ephemeral-key fallback in debug builds: if both this and `SESSION_KEY` are unset or empty, the first passkey ceremony panics, even in development. |
 | `MAGIC_LINK_TTL_SECONDS` | no | `900` | How long a magic-link sign-in token stays valid, in seconds. |
 | `SITE_BASE_URL` | no, but must be correct | `http://localhost:3000` | Absolute base URL used to build the links emailed for sign-in. Must match how users actually reach the app, or the emailed links point somewhere wrong. |
 | `SMTP_HOST` | no | unset | SMTP relay host. Unset is a supported development mode: sign-in links are logged to the server's output instead of emailed. |

@@ -3,6 +3,7 @@
 #[cfg(feature = "ssr")]
 mod server_main {
     use leptos::prelude::*;
+    use time_tracking_leptos::{session, test_support};
 
     pub async fn run() {
         dotenvy::dotenv().ok();
@@ -10,10 +11,20 @@ mod server_main {
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
         tracing_subscriber::fmt().with_env_filter(filter).init();
 
+        // Fail fast, before binding a socket or touching the database: an
+        // unset or empty SESSION_KEY must refuse to start in a release
+        // build, not fall back to a guessable key. See
+        // `session::ensure_session_key_configured` for why this check lives
+        // here rather than relying solely on the panic inside `session_key`.
+        if let Err(msg) = session::ensure_session_key_configured() {
+            tracing::error!("{msg}");
+            std::process::exit(1);
+        }
+
         let conf = get_configuration(None).expect("failed to read Leptos configuration");
         let addr = conf.leptos_options.site_addr;
 
-        let app = time_tracking_leptos::test_support::router().await;
+        let app = test_support::router().await;
 
         let listener = tokio::net::TcpListener::bind(&addr)
             .await

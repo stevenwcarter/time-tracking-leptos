@@ -49,7 +49,8 @@ ENV DATABASE_URL=/data/time-tracking.db
 VOLUME ["/data"]
 
 EXPOSE 80
-# SESSION_KEY has no default in a release build (see src/session.rs) — the
-# container exits immediately if it is not supplied at run time. Intended:
+# SESSION_KEY has no default in a release build (see src/session.rs and
+# main's startup check) — the container logs an error naming the variable
+# and exits immediately if it is unset OR left empty at run time. Intended:
 # refusing to boot beats silently signing every session with a guessable key.
 CMD ["/app/time-tracking-leptos"]

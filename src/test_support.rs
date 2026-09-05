@@ -1,9 +1,13 @@
 //! Router construction shared by `main` and the integration tests.
 //!
-//! [`router`] is the whole point of this module: `main` and `tests/routes.rs`
-//! call the exact same function, so a route-order test here pins the router
-//! that actually serves traffic rather than a copy of it that could drift.
-//! [`app_with_magic_link`] builds the same router around a test pool a
+//! [`router`] is the whole point of this module: it does no environment
+//! defaulting, and `main` calls it directly, so a deployment that forgets
+//! `SESSION_KEY` or `DATABASE_URL` gets production's real behaviour rather
+//! than a silently-substituted test value. [`test_router`] is the
+//! test-only entry point — it applies [`ensure_env_defaults`] and then
+//! delegates to the exact same `router`, so a route-order test still pins
+//! the router that actually serves traffic rather than a copy of it that
+//! could drift. [`app_with_magic_link`] builds the same router around a test pool a
 //! caller can mint tokens against directly, for tests that need to drive
 //! `/magic/{token}`. [`TestApp`] pairs a router with the exact pool and
 //! mailer it serves from, so a test can seed rows directly, drive them over
@@ -68,6 +72,10 @@ async fn server_fn_handler(
 /// A no-op wherever the environment already sets them, so production
 /// behaviour under `main` is unaffected.
 ///
+/// **Never call this from a path `main` reaches.** It exists solely to back
+/// [`test_router`] and the other test-only builders below; `main` calls
+/// [`router`] directly, which applies no defaulting at all.
+///
 /// `session::session_key()` memoizes in a `OnceLock`, so the default must
 /// land before anything else in this module first reads it.
 fn ensure_env_defaults() {
@@ -82,15 +90,32 @@ fn ensure_env_defaults() {
     }
 }
 
-/// Builds the full application router.
+/// Builds the full application router around the environment's actual
+/// configuration.
+///
+/// Does **no** environment defaulting — this is what `main` calls. A
+/// deployment that leaves `DATABASE_URL` unset gets `db::build_pool`'s real
+/// default (`./data/time-tracking.db`), and one that leaves `SESSION_KEY`
+/// unset or empty gets `session::session_key`'s real release-build panic
+/// (`main` fails faster than that, see `session::ensure_session_key_configured`).
+/// Neither ever silently falls back to a test value. Use [`test_router`] from
+/// a test that needs a working router with no `.env` file.
 pub async fn router() -> Router {
-    ensure_env_defaults();
-
     let pool = db::build_pool().expect("build database pool");
     db::run_migrations(&pool).expect("run migrations");
     let ctx = AppCtx::new(pool, email::Mailer::from_env());
 
     router_with_ctx(ctx)
+}
+
+/// [`router`], with [`ensure_env_defaults`] applied first.
+///
+/// The test-only entry point: it delegates to the exact same router
+/// construction `main` uses, so route-order tests built on it still pin
+/// production's router rather than a copy that could drift.
+pub async fn test_router() -> Router {
+    ensure_env_defaults();
+    router().await
 }
 
 /// Builds a router with a `Mailer::capture()` and a magic-link token already

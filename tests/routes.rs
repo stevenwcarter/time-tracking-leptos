@@ -8,11 +8,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-/// Builds the router exactly as `main` does. Kept in sync by construction:
-/// `time_tracking_leptos::test_support::router()` is the same function main
-/// calls.
+/// Builds the router exactly as `main` does, plus the safe test defaults a
+/// bare test binary needs. Kept in sync by construction: `test_router`
+/// applies `ensure_env_defaults` and then delegates to `test_support::router`
+/// — the same function `main` calls directly.
 async fn get(path: &str) -> (StatusCode, String) {
-    let app = time_tracking_leptos::test_support::router().await;
+    let app = time_tracking_leptos::test_support::test_router().await;
     let res = app
         .oneshot(
             Request::builder()
