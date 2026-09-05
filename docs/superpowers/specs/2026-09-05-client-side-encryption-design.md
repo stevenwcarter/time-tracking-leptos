@@ -167,10 +167,17 @@ Dispatch is on the row's own `v`, never on account state. A v1 row in an
 encrypted account still reads as plaintext. This is what makes a partial
 migration safe rather than corrupting.
 
-`envelope::unwrap` already errors on `v: 2` today, and
-`unknown_version_is_an_error` pins it. That test is *replaced*, not weakened:
-v2 becomes readable, and a new `v: 3` takes over as the unknown-version
-case.
+Phase 1's `envelope::unwrap` already errored on `v: 2`, and
+`unknown_version_is_an_error` pinned it. That test was *re-pointed*, not
+weakened: v2 became readable and `v: 3` took over as the unknown-version case.
+
+`unwrap` itself no longer exists. Implementation split it in two, which is
+better than the single async function §7.5 sketched: `plan_read`/`decide_row`
+are pure and host-testable, and `open_row` is the async browser-only half.
+Keeping one function would have forced either a `Locked` variant into
+`EnvelopeError` — where it does not belong, since being locked is a session
+state and not a defect in the envelope — or a dependency from `envelope` onto
+its parent's error type.
 
 ### 5.2 Schema
 
