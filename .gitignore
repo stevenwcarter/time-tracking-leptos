@@ -13,3 +13,6 @@
 # Local SQLite data directory (DATABASE_URL default) and local env overrides
 /data
 .env
+
+# Local SQLite database from a DATABASE_URL pointed at ./db (see .env.example)
+/db

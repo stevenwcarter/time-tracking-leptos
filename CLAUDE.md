@@ -151,6 +151,7 @@ Configuration section for what each variable does. Summarized here:
 | `MAGIC_LINK_TTL_SECONDS` | no | `900` |
 | `SITE_BASE_URL` | no (must be correct for emailed links) | `http://localhost:3000` |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | no | unset `SMTP_HOST` logs links instead of sending |
+| `SMTP_INSECURE` | no | unset — STARTTLS required; `1`/`true` drops TLS for a local catcher |
 | `WEBAUTHN_RP_ID` / `WEBAUTHN_RP_ORIGIN` / `WEBAUTHN_RP_NAME` | no | suit `localhost:3000` |
 | `RUST_LOG` | no | `info` |
 

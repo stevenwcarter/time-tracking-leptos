@@ -46,6 +46,7 @@ mode, because sign-in depends on it.
 | `SMTP_USER` | no | unset | SMTP auth username. |
 | `SMTP_PASS` | no | unset | SMTP auth password. |
 | `SMTP_FROM` | no | unset | The `From:` address on sign-in emails. |
+| `SMTP_INSECURE` | no | unset (STARTTLS required) | Set to `1` or `true` to connect with **no TLS at all**, for a local mail catcher that speaks none. Any other value, including `yes` and `on`, leaves STARTTLS required, so a typo cannot silently downgrade a relay. AUTH credentials cross the network in cleartext when this is on; the server logs a warning at startup naming the host. Never set it against a relay you do not own the wire to. |
 | `WEBAUTHN_RP_ID` | no | `localhost` | WebAuthn relying-party ID. |
 | `WEBAUTHN_RP_ORIGIN` | no | `http://localhost:3000` | WebAuthn relying-party origin. Must match the browser's origin exactly, scheme included, or every passkey ceremony fails with an origin mismatch. |
 | `WEBAUTHN_RP_NAME` | no | `Time Tracker` | Relying-party name shown in the browser's own passkey UI. |
@@ -81,6 +82,30 @@ changes where entries are stored, and nothing else about how the app is used:
 
 See the Configuration section above for the SMTP settings that control
 magic-link email and the `WEBAUTHN_RP_*` settings that control passkeys.
+
+### Seeing sign-in emails locally
+
+With `SMTP_HOST` unset, sign-in links are written to the server's log — enough
+to click through, and the lowest-setup option. To exercise the real send path
+instead, `docker-compose.yml` runs [Mailpit](https://mailpit.axllent.org/), a
+catcher that accepts any credentials and speaks no TLS:
+
+```bash
+docker compose up -d mailpit   # SMTP on :2025, web UI on http://localhost:9025
+```
+
+```dotenv
+SMTP_HOST=localhost
+SMTP_PORT=2025
+SMTP_USER=dev
+SMTP_PASS=dev
+SMTP_FROM=Time Tracker Dev <dev@example.com>
+SMTP_INSECURE=true
+```
+
+`SMTP_INSECURE` is what makes this work: without it the transport requires
+STARTTLS, which Mailpit does not offer, and every send fails with "STARTTLS is
+not supported on this server". Sign-in emails then appear in the web UI.
 
 ## Architecture
 

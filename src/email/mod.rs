@@ -29,7 +29,8 @@ pub struct CaptureMailer {
     sent: Arc<Mutex<Vec<OutboundEmail>>>,
 }
 
-/// A STARTTLS SMTP relay, built once at startup and cloned per request.
+/// An SMTP relay, built once at startup and cloned per request. STARTTLS by
+/// default; plaintext only where `SMTP_INSECURE` explicitly asks for it.
 #[derive(Clone)]
 pub struct SmtpMailer {
     from: String,
@@ -87,25 +88,98 @@ impl Mailer {
     }
 }
 
+/// How the SMTP connection is protected.
+///
+/// A local mail catcher — Mailpit, MailHog — speaks no TLS at all, so a
+/// STARTTLS transport cannot talk to it: the connection dies at "STARTTLS is
+/// not supported on this server" before a message is ever offered.
+/// `Plaintext` exists for exactly that case and nothing else. Against a real
+/// relay it puts the AUTH credentials on the wire in the clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmtpSecurity {
+    StartTls,
+    Plaintext,
+}
+
+impl SmtpSecurity {
+    /// Reads the posture from a raw `SMTP_INSECURE` value.
+    ///
+    /// Only `1` and `true` opt out of TLS, ignoring case and surrounding
+    /// whitespace. Everything else keeps STARTTLS — including plausible
+    /// near-misses like `yes` and `on`, so that no typo can quietly downgrade
+    /// a production relay. Failing closed is the whole point: the cost of
+    /// rejecting `yes` is one confused developer, and the cost of accepting a
+    /// typo is credentials in cleartext.
+    fn from_env_value(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("1" | "true") => Self::Plaintext,
+            _ => Self::StartTls,
+        }
+    }
+}
+
+/// Everything `SmtpMailer` needs, separated from where it came from so a test
+/// can build a transport without mutating the process environment.
+struct SmtpSettings {
+    host: String,
+    port: u16,
+    user: String,
+    pass: String,
+    from: String,
+    security: SmtpSecurity,
+}
+
+impl SmtpSettings {
+    fn from_env() -> Option<Self> {
+        let insecure = std::env::var("SMTP_INSECURE").ok();
+        Some(Self {
+            host: std::env::var("SMTP_HOST").ok().filter(|s| !s.is_empty())?,
+            port: std::env::var("SMTP_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(587),
+            user: std::env::var("SMTP_USER").ok().filter(|s| !s.is_empty())?,
+            pass: std::env::var("SMTP_PASS").ok().filter(|s| !s.is_empty())?,
+            from: std::env::var("SMTP_FROM").ok().filter(|s| !s.is_empty())?,
+            security: SmtpSecurity::from_env_value(insecure.as_deref()),
+        })
+    }
+}
+
 impl SmtpMailer {
     fn from_env() -> Option<Self> {
+        Self::new(SmtpSettings::from_env()?)
+    }
+
+    fn new(settings: SmtpSettings) -> Option<Self> {
         use lettre::transport::smtp::authentication::Credentials;
 
-        let host = std::env::var("SMTP_HOST").ok().filter(|s| !s.is_empty())?;
-        let port = std::env::var("SMTP_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(587);
-        let user = std::env::var("SMTP_USER").ok().filter(|s| !s.is_empty())?;
-        let pass = std::env::var("SMTP_PASS").ok().filter(|s| !s.is_empty())?;
-        let from = std::env::var("SMTP_FROM").ok().filter(|s| !s.is_empty())?;
+        let builder = match settings.security {
+            SmtpSecurity::StartTls => {
+                lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::starttls_relay(&settings.host)
+                    .ok()?
+            }
+            SmtpSecurity::Plaintext => {
+                tracing::warn!(
+                    host = %settings.host,
+                    port = settings.port,
+                    "SMTP_INSECURE is set: connecting without TLS. Credentials will \
+                     cross the network in the clear — local mail catchers only."
+                );
+                lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::builder_dangerous(
+                    &settings.host,
+                )
+            }
+        };
 
-        let transport = lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::starttls_relay(&host)
-            .ok()?
-            .port(port)
-            .credentials(Credentials::new(user, pass))
+        let transport = builder
+            .port(settings.port)
+            .credentials(Credentials::new(settings.user, settings.pass))
             .build();
-        Some(Self { from, transport })
+        Some(Self {
+            from: settings.from,
+            transport,
+        })
     }
 
     async fn send(&self, email: OutboundEmail) -> anyhow::Result<()> {
@@ -221,5 +295,163 @@ mod tests {
         assert_eq!(mask("alice@example.com"), "ali•••@example.com");
         assert_eq!(mask("ab@example.com"), "•••@example.com");
         assert_eq!(mask("not-an-address"), "•••");
+    }
+
+    /// `SMTP_INSECURE` fails closed. Only the two documented spellings turn
+    /// TLS off; a typo leaves a production relay encrypted.
+    #[test]
+    fn only_1_and_true_disable_tls() {
+        for on in ["1", "true", "TRUE", "  True  "] {
+            assert_eq!(
+                SmtpSecurity::from_env_value(Some(on)),
+                SmtpSecurity::Plaintext,
+                "{on:?} should disable TLS"
+            );
+        }
+        for off in ["0", "false", "yes", "on", "ture", ""] {
+            assert_eq!(
+                SmtpSecurity::from_env_value(Some(off)),
+                SmtpSecurity::StartTls,
+                "{off:?} must not disable TLS"
+            );
+        }
+        assert_eq!(
+            SmtpSecurity::from_env_value(None),
+            SmtpSecurity::StartTls,
+            "an unset variable must not disable TLS"
+        );
+    }
+
+    /// A single-connection SMTP server that speaks just enough of the protocol
+    /// to accept one message, and that advertises **no STARTTLS**. That
+    /// omission is the point: it is the shape of a local mail catcher, and the
+    /// reason `SMTP_INSECURE` has to exist at all.
+    ///
+    /// Returns the port it listens on and the commands it received. Blocking
+    /// std sockets on their own thread, so the test needs no extra tokio
+    /// features and cannot deadlock the runtime driving lettre.
+    fn spawn_smtp_stub() -> (u16, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().expect("stub address").port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut out = stream.try_clone().expect("clone stream");
+            let mut reader = BufReader::new(stream);
+            let mut in_data = false;
+            let mut line = String::new();
+
+            out.write_all(b"220 stub ESMTP\r\n").expect("greeting");
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let command = line.trim_end_matches(['\r', '\n']).to_string();
+
+                if in_data {
+                    // Message body — everything up to the lone dot.
+                    if command == "." {
+                        in_data = false;
+                        let _ = out.write_all(b"250 2.0.0 queued\r\n");
+                    }
+                    continue;
+                }
+
+                let upper = command.to_ascii_uppercase();
+                recorder
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(command);
+
+                let reply: &[u8] = if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+                    // Note what is absent: no `250-STARTTLS`.
+                    b"250-stub\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n"
+                } else if upper.starts_with("AUTH") {
+                    b"235 2.7.0 authenticated\r\n"
+                } else if upper.starts_with("DATA") {
+                    in_data = true;
+                    b"354 go ahead\r\n"
+                } else if upper.starts_with("QUIT") {
+                    let _ = out.write_all(b"221 2.0.0 bye\r\n");
+                    break;
+                } else {
+                    b"250 2.0.0 ok\r\n"
+                };
+                if out.write_all(reply).is_err() {
+                    break;
+                }
+            }
+        });
+
+        (port, seen)
+    }
+
+    fn stub_settings(port: u16, security: SmtpSecurity) -> SmtpSettings {
+        SmtpSettings {
+            host: "127.0.0.1".into(),
+            port,
+            user: "dev".into(),
+            pass: "dev".into(),
+            from: "Dev <dev@example.com>".into(),
+            security,
+        }
+    }
+
+    fn sample_email() -> OutboundEmail {
+        OutboundEmail {
+            to: "alice@example.com".into(),
+            subject: "sign in".into(),
+            text: "link".into(),
+            html: None,
+        }
+    }
+
+    /// The regression this exists for: against a catcher with no TLS, the
+    /// default transport cannot deliver at all.
+    #[tokio::test]
+    async fn starttls_cannot_reach_a_catcher_that_offers_no_starttls() {
+        let (port, _seen) = spawn_smtp_stub();
+        let mailer =
+            SmtpMailer::new(stub_settings(port, SmtpSecurity::StartTls)).expect("build transport");
+
+        let err = mailer
+            .send(sample_email())
+            .await
+            .expect_err("a STARTTLS transport must refuse a server without it");
+        assert!(
+            err.to_string().to_lowercase().contains("starttls"),
+            "expected a STARTTLS failure, got: {err}"
+        );
+    }
+
+    /// …and with `SMTP_INSECURE` the same catcher receives the message,
+    /// credentials and all.
+    #[tokio::test]
+    async fn plaintext_delivers_to_a_catcher_that_offers_no_starttls() {
+        let (port, seen) = spawn_smtp_stub();
+        let mailer =
+            SmtpMailer::new(stub_settings(port, SmtpSecurity::Plaintext)).expect("build transport");
+
+        mailer.send(sample_email()).await.expect("plaintext send");
+
+        let commands = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let starts_with = |prefix: &str| {
+            commands
+                .iter()
+                .any(|c| c.to_ascii_uppercase().starts_with(prefix))
+        };
+        assert!(
+            starts_with("AUTH"),
+            "credentials must still be offered on the plaintext transport: {commands:?}"
+        );
+        assert!(
+            starts_with("DATA"),
+            "the message must reach the catcher: {commands:?}"
+        );
     }
 }
