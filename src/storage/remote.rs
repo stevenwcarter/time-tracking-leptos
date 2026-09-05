@@ -32,7 +32,7 @@ pub async fn store(key: StorageKey, envelope: &str) -> Result<(), StorageError> 
 /// empty row keeps the day's `updated_at` meaningful. It also means clear
 /// and save take the same path, so there is one less server fn to authorize.
 pub async fn clear(key: StorageKey) -> Result<(), StorageError> {
-    store(key, &envelope::wrap("")).await
+    store(key, &envelope::wrap_v1("")).await
 }
 
 pub async fn dates_with_entries(

@@ -73,7 +73,7 @@ pub fn resolve_load(
         key: LEGACY_KEY.to_string(),
         source,
     })?;
-    Ok(Some(envelope::wrap(&body)))
+    Ok(Some(envelope::wrap_v1(&body)))
 }
 
 /// Whether writing `written` supersedes the legacy alias.
@@ -303,7 +303,7 @@ mod tests {
     /// A dated value always wins, and comes back as-is.
     #[test]
     fn dated_value_is_used_when_present() {
-        let dated = Some(envelope::wrap("dated-body"));
+        let dated = Some(envelope::wrap_v1("dated-body"));
         let legacy = Some("\"legacy-body\"".to_string());
         let got = resolve_load(d(2026, 9, 4), TODAY(), dated.clone(), legacy).expect("resolve");
         assert_eq!(got, dated);
@@ -318,7 +318,7 @@ mod tests {
         let got = resolve_load(d(2026, 9, 4), TODAY(), None, legacy).expect("resolve");
         assert_eq!(
             got,
-            Some(envelope::wrap("legacy-body")),
+            Some(envelope::wrap_v1("legacy-body")),
             "the legacy value must be normalized into an envelope"
         );
     }
@@ -338,7 +338,7 @@ mod tests {
     /// even if the legacy key has not been cleaned up yet.
     #[test]
     fn legacy_value_is_ignored_once_a_dated_value_exists() {
-        let dated = Some(envelope::wrap(""));
+        let dated = Some(envelope::wrap_v1(""));
         let legacy = Some("\"legacy-body\"".to_string());
         let got = resolve_load(d(2026, 9, 4), TODAY(), dated.clone(), legacy).expect("resolve");
         assert_eq!(got, dated, "an empty-but-present dated value still wins");

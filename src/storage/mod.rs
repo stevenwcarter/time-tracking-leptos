@@ -172,7 +172,7 @@ pub fn store(
     key: StorageKey,
     value: &str,
 ) -> impl Future<Output = Result<(), StorageError>> {
-    let wrapped = envelope::wrap(value);
+    let wrapped = envelope::wrap_v1(value);
     async move {
         #[cfg(feature = "hydrate")]
         {
@@ -368,7 +368,7 @@ mod tests {
     /// only its own day, not the whole range.
     #[test]
     fn a_bad_envelope_is_skipped_but_the_rest_of_the_range_survives() {
-        let good = envelope::wrap("9-10 code1");
+        let good = envelope::wrap_v1("9-10 code1");
         let rows = vec![
             (d(2026, 9, 1), good.clone()),
             (d(2026, 9, 2), "not an envelope".to_string()),
@@ -385,8 +385,8 @@ mod tests {
     #[test]
     fn every_valid_envelope_is_kept() {
         let rows = vec![
-            (d(2026, 9, 1), envelope::wrap("a")),
-            (d(2026, 9, 2), envelope::wrap("b")),
+            (d(2026, 9, 1), envelope::wrap_v1("a")),
+            (d(2026, 9, 2), envelope::wrap_v1("b")),
         ];
         assert_eq!(unwrap_bodies(rows).len(), 2);
     }
