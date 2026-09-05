@@ -33,7 +33,7 @@ chrono = { version = "0.4", default-features = false, features = [
 ] }
 # Shared between hydrate and ssr — the phase-2 envelope is read and written
 # by both the browser and the server.
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 
 # Hydrate-only (wasm).
 console_error_panic_hook = { version = "0.1", optional = true }
@@ -141,7 +141,6 @@ hydrate = [
   "dep:wasm-bindgen-futures",
   "dep:js-sys",
   "dep:web-sys",
-  "dep:base64",
 ]
 ssr = [
   "leptos/ssr",
@@ -156,7 +155,6 @@ ssr = [
   "dep:libsqlite3-sys",
   "dep:lettre",
   "dep:ring",
-  "dep:base64",
   "dep:hex",
   "dep:uuid",
   "dep:anyhow",
