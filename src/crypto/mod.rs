@@ -30,6 +30,19 @@ pub use self::ceremony::{
     unlock_with_prf, unlock_with_recovery,
 };
 
+/// The unlocked data key, on a target that has no WebCrypto.
+///
+/// Uninhabited on purpose. The storage seam takes `Option<&SessionKey>` on
+/// every target so that its signatures — and the `ssr` tests that call them —
+/// do not fork on cfg. Giving the non-browser build a type with no values
+/// turns "there is no session key outside the browser" into something the
+/// compiler enforces rather than something each `ssr` branch has to remember:
+/// `Some` is not constructible here, so a server render cannot come to hold a
+/// key even by mistake (spec sections 7.4, 9.1).
+#[cfg(not(feature = "hydrate"))]
+#[derive(Clone)]
+pub enum SessionKey {}
+
 /// The wrap this device is going to try to open, picked out of the rows the
 /// server offered.
 ///

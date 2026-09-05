@@ -74,7 +74,11 @@ impl Persistent {
             // stands — but it must not be silent either: Safari private
             // browsing and a quota-exceeded `setItem` both throw, and the
             // user would otherwise lose data with nothing to explain why.
-            if let Err(err) = store(backend, key, &value).await {
+            // `None`: Task 12 threads the real key here, out of
+            // `EncryptionCtx`. Until then every write is a v1 envelope,
+            // which is exactly what an account with encryption off writes
+            // anyway.
+            if let Err(err) = store(backend, key, &value, None).await {
                 error!("failed to persist value for {key:?}: {err}");
             }
         });
@@ -142,7 +146,11 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
         set_value.set(None);
 
         spawn_local(async move {
-            let loaded = loaded_value(load(backend, key).await);
+            // `None`: Task 12 threads the real key here, out of
+            // `EncryptionCtx`. Until then a v2 row reads as
+            // `StorageError::Locked`, which `loaded_value` logs and shows as
+            // empty — the same as any other read failure.
+            let loaded = loaded_value(load(backend, key, None).await);
             // Discard if a newer load started while this one was in flight,
             // or if this component has since been unmounted.
             let is_current = generation

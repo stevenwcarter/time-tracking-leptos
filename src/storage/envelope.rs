@@ -1,11 +1,13 @@
 //! The versioned wrapper every stored entry body is written inside.
 //!
-//! Phase 1 writes `{"v":1,"alg":"none","body":"..."}`. Phase 2 writes
+//! Phase 1 wrote `{"v":1,"alg":"none","body":"..."}`. Phase 2 writes
 //! `{"v":2,"alg":"a256gcm","n":"...","ct":"..."}` (the wire shape lives in
-//! [`crate::crypto::wire`]). [`plan_read`] can already tell the two apart;
-//! only the key-taking encrypt/decrypt step is still to come, in a later
-//! task. The version tag is what lets that arrive with no migration and no
-//! guessing: a reader always knows what it is holding from the row alone.
+//! [`crate::crypto::wire`]). Which of the two [`wrap`] produces is decided by
+//! whether the session holds a key; which of the two a *reader* gets is never
+//! asked here at all — [`plan_read`] dispatches on the row's own `v` (spec
+//! E3). The version tag is what lets both shapes coexist in one account with
+//! no migration and no guessing: a reader always knows what it is holding
+//! from the row alone.
 //!
 //! This sits *above* [`super::codec`], which handles the gloo-compatible
 //! JSON-string encoding on the `localStorage` side. Two layers, two jobs:
@@ -14,6 +16,10 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "hydrate")]
+use crate::crypto::SessionKey;
+#[cfg(feature = "hydrate")]
+use crate::crypto::subtle::CryptoError;
 use crate::crypto::wire::{self, Sealed, WireError};
 
 const VERSION: u8 = 1;
@@ -85,7 +91,11 @@ pub fn plan_read(raw: &str) -> Result<ReadPlan, EnvelopeError> {
     }
 }
 
-/// Wraps a plaintext body for storage.
+/// Wraps a plaintext body for storage, unsealed.
+///
+/// Still the whole story for a signed-out device, whose `localStorage` is
+/// never encrypted, and for the legacy blob `local::resolve_load` normalizes
+/// into an envelope so the read path stays uniform.
 pub fn wrap_v1(body: &str) -> String {
     let env = Envelope {
         v: VERSION,
@@ -96,16 +106,23 @@ pub fn wrap_v1(body: &str) -> String {
     serde_json::to_string(&env).expect("envelope must serialize")
 }
 
-/// Reads a body back out of a stored envelope.
+/// Wraps a body for storage, sealing it first when the session holds a key.
 ///
-/// Temporary: a thin shim over [`plan_read`] for callers that don't yet
-/// carry a session key and so can only ever handle the plaintext branch. A
-/// later task (once `SessionKey` exists) replaces every call site with
-/// `plan_read` plus a decrypt step, and this goes away.
-pub fn unwrap(raw: &str) -> Result<String, EnvelopeError> {
-    match plan_read(raw)? {
-        ReadPlan::Plaintext(body) => Ok(body),
-        ReadPlan::Sealed(_) => Err(EnvelopeError::UnsupportedVersion(wire::V2)),
+/// The write half of the version dispatch, and the *only* place it is made:
+/// `None` writes v1, `Some` writes v2. The read half never consults this
+/// choice — it reads each row's own `v` (spec E3) — which is exactly what
+/// lets a half-migrated account keep working: new writes land as v2 while
+/// the rows the migration has not reached yet still read as v1.
+///
+/// Browser-only, because sealing is: the plaintext branch could run
+/// anywhere, but a function that silently degrades to writing plaintext on a
+/// target where `Some` cannot exist is the wrong shape for the one call that
+/// decides whether a body is encrypted.
+#[cfg(feature = "hydrate")]
+pub async fn wrap(body: &str, session: Option<&SessionKey>) -> Result<String, CryptoError> {
+    match session {
+        None => Ok(wrap_v1(body)),
+        Some(session) => Ok(wire::encode_v2(&session.seal(body).await?)),
     }
 }
 
@@ -113,10 +130,13 @@ pub fn unwrap(raw: &str) -> Result<String, EnvelopeError> {
 mod tests {
     use super::*;
 
+    /// A body with a newline in it: entries are multi-line by nature, and
+    /// the JSON encoding is the only thing standing between that and a
+    /// mangled round trip.
     #[test]
-    fn round_trips_a_body() {
+    fn round_trips_a_multiline_body() {
         let body = "11:45-12:15 code1\n- did a thing";
-        assert_eq!(unwrap(&wrap_v1(body)).expect("round trip"), body);
+        assert!(matches!(plan_read(&wrap_v1(body)), Ok(ReadPlan::Plaintext(b)) if b == body));
     }
 
     /// Pins invariant I8. The version and algorithm tags are what let phase 2
@@ -130,40 +150,12 @@ mod tests {
         assert_eq!(v["body"], "x");
     }
 
-    /// The compatibility shim's one nontrivial behavior: unlike `plan_read`,
-    /// it must refuse a v2 row rather than ever return ciphertext as if it
-    /// were the plaintext body.
-    #[test]
-    fn unwrap_refuses_a_sealed_v2_row() {
-        let raw = wire::encode_v2(&Sealed {
-            nonce: vec![0; wire::NONCE_LEN],
-            ciphertext: vec![9, 9, 9],
-        });
-        assert!(matches!(
-            unwrap(&raw),
-            Err(EnvelopeError::UnsupportedVersion(wire::V2))
-        ));
-    }
-
-    #[test]
-    fn unknown_algorithm_is_an_error() {
-        let odd = r#"{"v":1,"alg":"rot13","body":"x"}"#;
-        assert!(matches!(unwrap(odd), Err(EnvelopeError::UnsupportedAlg(_))));
-    }
-
     #[test]
     fn malformed_json_is_an_error() {
         assert!(matches!(
             plan_read("not json"),
             Err(EnvelopeError::Malformed(_))
         ));
-    }
-
-    /// An empty body is a real, meaningful state (`Some("")` in the hook's
-    /// tri-state) and must survive the round trip distinctly from absence.
-    #[test]
-    fn empty_body_round_trips() {
-        assert_eq!(unwrap(&wrap_v1("")).expect("round trip"), "");
     }
 
     /// Spec E3. Dispatch is on the row's own version, never on account state.

@@ -175,7 +175,11 @@ pub fn ImportBanner() -> impl IntoView {
                 let (Some(&first), Some(&last)) = (days.first(), days.last()) else {
                     return;
                 };
-                let bodies = bodies_in_range(Backend::Local, first, last)
+                // `None`: Task 12 threads the real key here, out of
+                // `EncryptionCtx`. The read side is signed-out
+                // `localStorage`, which is never encrypted, so `None` is
+                // already the right answer for it.
+                let bodies = bodies_in_range(Backend::Local, first, last, None)
                     .await
                     .unwrap_or_default();
 
@@ -187,7 +191,12 @@ pub fn ImportBanner() -> impl IntoView {
                     // Local copies are deliberately left in place: a failed
                     // import then loses nothing, and signing out still
                     // leaves the user their data.
-                    if store(Backend::Remote, StorageKey::TimeEntry(date), &body)
+                    // `None`: Task 12 threads the real key here, out of
+                    // `EncryptionCtx`. This one is the write side, into the
+                    // signed-in account — so until Task 12 lands, an import
+                    // into an encrypted account would write v1 rows the
+                    // migration then has to pick up.
+                    if store(Backend::Remote, StorageKey::TimeEntry(date), &body, None)
                         .await
                         .is_ok()
                     {

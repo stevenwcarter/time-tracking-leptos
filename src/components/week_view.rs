@@ -132,7 +132,11 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
         totals.set(None);
 
         spawn_local(async move {
-            let rows = loaded_rows(bodies_in_range(backend, start, end).await);
+            // `None`: Task 12 threads the real key here, out of
+            // `EncryptionCtx`. Until then a sealed row is skipped like any
+            // other unreadable one, so a signed-in week reads as empty
+            // rather than wrong.
+            let rows = loaded_rows(bodies_in_range(backend, start, end, None).await);
             let computed = aggregate(&rows);
             // `try_with_value`, not the panicking form: this component's
             // owner — and so this `StoredValue` — can already be disposed
