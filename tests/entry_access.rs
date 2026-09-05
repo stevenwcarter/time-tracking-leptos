@@ -85,3 +85,95 @@ async fn malformed_dates_and_wide_ranges_are_rejected() {
         "range too wide"
     );
 }
+
+/// The read half of the encryption migration pass (spec section 8): no date
+/// bounds, and scoped to the caller the same as every other read here.
+#[tokio::test]
+async fn entries_all_returns_every_row_for_the_caller_only() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+    let mallory = signed_in_as(&app, "mallory@example.com").await;
+
+    alice.save_entry("2020-01-01", "old").await.expect("save");
+    alice
+        .save_entry("2026-09-04", "recent")
+        .await
+        .expect("save");
+    mallory
+        .save_entry("2026-09-04", "mallory-secret")
+        .await
+        .expect("save");
+
+    assert_eq!(
+        alice.entries_all().await.expect("all"),
+        vec![
+            ("2020-01-01".to_string(), "old".to_string()),
+            ("2026-09-04".to_string(), "recent".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn save_many_writes_every_entry_in_one_call() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    alice
+        .save_entries_many(&[
+            ("2026-09-01", "one"),
+            ("2026-09-02", "two"),
+            ("2026-09-03", "three"),
+        ])
+        .await
+        .expect("save many");
+
+    assert_eq!(
+        alice.entries_all().await.expect("all"),
+        vec![
+            ("2026-09-01".to_string(), "one".to_string()),
+            ("2026-09-02".to_string(), "two".to_string()),
+            ("2026-09-03".to_string(), "three".to_string()),
+        ]
+    );
+}
+
+/// Partial application would leave the migration in a state neither the
+/// client nor the server can describe. All or nothing.
+#[tokio::test]
+async fn save_many_is_atomic_when_one_entry_is_rejected() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    let result = alice
+        .save_entries_many(&[
+            ("2026-09-01", "one"),
+            ("not-a-date", "two"),
+            ("2026-09-03", "three"),
+        ])
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        alice.entries_all().await.expect("all").is_empty(),
+        "the entries either side of the rejected one must not have landed"
+    );
+}
+
+/// The same cap `entry_save` applies, applied per body. A bulk endpoint that
+/// skipped it would be a way around the limit.
+#[tokio::test]
+async fn save_many_enforces_the_per_body_length_cap() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+    // One byte past `entries::MAX_BODY_BYTES` (256 KiB), mirrored here as a
+    // literal rather than imported: that constant is private to the ssr
+    // module, same as the boundary a real caller would meet.
+    let oversized = "x".repeat(256 * 1024 + 1);
+
+    let result = alice
+        .save_entries_many(&[("2026-09-01", "one"), ("2026-09-02", &oversized)])
+        .await;
+
+    assert!(result.is_err());
+    assert!(alice.entries_all().await.expect("all").is_empty());
+}

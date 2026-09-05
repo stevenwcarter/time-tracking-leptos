@@ -270,6 +270,23 @@ impl SessionClient {
             .await
     }
 
+    /// This client's every saved entry, across every date — the read half
+    /// of the encryption migration pass.
+    pub async fn entries_all(&self) -> Result<Vec<(String, String)>, String> {
+        self.call("entries/all", &[]).await
+    }
+
+    /// Writes every `(date, body)` pair in one call — the bulk write half
+    /// of the encryption migration pass, exercising `entry_save_many`'s
+    /// one-transaction guarantee.
+    pub async fn save_entries_many(&self, entries: &[(&str, &str)]) -> Result<(), String> {
+        self.send(
+            "entries/save_many",
+            form_urlencode_pair_vec("entries", entries),
+        )
+        .await
+    }
+
     /// Bumps this user's `session_epoch`, invalidating every token issued
     /// before the call — including this same client's own cookie.
     pub async fn sign_out_everywhere(&self) -> Result<(), String> {
@@ -528,6 +545,26 @@ fn form_urlencode_byte_vec(key: &str, bytes: &[u8]) -> String {
         .iter()
         .enumerate()
         .map(|(i, b)| format!("{key}[{i}]={b}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Encodes one `Vec<(String, String)>` server-fn argument (`entry_save_many`'s
+/// bulk entry list) the way `serde_qs` serializes a sequence of tuples:
+/// `key[0][0]=<first>&key[0][1]=<second>&key[1][0]=...`. Confirmed against
+/// `serde_qs` directly, the same way `form_urlencode_byte_vec` was.
+fn form_urlencode_pair_vec(key: &str, pairs: &[(&str, &str)]) -> String {
+    let key = form_urlencode(key);
+    pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (a, b))| {
+            format!(
+                "{key}[{i}][0]={}&{key}[{i}][1]={}",
+                form_urlencode(a),
+                form_urlencode(b)
+            )
+        })
         .collect::<Vec<_>>()
         .join("&")
 }

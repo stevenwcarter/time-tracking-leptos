@@ -115,3 +115,93 @@ pub async fn entries_in_range(
         .map(|(d, b)| (to_iso(d), b))
         .collect())
 }
+
+/// Every entry the caller has ever saved, bodies included and uninterpreted,
+/// with no date bounds.
+///
+/// This exists to feed the encryption migration pass (spec section 8): the
+/// client needs every row to find which still carry a `v: 1` envelope, and
+/// answering that server-side would mean inspecting envelope versions —
+/// parsing bodies, which invariant E1 forbids outright.
+#[server(endpoint = "entries/all")]
+pub async fn entries_all() -> Result<Vec<(String, String)>, ServerFnError> {
+    use crate::date::to_iso;
+    use crate::entries::repo;
+    let (ctx, me) = super::require_user()?;
+    let mut conn = ctx
+        .conn()
+        .map_err(super::log_and_fail("conn", "Internal server error"))?;
+    Ok(repo::entries_all(&mut conn, me.id)
+        .map_err(super::log_and_fail("entries all", "Internal server error"))?
+        .into_iter()
+        .map(|(d, b)| (to_iso(d), b))
+        .collect())
+}
+
+/// The two ways the batch transaction in [`entry_save_many`] can fail: an
+/// expected, user-facing refusal (bad date, oversized body) versus an
+/// unexpected database error.
+///
+/// Diesel's `transaction` needs one error type for the whole closure, and
+/// the two must stay distinguishable: reporting a refusal as `Ok(Err(..))`
+/// (the way `encryption_enable` reports its "already enabled" refusal)
+/// would have `transaction` **commit** the entries already written earlier
+/// in the same loop, since Diesel only rolls back on an `Err` return —
+/// `encryption_enable` gets away with `Ok(Err(..))` only because that check
+/// runs before any write. Reporting a refusal's message as a plain
+/// `anyhow::Error` string would go the other way and work, but a genuine
+/// `Db` error's message would then flow straight to the caller too,
+/// breaking `server_err`'s rule that a user-facing message never carries
+/// internal detail.
+#[cfg(feature = "ssr")]
+enum SaveManyError {
+    Refused(&'static str),
+    Db(anyhow::Error),
+}
+
+#[cfg(feature = "ssr")]
+impl From<diesel::result::Error> for SaveManyError {
+    fn from(err: diesel::result::Error) -> Self {
+        SaveManyError::Db(err.into())
+    }
+}
+
+/// Writes every `(date, body)` pair in one call, one transaction — the write
+/// half of the encryption migration pass (spec section 8). Applies
+/// `entry_save`'s own length cap to each body; a bulk endpoint that skipped
+/// it would be a way around the limit.
+///
+/// Each entry is validated and written in the same pass through the loop,
+/// rather than validated up front and written in a second pass: only that
+/// ordering lets an entry rejected partway through undo the entries already
+/// written ahead of it in the same call, via the transaction's rollback.
+#[server(endpoint = "entries/save_many")]
+pub async fn entry_save_many(entries: Vec<(String, String)>) -> Result<(), ServerFnError> {
+    use diesel::prelude::*;
+
+    use crate::date::parse_iso;
+    use crate::entries::repo;
+
+    let (ctx, me) = super::require_user()?;
+    let mut conn = ctx
+        .conn()
+        .map_err(super::log_and_fail("conn", "Internal server error"))?;
+
+    let result = conn.transaction::<(), SaveManyError, _>(|conn| {
+        for (date, body) in &entries {
+            let date = parse_iso(date).ok_or(SaveManyError::Refused("Invalid date"))?;
+            if body.len() > MAX_BODY_BYTES {
+                return Err(SaveManyError::Refused("That entry is too large to save"));
+            }
+            repo::save(conn, me.id, date, body).map_err(SaveManyError::Db)?;
+        }
+        Ok(())
+    });
+
+    result.map_err(|err| match err {
+        SaveManyError::Refused(msg) => super::server_err(msg),
+        SaveManyError::Db(err) => {
+            super::log_and_fail("entry save many", "Internal server error")(err)
+        }
+    })
+}
