@@ -583,6 +583,20 @@ it — the phase-1 spec's §10 convention.
   absence of any server function accepting key material. This is the
   weakest-guarded invariant in the list and the one most worth re-reading in
   review.
+- **E7. A write into an encrypted account is never plaintext.** The read side
+  can say "locked" with an error; the write side originally could not — its
+  key parameter was `Option<&SessionKey>`, where `None` meant both "this
+  account is not encrypted, write v1" and "this account is encrypted but this
+  device has no key". The second silently wrote a plaintext row that no later
+  migration would flag as wrong, because a v1 row is exactly what an
+  unmigrated account legitimately holds.
+
+  *Guarded by:* the type. `store` takes `WriteKey { Plaintext, Sealed, Locked }`
+  and refuses `Locked` with `StorageError::Locked` rather than writing.
+  `EncryptionCtx::write_key()` is the single conversion from state to key, so
+  no call site derives one ad hoc. `Unknown` maps to `Locked`: refusing costs
+  a retry, writing costs a silent plaintext row.
+
 - **E6. `APP_SALT` and the two HKDF `info` strings never change.** Changing
   one silently makes every existing wrap unopenable. *Guarded by:*
   constant-pinning tests that assert their exact bytes, in the same spirit as
