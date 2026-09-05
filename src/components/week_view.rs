@@ -20,6 +20,7 @@ use crate::components::header::AppHeader;
 use crate::components::unlock::{UnlockPrompt, UnlockReason};
 use crate::date::{parse_iso, to_iso, week_bounds};
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
+use crate::storage::hook::session_identity;
 use crate::storage::{Backend, Generation, StorageError, bodies_in_range};
 
 /// A week's totals, ready to render.
@@ -116,13 +117,21 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
     // before it has any.
     let totals = RwSignal::new(Option::<WeekTotals>::None);
     let generation = StoredValue::new(Generation::default());
+    let identity = session_identity(encryption);
 
     Effect::new(move |_| {
         let backend = backend.get();
-        // Tracked, like the backend: unlocking mid-session turns a week of
-        // sealed rows into readable ones, and this page has to recompute
-        // when it happens rather than keep reporting an empty week.
-        let session = encryption.state();
+        // Narrowed to *which key*, not the whole session. Unlocking
+        // mid-session turns a week of sealed rows into readable ones and has
+        // to recompute; the probe resolving from `Unknown` to `Disabled`,
+        // which happens on every load, changes nothing this read would
+        // return. Tracking the state itself re-ran the load for both — the
+        // same over-subscription `storage::hook` documents, costing a
+        // redundant week fetch here rather than a lost keystroke, and the
+        // narrowing belongs in both places rather than in whichever one the
+        // bug surfaced.
+        identity.track();
+        let session = encryption.state_untracked();
         // Captured synchronously, before the `spawn_local` below: sign-out
         // is a live, no-reload toggle (`AccountMenu` flips `AuthCtx::user`
         // in place), so this effect can re-run — and start a second,

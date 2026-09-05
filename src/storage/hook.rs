@@ -150,7 +150,11 @@ fn begin_operation(generation: StoredValue<Generation>) -> u64 {
 /// probe window, which the same window refused to save, was reverted on
 /// screen in front of the user. `Memo` is what turns "the state changed" into
 /// "the key changed" — see [`KeyIdentity`].
-fn session_identity(encryption: EncryptionCtx) -> Memo<KeyIdentity> {
+///
+/// `pub(crate)` because `week_view`'s range load wants the same narrowing
+/// for the same reason, one signal wider: nothing about one keyless state
+/// becoming another changes what either read would return.
+pub(crate) fn session_identity(encryption: EncryptionCtx) -> Memo<KeyIdentity> {
     Memo::new(move |_| encryption.key_identity())
 }
 

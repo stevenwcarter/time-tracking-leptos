@@ -33,6 +33,7 @@ use leptos::prelude::*;
 
 use crate::auth_ctx::AuthCtx;
 use crate::clipboard::copy_to_clipboard;
+use crate::components::status::Status;
 use crate::crypto::KeySource;
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 
@@ -530,37 +531,6 @@ impl Screen {
     }
 }
 
-/// The one line the panel talks back through.
-///
-/// Two variants rather than a bare `String` because the severity has to
-/// reach the styling, and every one of these ceremonies can half-finish: a
-/// passkey enrolled with no unlock key, a lock whose keystore clear failed,
-/// a migration that stopped partway. A failure rendered in the same muted
-/// grey as "Encrypted 3 days." is a failure the user scrolls past.
-#[derive(Clone)]
-#[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
-enum Status {
-    /// Something worked, or is under way.
-    Note(String),
-    /// Something did not.
-    Problem(String),
-}
-
-impl Status {
-    fn message(&self) -> &str {
-        match self {
-            Status::Note(message) | Status::Problem(message) => message,
-        }
-    }
-
-    fn class(&self) -> &'static str {
-        match self {
-            Status::Note(_) => "text-sm text-gray-600 mb-3",
-            Status::Problem(_) => "text-sm text-red-700 mb-3",
-        }
-    }
-}
-
 /// "1 day" / "2 days", so counts read as English.
 fn days(n: usize) -> String {
     format!("{n} {}", if n == 1 { "day" } else { "days" })
@@ -932,7 +902,7 @@ pub fn EncryptionPanel(
     view! {
         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mt-6">
             {move || status.get().map(|line| view! {
-                <p class=line.class()>{line.message().to_string()}</p>
+                <p class=format!("{} mb-3", line.tone())>{line.message().to_string()}</p>
             })}
             <FetchProblem overview=overview/>
             {move || match Screen::of(mode.get(), move || phase.get()) {

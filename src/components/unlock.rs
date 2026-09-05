@@ -384,6 +384,15 @@ mod ceremony {
     /// code, because that route works when this one does not — including on
     /// a browser with no PRF support at all.
     pub async fn unlock_with_passkey(user: &str) -> Result<SessionKey, String> {
+        // The wraps come first, before the authenticator is touched at all.
+        // Both orders work, and this is the one every other ceremony uses
+        // (`flow::add_passkey_key`, the panel's re-issue): a server that
+        // cannot answer is going to sink this attempt whatever the
+        // authenticator says, so asking the user for a passkey — or a
+        // fingerprint, or a phone — before finding that out spends a real
+        // gesture on a failure that was already decided.
+        let wraps = encryption_wraps().await.map_err(flow::server_unreachable)?;
+
         // The credential id is kept apart from `choose_route`'s `None`,
         // rather than folded into it: `None` there means "the user chose the
         // recovery route", and a `rawId` that could not be parsed is not
@@ -401,7 +410,6 @@ mod ceremony {
                 .to_string(),
         })?;
 
-        let wraps = encryption_wraps().await.map_err(flow::server_unreachable)?;
         let route = choose_route(&wraps, Some(&assertion.credential_id)).ok_or_else(|| {
             "That passkey can't unlock this account. Try your recovery code instead.".to_string()
         })?;

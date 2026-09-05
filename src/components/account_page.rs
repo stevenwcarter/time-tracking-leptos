@@ -19,6 +19,7 @@ use leptos_router::components::A;
 use crate::auth_ctx::{AuthCtx, forget_device_key, sign_out};
 use crate::components::encryption_panel::EncryptionPanel;
 use crate::components::header::AppHeader;
+use crate::components::status::Status;
 use crate::dto::PasskeyListItem;
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 use crate::server_fns::passkey::{passkey_delete, passkey_list, passkey_rename};
@@ -32,14 +33,14 @@ use crate::server_fns::session::sign_out_everywhere;
 /// handlers only ever run in the browser. It exists purely so this call
 /// site type-checks under a plain `ssr` build too, the same cfg-swap
 /// `auth_ctx::initial_user` uses for the same reason.
-fn passkey_error(e: ServerFnError) -> String {
+fn passkey_error(e: ServerFnError) -> Status {
     #[cfg(feature = "hydrate")]
     {
-        crate::webauthn_browser::friendly_error(e.to_string())
+        Status::Problem(crate::webauthn_browser::friendly_error(e.to_string()))
     }
     #[cfg(not(feature = "hydrate"))]
     {
-        e.to_string()
+        Status::Problem(e.to_string())
     }
 }
 
@@ -90,7 +91,12 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
     // Sourced from `reload` rather than refetched by hand, so the encryption
     // panel's writes refresh this list too — one trigger, both halves.
     let rows = Resource::new(move || reload.get(), |_| async { passkey_list().await });
-    let status = RwSignal::new(String::new());
+    // `Status`, not a bare `String`, so spec section 6.6's refusal to remove
+    // the last passkey that can unlock an encrypted account does not render
+    // in the same muted grey as "Passkey renamed." It is the one message on
+    // this page that stops the user doing something, and it has to look like
+    // it.
+    let status = RwSignal::new(Option::<Status>::None);
     // Whether the account is encrypted, which changes what adding a passkey
     // costs and therefore what has to be said before it starts.
     let encrypted = Memo::new(move |_| {
@@ -119,16 +125,20 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
                             // the browser is about to ask twice and the
                             // prompts themselves cannot say which passkey
                             // to choose.
-                            status.set(
+                            status.set(Some(Status::Note(
                                 "Passkey added. Two more prompts: first a passkey that can \
                                  already open your entries, then the new one."
                                     .to_string(),
-                            );
+                            )));
                         }
-                        status.set(finish_added_passkey(&user, encrypted, new_credential).await);
+                        status.set(Some(
+                            finish_added_passkey(&user, encrypted, new_credential).await,
+                        ));
                         refresh();
                     }
-                    Err(e) => status.set(crate::webauthn_browser::friendly_error(e)),
+                    Err(e) => status.set(Some(Status::Problem(
+                        crate::webauthn_browser::friendly_error(e),
+                    ))),
                 }
             });
         }
@@ -138,7 +148,7 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
         leptos::task::spawn_local(async move {
             match passkey_delete(id).await {
                 Ok(()) => {
-                    status.set("Passkey removed.".to_string());
+                    status.set(Some(Status::Note("Passkey removed.".to_string())));
                     refresh();
                 }
                 // Includes spec section 6.6's refusal to remove the last
@@ -146,8 +156,10 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
                 // names the recovery code and the alternative, so it is
                 // shown as it stands rather than collapsed into a generic
                 // failure — `webauthn_browser::friendly_error` passes it
-                // through by prefix.
-                Err(e) => status.set(passkey_error(e)),
+                // through by prefix — and as a `Problem`, because a refusal
+                // in the same grey as "Passkey renamed." is a refusal the
+                // user scrolls past.
+                Err(e) => status.set(Some(passkey_error(e))),
             }
         });
     };
@@ -177,7 +189,7 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
                 // signed-out branch, which is the confirmation — a status
                 // line set here would be destroyed by that same flip.
                 Ok(()) => auth.user.set(None),
-                Err(e) => status.set(passkey_error(e)),
+                Err(e) => status.set(Some(passkey_error(e))),
             }
         });
     };
@@ -186,10 +198,10 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
         leptos::task::spawn_local(async move {
             match passkey_rename(id, name).await {
                 Ok(()) => {
-                    status.set("Passkey renamed.".to_string());
+                    status.set(Some(Status::Note("Passkey renamed.".to_string())));
                     refresh();
                 }
-                Err(e) => status.set(passkey_error(e)),
+                Err(e) => status.set(Some(passkey_error(e))),
             }
         });
     };
@@ -223,8 +235,8 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
                             </ul>
                         }),
                         Err(e) => EitherOf3::C(view! {
-                            <p class="text-sm text-red-600">
-                                {passkey_error(e)}
+                            <p class="text-sm text-red-700">
+                                {passkey_error(e).message().to_string()}
                             </p>
                         }),
                     }
@@ -283,10 +295,9 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
                     </button>
                 }),
             }}
-            {move || {
-                let s = status.get();
-                (!s.is_empty()).then(|| view! { <p class="mt-3 text-sm text-gray-600">{s}</p> })
-            }}
+            {move || status.get().map(|line| view! {
+                <p class=format!("mt-3 {}", line.tone())>{line.message().to_string()}</p>
+            })}
 
             // Deliberately secondary to the passkey actions above: a
             // recovery control for a lost device, not something to reach for
@@ -373,6 +384,33 @@ fn PasskeyRow(
 /// not-PRF-capable, and the encryption panel would conclude none of them can
 /// derive a key.
 ///
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec section 6.6's refusal arrives through here — the server declines
+    /// to remove the last passkey that can unlock an encrypted account, and
+    /// the message names the recovery code and the alternative. It has to
+    /// land as a problem: this is the one message on the page that stops the
+    /// user doing something, and in the same grey as "Passkey renamed." it
+    /// is one they scroll past and then retry.
+    #[test]
+    fn a_refused_passkey_change_is_reported_as_a_problem() {
+        let refused = passkey_error(ServerFnError::ServerError(
+            "That's the last passkey that can unlock your entries.".to_string(),
+        ));
+        assert!(
+            matches!(refused, Status::Problem(_)),
+            "a refusal must not render as a note"
+        );
+        assert!(
+            refused.message().contains("last passkey"),
+            "the server's own words must survive: {}",
+            refused.message()
+        );
+    }
+}
+
 /// The credential id is `Ok(None)`, never `Err`, when the response cannot be
 /// parsed: the passkey exists by then, and reporting a failure would tell
 /// the user to add another one. What is lost is only the ability to key it
@@ -404,18 +442,25 @@ async fn run_registration() -> Result<Option<Vec<u8>>, String> {
 /// does), and separately whether it opens their entries (it may not). Those
 /// are two different capabilities on an encrypted account, and a message
 /// that says only "Passkey added" would let somebody believe they had gained
-/// a second way back in when they had not.
+/// a second way back in when they had not. The severity carries the same
+/// distinction: only the outcome where both hold is a [`Status::Note`].
 #[cfg(feature = "hydrate")]
-async fn finish_added_passkey(user: &str, encrypted: bool, credential: Option<Vec<u8>>) -> String {
+async fn finish_added_passkey(
+    user: &str,
+    encrypted: bool,
+    credential: Option<Vec<u8>>,
+) -> Status {
     use crate::crypto::KeySource;
 
     if !encrypted {
-        return "Passkey added.".to_string();
+        return Status::Note("Passkey added.".to_string());
     }
     let Some(credential) = credential else {
-        return "Passkey added, but this browser couldn't tell which credential it is, so it \
-                has no unlock key yet. Use “Give it an unlock key” below."
-            .to_string();
+        return Status::Problem(
+            "Passkey added, but this browser couldn't tell which credential it is, so it has \
+             no unlock key yet. Use “Give it an unlock key” below."
+                .to_string(),
+        );
     };
     // A passkey opener, because this path has just been through one
     // authenticator prompt and can reasonably ask for another. When there is
@@ -423,10 +468,13 @@ async fn finish_added_passkey(user: &str, encrypted: bool, credential: Option<Ve
     // fails and says so, and the panel below offers the recovery route that
     // does work (see `flow::add_passkey_key`).
     match crate::crypto::flow::add_passkey_key(user, &credential, KeySource::Passkey).await {
-        Ok(()) => "Passkey added, and it can open your entries.".to_string(),
-        Err(message) => format!(
+        Ok(()) => Status::Note("Passkey added, and it can open your entries.".to_string()),
+        // A problem, not a note: the passkey signs the user in but does not
+        // open their entries, and somebody who reads this as "added" thinks
+        // they have gained a second way back in when they have not.
+        Err(message) => Status::Problem(format!(
             "Passkey added, but it has no unlock key yet, so it won't open your entries: \
              {message} Use “Give it an unlock key” below to try again."
-        ),
+        )),
     }
 }
