@@ -24,6 +24,22 @@
 //!
 //! The two directions take different types because "no key" means different
 //! things in each; [`WriteKey`] says why.
+//!
+//! # Whose key it is, is not checked here
+//!
+//! [`load`] and [`bodies_in_range`] try whatever key they are handed against
+//! whatever rows come back; neither asks whether that key belongs to the
+//! account those rows came from. A key for the wrong account opens nothing,
+//! so every row would surface as [`StorageError::Crypto`] — "this row is
+//! damaged" — rather than as the wrong-account condition it actually is.
+//!
+//! That is layering, not an oversight: identity belongs to
+//! [`crate::encryption_ctx`], which resets to `Unknown` on every
+//! `AuthCtx::user` change, restores from the keystore under the signed-in
+//! address, and refuses an unlock for anyone else. This seam depends on all
+//! three. If a future change ever lets one account's key reach another
+//! account's rows, the symptom will be a whole range of "damaged" rows, and
+//! this note is where to start looking.
 
 pub mod codec;
 pub mod envelope;
@@ -359,18 +375,45 @@ pub fn store(
     }
 }
 
-/// Removes a stored value. A no-op under `ssr`.
-pub async fn clear(backend: Backend, key: StorageKey) -> Result<(), StorageError> {
+/// Removes a stored value.
+///
+/// Takes a [`WriteKey`] because on `Remote` this *is* a write: clearing a day
+/// stores an empty body rather than deleting the row, so that "cleared" and
+/// "never written" read alike, the day's `updated_at` stays meaningful, and
+/// there is one less server fn to authorize. Letting a locked session
+/// through would therefore put a v1 row into an encrypted account — the
+/// plaintext downgrade invariant E7 exists to prevent — so `Remote` goes
+/// through [`store`], which already refuses and already picks the envelope
+/// version.
+///
+/// `Local` removes the key rather than rewriting it, so it has no envelope
+/// to pick, but it refuses a locked session too: "can this session write?"
+/// should have one answer per session and not one per backend.
+pub async fn clear(
+    backend: Backend,
+    key: StorageKey,
+    session: WriteKey<'_>,
+) -> Result<(), StorageError> {
+    match backend {
+        Backend::Remote => store(backend, key, "", session).await,
+        Backend::Local => {
+            if matches!(session, WriteKey::Locked) {
+                return Err(StorageError::Locked { key: key.as_key() });
+            }
+            clear_local(key).await
+        }
+    }
+}
+
+/// `localStorage`'s half of [`clear`]. A no-op under `ssr`.
+async fn clear_local(key: StorageKey) -> Result<(), StorageError> {
     #[cfg(feature = "hydrate")]
     {
-        match backend {
-            Backend::Local => local::clear(key).await,
-            Backend::Remote => remote::clear(key).await,
-        }
+        local::clear(key).await
     }
     #[cfg(not(feature = "hydrate"))]
     {
-        let _ = (backend, key);
+        let _ = key;
         Ok(())
     }
 }
@@ -441,6 +484,32 @@ fn decide_rows<'a, K>(
         .collect()
 }
 
+/// Opens every decided row, dropping (and logging) the ones that will not
+/// open.
+///
+/// Generic over the opener for the same reason [`decide_row`] is generic over
+/// the key. The real opener is [`open_row`], which needs a browser, but the
+/// control flow around it is ordinary code — and it is the half that decides
+/// whether one unreadable row costs a day or a week ([`keep_row`]). A
+/// stand-in opener puts that within reach of `cargo test`; only the one
+/// `SubtleCrypto` call stays out of it.
+#[cfg(any(feature = "hydrate", test))]
+async fn open_rows<'a, K, F, Fut>(
+    rows: Vec<(NaiveDate, RowRead<'a, K>)>,
+    open: F,
+) -> Vec<(NaiveDate, String)>
+where
+    F: Fn(RowRead<'a, K>, StorageKey) -> Fut,
+    Fut: Future<Output = Result<String, StorageError>>,
+{
+    let mut bodies = Vec::new();
+    for (date, read) in rows {
+        let opened = open(read, StorageKey::TimeEntry(date)).await;
+        bodies.extend(keep_row(date, opened));
+    }
+    bodies
+}
+
 /// Every stored body in `[from, to]`, unwrapped and opened. Feeds the week
 /// view.
 ///
@@ -464,12 +533,7 @@ pub async fn bodies_in_range(
             Backend::Local => local::bodies_in_range(from, to).await?,
             Backend::Remote => remote::bodies_in_range(from, to).await?,
         };
-        let mut bodies = Vec::new();
-        for (date, read) in decide_rows(raw, session) {
-            let opened = open_row(read, StorageKey::TimeEntry(date)).await;
-            bodies.extend(keep_row(date, opened));
-        }
-        Ok(bodies)
+        Ok(open_rows(decide_rows(raw, session), open_row).await)
     }
     #[cfg(not(feature = "hydrate"))]
     {
@@ -488,9 +552,13 @@ mod tests {
     }
 
     /// Stands in for the session key. `decide_row` is generic over the key
-    /// and never looks inside one, so a byte does the job here — a
-    /// distinctive byte, so a test can check that a decision hands back *the*
-    /// key it was given rather than merely that some key came out.
+    /// and never looks inside one, so a byte does the job here.
+    ///
+    /// It is a readable placeholder, not a discriminator: only one key is
+    /// ever in scope, and a function generic over `K` with a single `&K` to
+    /// hand has nothing else it could return, so `*k == SESSION` cannot fail
+    /// against a type-correct implementation. What the sealed-row assertions
+    /// below actually pin is the *ciphertext* travelling with the decision.
     const SESSION: u8 = 42;
 
     /// A v2 row. `tag` distinguishes one row's ciphertext from another's, so
@@ -568,7 +636,10 @@ mod tests {
             block_on(store(Backend::Local, key, "x", WriteKey::Plaintext)),
             Ok(())
         );
-        assert_eq!(block_on(clear(Backend::Local, key)), Ok(()));
+        assert_eq!(
+            block_on(clear(Backend::Local, key, WriteKey::Plaintext)),
+            Ok(())
+        );
     }
 
     /// The regression this guards against: a session that cannot seal must
@@ -587,6 +658,23 @@ mod tests {
             block_on(store(Backend::Local, key, "9-10 code1", WriteKey::Locked)),
             Err(StorageError::Locked { key: key.as_key() })
         );
+    }
+
+    /// The regression this guards against: clearing a day on `Remote` stores
+    /// an empty *body* rather than deleting the row, so a locked session let
+    /// through here would write a v1 row into an encrypted account — the
+    /// same plaintext downgrade `store` refuses, arriving through the one
+    /// door that used to have no lock on it (invariant E7).
+    #[test]
+    fn a_locked_session_refuses_to_clear_on_either_backend() {
+        let key = StorageKey::TimeEntry(d(2026, 9, 4));
+        for backend in [Backend::Local, Backend::Remote] {
+            assert_eq!(
+                block_on(clear(backend, key, WriteKey::Locked)),
+                Err(StorageError::Locked { key: key.as_key() }),
+                "{backend:?} must refuse to clear a day it cannot seal"
+            );
+        }
     }
 
     /// Same invariant as `ssr_backends_return_none`, for the range read the
@@ -623,8 +711,10 @@ mod tests {
 
     /// The sealed decision has to carry the key *and* the ciphertext, since
     /// pairing them is what makes "sealed but unopenable" unrepresentable
-    /// past this point. Both halves are asserted: a decision that returned
-    /// the right ciphertext beside some other key would open to garbage.
+    /// past this point.
+    ///
+    /// Only the ciphertext half discriminates; the key half is there for
+    /// readability, for the reason [`SESSION`] gives.
     #[test]
     fn a_sealed_row_with_a_key_carries_both_that_key_and_the_ciphertext() {
         let key = StorageKey::TimeEntry(d(2026, 9, 4));
@@ -710,6 +800,60 @@ mod tests {
                 .map(|(date, _)| *date)
                 .collect::<Vec<_>>(),
             vec![d(2026, 9, 1), d(2026, 9, 3)]
+        );
+    }
+
+    /// Stands in for [`open_row`], which needs a browser. A plaintext row
+    /// passes through; a sealed one fails the way a tampered or truncated
+    /// row does, which is the only failure the second pass can see.
+    async fn open_or_fail(read: RowRead<'_, u8>, key: StorageKey) -> Result<String, StorageError> {
+        match read {
+            RowRead::Plaintext(body) => Ok(body),
+            RowRead::Sealed(..) => Err(StorageError::Crypto {
+                key: key.as_key(),
+                detail: "stand-in opener".to_string(),
+            }),
+        }
+    }
+
+    /// The blast-radius rule again, for the pass that carries it second: a
+    /// row that decoded fine and then would not *open* must cost its own day
+    /// and nothing more. The `decide_rows` assertion first is what places the
+    /// loss in the second pass — all three rows survive the first.
+    #[test]
+    fn a_row_that_will_not_open_costs_only_its_own_day() {
+        let rows = vec![
+            (d(2026, 9, 1), envelope::wrap_v1("a")),
+            (d(2026, 9, 2), sealed(7)),
+            (d(2026, 9, 3), envelope::wrap_v1("b")),
+        ];
+        let decided = decide_rows(rows, Some(&SESSION));
+        assert_eq!(decided.len(), 3, "every row must survive the first pass");
+
+        assert_eq!(
+            block_on(open_rows(decided, open_or_fail)),
+            vec![
+                (d(2026, 9, 1), "a".to_string()),
+                (d(2026, 9, 3), "b".to_string())
+            ],
+            "the unopenable day must be dropped, not the whole week"
+        );
+    }
+
+    /// The complement, and the reason the rule is "skip", not "swallow":
+    /// with nothing failing, every row still has to come out.
+    #[test]
+    fn every_row_that_opens_is_kept() {
+        let rows = vec![
+            (d(2026, 9, 1), envelope::wrap_v1("a")),
+            (d(2026, 9, 2), envelope::wrap_v1("b")),
+        ];
+        assert_eq!(
+            block_on(open_rows(decide_rows(rows, None::<&u8>), open_or_fail)),
+            vec![
+                (d(2026, 9, 1), "a".to_string()),
+                (d(2026, 9, 2), "b".to_string())
+            ]
         );
     }
 

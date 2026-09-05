@@ -275,8 +275,8 @@ mod browser {
             // Logged and skipped, never propagated: `?` here would scope one
             // undecodable day to the whole range, and the week view would
             // render "Nothing logged this week." over six good days. Mirrors
-            // `storage::unwrap_bodies`, which makes the same call one layer
-            // up at the envelope.
+            // `storage::keep_row`, which makes the same call one layer up, at
+            // the envelope.
             match body_for(&store, date, source, legacy_raw.as_deref()) {
                 Ok(Some(body)) => out.push((date, body)),
                 Ok(None) => {}

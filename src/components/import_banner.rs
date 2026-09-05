@@ -53,7 +53,7 @@ pub fn importable(local: &[NaiveDate], remote: &[NaiveDate]) -> Vec<NaiveDate> {
 /// may settle this device, and the status line to show for it.
 ///
 /// Pure — no `web_sys` dependency — so unlike the `spawn_local` loop that
-/// calls it, this is host-tested directly (mirrors `storage::unwrap_bodies`:
+/// calls it, this is host-tested directly (mirrors `storage::decide_rows`:
 /// pull the decision out of the code a wasm-only harness would be needed to
 /// exercise, not the arithmetic itself).
 ///

@@ -6,7 +6,7 @@
 use chrono::NaiveDate;
 use leptos::prelude::ServerFnError;
 
-use super::{StorageError, StorageKey, envelope};
+use super::{StorageError, StorageKey};
 use crate::date::{parse_iso, to_iso};
 use crate::server_fns::entries;
 
@@ -24,15 +24,6 @@ pub async fn store(key: StorageKey, envelope: &str) -> Result<(), StorageError> 
     entries::entry_save(to_iso(key.date()), envelope.to_string())
         .await
         .map_err(server_error)
-}
-
-/// Clearing a day writes an empty envelope rather than deleting the row.
-///
-/// "Cleared" and "never written" are the same thing to the reader, and an
-/// empty row keeps the day's `updated_at` meaningful. It also means clear
-/// and save take the same path, so there is one less server fn to authorize.
-pub async fn clear(key: StorageKey) -> Result<(), StorageError> {
-    store(key, &envelope::wrap_v1("")).await
 }
 
 pub async fn dates_with_entries(
