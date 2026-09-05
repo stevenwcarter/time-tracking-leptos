@@ -46,6 +46,12 @@ async fn wraps_are_scoped_to_the_signed_in_user() {
     assert_eq!(alice.encryption_wraps().await.expect("wraps").len(), 2);
 }
 
+/// A second `encryption_enable` must be caught by the application-level
+/// `encrypted_at` guard, not merely by the schema's
+/// `idx_entry_key_wrap_one_recovery` unique index tripping on the second
+/// recovery-wrap insert underneath it — the guard's own message is asserted
+/// here specifically so a deleted guard fails this test with a generic
+/// internal-server-error message rather than passing for the wrong reason.
 #[tokio::test]
 async fn enabling_twice_is_refused() {
     let app = TestApp::new().await;
@@ -55,11 +61,13 @@ async fn enabling_twice_is_refused() {
         .await
         .expect("first enable");
 
+    let err = alice
+        .encryption_enable(&[3; 40], b"cred-2", &[4; 40])
+        .await
+        .expect_err("a second enable must be refused");
     assert!(
-        alice
-            .encryption_enable(&[3; 40], b"cred-2", &[4; 40])
-            .await
-            .is_err()
+        err.contains("already enabled"),
+        "refusal must come from the encrypted_at guard, got: {err}"
     );
     // A rejected retry must not touch what the first call already wrote.
     assert_eq!(alice.encryption_wraps().await.expect("wraps").len(), 2);
@@ -160,6 +168,41 @@ async fn deleting_a_non_last_passkey_is_allowed_and_removes_its_wrap() {
             .all(|w| w.credential_id.as_deref() != Some(first_cred.as_slice())),
         "the deleted credential's own wrap must be gone too"
     );
+}
+
+/// `encryption_add_passkey_wrap` must check that `credential_id` belongs to
+/// the caller before inserting anything — a wrap filed under someone else's
+/// credential could never be opened by its owner, and the check is the only
+/// thing standing between "another user's passkey" and "this account's key
+/// material." No other test in this file or `entry_key::store`'s own unit
+/// tests attempts the cross-account case, so this is the only guard against
+/// a regression here.
+#[tokio::test]
+async fn add_passkey_wrap_refuses_a_credential_belonging_to_another_user() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+    let mallory = signed_in_as(&app, "mallory@example.com").await;
+
+    let mut conn = app.pool.get().expect("checkout");
+    let uid = auth::user::find_or_create(&mut conn, "alice@example.com")
+        .expect("user")
+        .id;
+    let key = enrol_credential("alice@example.com");
+    let cred_id = key.cred_id().to_vec();
+    passkey::store::insert(&mut conn, uid, &key, true).expect("insert passkey");
+    drop(conn);
+
+    let err = mallory
+        .encryption_add_passkey_wrap(&cred_id, &[9; 40])
+        .await
+        .expect_err("must refuse to wrap a credential belonging to another account");
+    assert!(
+        err.contains("does not belong"),
+        "refusal must point at credential ownership, got: {err}"
+    );
+
+    assert!(alice.encryption_wraps().await.expect("wraps").is_empty());
+    assert!(mallory.encryption_wraps().await.expect("wraps").is_empty());
 }
 
 /// An unauthenticated caller must reach none of this.
