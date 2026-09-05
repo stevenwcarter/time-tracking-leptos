@@ -180,26 +180,26 @@ pub fn passkey_wrap_count(conn: &mut DbConn, user_id: i32) -> Result<i64> {
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
     use super::*;
-    use crate::auth::user;
+    use crate::auth::user as auth_user;
     use crate::db::test_pool;
 
     fn seed() -> (DbConn, i32) {
         let pool = test_pool();
         let mut conn = pool.get().expect("checkout");
-        let uid = user::find_or_create(&mut conn, "alice@example.com")
+        let uid = auth_user::find_or_create(&mut conn, "alice@example.com")
             .expect("create user")
             .id;
         (conn, uid)
     }
 
     fn seed_another_user(conn: &mut DbConn) -> i32 {
-        user::find_or_create(conn, "bob@example.com")
+        auth_user::find_or_create(conn, "bob@example.com")
             .expect("create user")
             .id
     }
 
     fn delete_user(conn: &mut DbConn, user_id: i32) -> Result<()> {
-        diesel::delete(super::user::table.find(user_id)).execute(conn)?;
+        diesel::delete(user::table.find(user_id)).execute(conn)?;
         Ok(())
     }
 
