@@ -250,8 +250,11 @@ fn crypto() -> Result<Object, CryptoError> {
 /// `window.crypto.subtle`.
 ///
 /// Absent outside a secure context, which is why the error says so: served
-/// over plain HTTP from anything but `localhost`, every function in this
-/// module fails here and nowhere else.
+/// over plain HTTP from anything but `localhost`, every function that reaches
+/// WebCrypto fails here and nowhere else. [`random_bytes`] is the one
+/// exception — it calls `getRandomValues` on `window.crypto` itself, which an
+/// insecure context still has, so randomness keeps working on a page where
+/// nothing else in this module does.
 fn subtle() -> Result<Object, CryptoError> {
     let crypto = crypto()?;
     Reflect::get(&crypto, &"subtle".into())
@@ -301,6 +304,14 @@ fn as_bytes(operation: &str, resolved: JsValue) -> Result<Vec<u8>, CryptoError> 
 ///
 /// The only source of randomness in this crate's browser half: the AES-GCM
 /// nonce in [`seal`] and the recovery code's entropy both come from here.
+/// Unlike everything else here it does not go through [`subtle`], so it works
+/// in an insecure context too.
+///
+/// Only sane lengths are `Err`-safe. `Uint8Array::new_with_length` is not a
+/// `catch` import, so a length the JS engine refuses to allocate throws
+/// across the wasm boundary instead of returning `Err`. The two call sites
+/// ask for [`NONCE_LEN`] and [`super::recovery::CODE_BYTES`] — 12 and 20
+/// bytes — so nothing here comes near that bound.
 pub fn random_bytes(n: usize) -> Result<Vec<u8>, CryptoError> {
     let length =
         u32::try_from(n).map_err(|_| CryptoError("requested too many random bytes".to_string()))?;
