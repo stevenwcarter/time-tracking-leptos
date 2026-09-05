@@ -102,7 +102,13 @@ fn SignedInPanel(
             // probe for a signed-out visitor publishes `Disabled`, which
             // holds no key — but that happens a round trip later, which is
             // what `signing_out` covers.
-            match sign_out(move || encryption.signing_out(), forget_device_key(), logout()).await {
+            match sign_out(
+                move || encryption.signing_out(),
+                forget_device_key(),
+                logout(),
+            )
+            .await
+            {
                 Ok(()) => {
                     // Closed first, deliberately: the popover is describing
                     // an account that is about to stop existing, and clearing

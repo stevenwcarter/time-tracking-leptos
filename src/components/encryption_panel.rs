@@ -489,7 +489,10 @@ enum Screen {
     Manage { unlocked: bool },
     /// One passkey is being given an unlock key, and the account's openers
     /// are the choice on offer.
-    GiveKey { credential_id: Vec<u8>, name: String },
+    GiveKey {
+        credential_id: Vec<u8>,
+        name: String,
+    },
 }
 
 impl Screen {
@@ -1907,10 +1910,7 @@ mod tests {
     /// server renders for everybody (invariant E2).
     #[test]
     fn an_idle_panel_follows_the_account_state() {
-        assert_eq!(
-            Screen::of(Mode::Idle, || Phase::Checking),
-            Screen::Checking
-        );
+        assert_eq!(Screen::of(Mode::Idle, || Phase::Checking), Screen::Checking);
         assert_eq!(
             Screen::of(Mode::Idle, || Phase::Unreachable),
             Screen::Unreachable

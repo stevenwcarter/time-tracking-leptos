@@ -357,10 +357,7 @@ pub async fn load(
 ///
 /// Owned rather than borrowed because [`store`] hands its future to
 /// `spawn_local`, which needs `'static`.
-fn sealing_key(
-    key: StorageKey,
-    session: WriteKey<'_>,
-) -> Result<Option<SessionKey>, StorageError> {
+fn sealing_key(key: StorageKey, session: WriteKey<'_>) -> Result<Option<SessionKey>, StorageError> {
     match session {
         WriteKey::Plaintext => Ok(None),
         // `Option::cloned`, not a direct `session.clone()`: on a target
@@ -443,13 +440,12 @@ pub async fn store_many(
                 total,
             });
             let key = StorageKey::TimeEntry(date);
-            let wrapped =
-                envelope::wrap(&body, sealing.as_ref())
-                    .await
-                    .map_err(|err| StorageError::Crypto {
-                        key: key.as_key(),
-                        detail: err.to_string(),
-                    })?;
+            let wrapped = envelope::wrap(&body, sealing.as_ref())
+                .await
+                .map_err(|err| StorageError::Crypto {
+                    key: key.as_key(),
+                    detail: err.to_string(),
+                })?;
             sealed.push((date, wrapped));
         }
         remote::store_many(sealed).await

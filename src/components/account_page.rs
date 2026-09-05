@@ -445,11 +445,7 @@ async fn run_registration() -> Result<Option<Vec<u8>>, String> {
 /// a second way back in when they had not. The severity carries the same
 /// distinction: only the outcome where both hold is a [`Status::Note`].
 #[cfg(feature = "hydrate")]
-async fn finish_added_passkey(
-    user: &str,
-    encrypted: bool,
-    credential: Option<Vec<u8>>,
-) -> Status {
+async fn finish_added_passkey(user: &str, encrypted: bool, credential: Option<Vec<u8>>) -> Status {
     use crate::crypto::KeySource;
 
     if !encrypted {
