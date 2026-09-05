@@ -55,6 +55,15 @@ thread_local! {
 /// to forget. No identity check catches that: the key really does belong to
 /// the account that was signed in when the ceremony began.
 ///
+/// "When a ceremony starts" means the whole thing, from the caller's first
+/// await — a wraps fetch, a WebAuthn assertion — not merely the first await
+/// inside this module. [`enable`] and the private `unlock` both take a
+/// `Forgets` as a parameter rather than calling [`now`](Self::now)
+/// themselves for exactly this reason: by the time either function runs,
+/// its caller may already have awaited the server and the authenticator,
+/// and capturing here would miss anything asked to forget during that
+/// window.
+///
 /// A thread-local counter rather than a signal because it has to be readable
 /// from every path that writes the keystore, including
 /// `account_menu::unlock_after_sign_in`, which runs with no reactive context
@@ -65,8 +74,10 @@ thread_local! {
 pub struct Forgets(u64);
 
 impl Forgets {
-    /// The count as of now, to be captured at the start of a ceremony that
-    /// will end in a keystore write.
+    /// The count as of now, to be captured at the *true* start of a ceremony
+    /// that will end in a keystore write — the caller's first await, not
+    /// necessarily this module's — and threaded in from there. See this
+    /// type's doc comment.
     pub fn now() -> Self {
         Self(FORGETS.with(Cell::get))
     }
@@ -261,14 +272,18 @@ mod ceremony {
         /// key and never prompts.
         ///
         /// Refuses when the device has been asked to forget its key since
-        /// the ceremony that produced this one started. That guard lives
-        /// here, at the write, rather than only at the one caller that can
-        /// compare accounts: `account_menu::unlock_after_sign_in` writes the
-        /// keystore too, and pre-reload it has no live `AuthCtx` to compare
-        /// against, so an identity check is not something that path can
-        /// make. What every path can honour is that a sign-out or a "Lock
-        /// now" issued after this started outranks it (spec section 6.7, and
-        /// see [`Forgets`]).
+        /// the ceremony that produced this one started — its true start, at
+        /// the caller's first await, which is what the `forgets` each
+        /// producer is handed must have been captured against (see
+        /// [`Forgets`]); a value captured any later would still compare
+        /// "current" against a forget that landed in the gap. That guard
+        /// lives here, at the write, rather than only at the one caller that
+        /// can compare accounts: `account_menu::unlock_after_sign_in` writes
+        /// the keystore too, and pre-reload it has no live `AuthCtx` to
+        /// compare against, so an identity check is not something that path
+        /// can make. What every path can honour is that a sign-out or a
+        /// "Lock now" issued after this started outranks it (spec section
+        /// 6.7).
         ///
         /// A failure is the caller's to log and otherwise ignore: the key
         /// works for this page load either way, and the only cost of not
@@ -438,11 +453,17 @@ mod ceremony {
     /// wrote the record on the way past, before the account existed
     /// server-side and before anyone had asked whose account it was, which
     /// is the ordering `SessionKey::remember` exists to undo.
-    pub async fn enable(prf_output: &[u8], user: &str) -> Result<Enabled, CryptoError> {
-        // Captured before the first await, so a sign-out or a "Lock now"
-        // issued while this ceremony runs outranks the keystore write at the
-        // end of it (see `SessionKey::remember`).
-        let forgets = Forgets::now();
+    ///
+    /// `forgets` is a parameter rather than [`Forgets::now`] called here,
+    /// because this is not the ceremony's first step from the user's side —
+    /// the caller has already run the PRF assertion this needs `prf_output`
+    /// from. Capturing here would miss a sign-out or a "Lock now" issued
+    /// during that assertion; see [`Forgets`].
+    pub async fn enable(
+        prf_output: &[u8],
+        user: &str,
+        forgets: Forgets,
+    ) -> Result<Enabled, CryptoError> {
         let (recovery_code, code_bytes) = new_recovery_code()?;
 
         let raw_key = subtle::generate_dek_extractable().await?;
@@ -476,9 +497,17 @@ mod ceremony {
     /// Remembering it on this device is the caller's separate step, and
     /// belongs behind whatever identity check that caller can make — see
     /// [`SessionKey::remember`].
-    async fn unlock(opener: Opener<'_>, user: &str) -> Result<SessionKey, UnlockError> {
-        // Captured before the first await, for the reason `enable` gives.
-        let forgets = Forgets::now();
+    ///
+    /// `forgets` is a parameter for the reason `enable` gives: every caller
+    /// of this reaches it only after a wraps fetch and, on the passkey
+    /// route, a WebAuthn assertion — neither of which is an await this
+    /// function itself makes — so [`Forgets::now`] belongs at the caller's
+    /// true first step, not here.
+    async fn unlock(
+        opener: Opener<'_>,
+        user: &str,
+        forgets: Forgets,
+    ) -> Result<SessionKey, UnlockError> {
         let kek = kek_for(&opener).await?;
         let key = subtle::unwrap_dek_sealed(opener.wrap(), &kek).await?;
         Ok(SessionKey::held(user, key, forgets))
@@ -487,25 +516,29 @@ mod ceremony {
     /// Unlocks with a passkey's PRF output (spec sections 6.2 and 6.3).
     ///
     /// `wrap` is the wrapped key from *that credential's* row — see
-    /// [`super::choose_route`], which is what picks it.
+    /// [`super::choose_route`], which is what picks it. `forgets` must be
+    /// [`Forgets::now`] read by the caller before *its own* first await —
+    /// see this module's header on [`Forgets`] — not a value captured here.
     pub async fn unlock_with_prf(
         prf_output: &[u8],
         wrap: &[u8],
         user: &str,
+        forgets: Forgets,
     ) -> Result<SessionKey, UnlockError> {
-        unlock(Opener::Passkey { prf_output, wrap }, user).await
+        unlock(Opener::Passkey { prf_output, wrap }, user, forgets).await
     }
 
     /// Unlocks with a typed recovery code (spec section 6.4).
     ///
     /// Works on a browser with no PRF support at all, which is the point of
-    /// the route.
+    /// the route. `forgets`: see [`unlock_with_prf`].
     pub async fn unlock_with_recovery(
         code: &str,
         wrap: &[u8],
         user: &str,
+        forgets: Forgets,
     ) -> Result<SessionKey, UnlockError> {
-        unlock(Opener::Recovery { code, wrap }, user).await
+        unlock(Opener::Recovery { code, wrap }, user, forgets).await
     }
 
     /// Re-wraps the account's data key under a new key-encryption key.

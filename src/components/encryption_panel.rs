@@ -1474,7 +1474,7 @@ fn RouteRow(
 mod ceremony {
     use super::{MigrationPlan, Overview, classify};
     use crate::crypto::flow::{self, PrfAssertion};
-    use crate::crypto::{Enabled, Opener, SessionKey, choose_route, enable};
+    use crate::crypto::{Enabled, Forgets, Opener, SessionKey, choose_route, enable};
     use crate::server_fns::encryption::{encryption_enable, encryption_wraps};
     use crate::server_fns::entries::entries_all;
     use crate::server_fns::passkey::passkey_list;
@@ -1556,6 +1556,13 @@ mod ceremony {
     /// `Disabled`, the keystore record is never consulted, and the code the
     /// user may have saved simply opens nothing.
     pub async fn begin_enable(user: &str) -> Result<PendingEnable, String> {
+        // Captured here, before this ceremony's first await, not inside
+        // `crypto::enable` — which does not run until the assertion below
+        // has already returned. A sign-out or a "Lock now" issued during it
+        // must still outrank the keystore write `remember` makes once this
+        // ceremony's key reaches `EncryptionCtx::unlock` (spec section 6.7,
+        // see `crypto::Forgets`).
+        let forgets = Forgets::now();
         let PrfAssertion {
             credential_id,
             prf_output,
@@ -1563,7 +1570,7 @@ mod ceremony {
             .await
             .map_err(flow::assertion_message)?;
 
-        let enabled = enable(&prf_output, user)
+        let enabled = enable(&prf_output, user, forgets)
             .await
             .map_err(|_| "This browser couldn't generate an encryption key.".to_string())?;
 

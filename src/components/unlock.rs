@@ -372,7 +372,8 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
 mod ceremony {
     use crate::crypto::flow::{self, AssertionError};
     use crate::crypto::{
-        Opener, SessionKey, UnlockError, choose_route, unlock_with_prf, unlock_with_recovery,
+        Forgets, Opener, SessionKey, UnlockError, choose_route, unlock_with_prf,
+        unlock_with_recovery,
     };
     use crate::server_fns::encryption::encryption_wraps;
 
@@ -384,6 +385,14 @@ mod ceremony {
     /// code, because that route works when this one does not — including on
     /// a browser with no PRF support at all.
     pub async fn unlock_with_passkey(user: &str) -> Result<SessionKey, String> {
+        // Captured here, before this ceremony's first await, not inside
+        // `crypto::unlock` — which does not run until both the wraps fetch
+        // and the assertion below have already returned. A sign-out or a
+        // "Lock now" issued during either must still outrank the keystore
+        // write `remember` makes at the end of this (spec section 6.7, see
+        // `crypto::Forgets`).
+        let forgets = Forgets::now();
+
         // The wraps come first, before the authenticator is touched at all.
         // Both orders work, and this is the one every other ceremony uses
         // (`flow::add_passkey_key`, the panel's re-issue): a server that
@@ -414,7 +423,7 @@ mod ceremony {
             "That passkey can't unlock this account. Try your recovery code instead.".to_string()
         })?;
 
-        unlock_with_prf(&assertion.prf_output, &route.wrapped_key, user)
+        unlock_with_prf(&assertion.prf_output, &route.wrapped_key, user, forgets)
             .await
             .map_err(|_| "That passkey couldn't unlock this account.".to_string())
     }
@@ -432,11 +441,14 @@ mod ceremony {
         typed: &str,
         user: &str,
     ) -> Result<(SessionKey, String, Vec<u8>), String> {
+        // See `unlock_with_passkey`: captured before this ceremony's first
+        // await, not inside `crypto::unlock`.
+        let forgets = Forgets::now();
         let wraps = encryption_wraps().await.map_err(flow::server_unreachable)?;
         let route = choose_route(&wraps, None)
             .ok_or_else(|| "This account has no recovery code set up.".to_string())?;
 
-        let key = unlock_with_recovery(typed, &route.wrapped_key, user)
+        let key = unlock_with_recovery(typed, &route.wrapped_key, user, forgets)
             .await
             .map_err(|err| match err {
                 UnlockError::Malformed(_) => "That doesn't look like a recovery code.".to_string(),

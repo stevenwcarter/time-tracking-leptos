@@ -345,10 +345,16 @@ async fn run_passkey_login(typed_email: String) -> Result<(), String> {
 #[cfg(feature = "hydrate")]
 async fn unlock_after_sign_in(credential_json: &str, prf_output: &[u8]) {
     use crate::crypto::flow::credential_id_from_response;
-    use crate::crypto::{choose_route, unlock_with_prf};
+    use crate::crypto::{Forgets, choose_route, unlock_with_prf};
     use crate::server_fns::encryption::{encryption_status, encryption_wraps};
     use crate::server_fns::session::current_session;
 
+    // Captured here, before this ceremony's first await, not inside
+    // `crypto::unlock` — which does not run until the identity read and the
+    // two server calls below have already returned. A sign-out or a "Lock
+    // now" issued during any of them must still outrank the keystore write
+    // below (spec section 6.7, see `crypto::Forgets`).
+    let forgets = Forgets::now();
     let Ok(Some(user)) = current_session().await else {
         error!("signed in, but could not read back which account to unlock");
         return;
@@ -390,7 +396,7 @@ async fn unlock_after_sign_in(credential_json: &str, prf_output: &[u8]) {
     // `SessionKey::remember` refuses if this device has been asked to forget
     // its key since the ceremony began, which is the only check this path
     // can make (there is no live `AuthCtx` to compare against yet).
-    match unlock_with_prf(prf_output, &route.wrapped_key, &user).await {
+    match unlock_with_prf(prf_output, &route.wrapped_key, &user, forgets).await {
         Ok(key) => {
             if let Err(e) = key.remember().await {
                 error!("the key the sign-in opened could not be stored on this device: {e}");
