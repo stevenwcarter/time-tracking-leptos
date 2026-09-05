@@ -3,6 +3,7 @@
 
 use chrono::NaiveDate;
 use leptos::either::Either;
+use leptos::logging::error;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
@@ -12,8 +13,14 @@ use crate::date::to_iso;
 use crate::server_fns::session::{logout, request_magic_link};
 
 /// The local part of an address, capped, for the corner label.
+///
+/// `split_once`, not `split(…).next()`: the latter's `unwrap_or` fallback is
+/// unreachable — `split` always yields at least one item — so an address with
+/// no `@` took the same branch as one with, and the test for it tested
+/// nothing. `split_once` returns `None` exactly when there is no `@`, which
+/// is the case the fallback is for.
 pub fn short_name(email: &str) -> String {
-    let local = email.split('@').next().unwrap_or(email);
+    let local = email.split_once('@').map_or(email, |(local, _)| local);
     if local.chars().count() <= 18 {
         local.to_string()
     } else {
@@ -64,7 +71,9 @@ pub fn AccountMenu(
             >
                 {move || match auth.user.get() {
                     None => Either::Left(view! { <SignInPanel/> }),
-                    Some(email) => Either::Right(view! { <SignedInPanel email=email date=date/> }),
+                    Some(email) => Either::Right(
+                        view! { <SignedInPanel email=email date=date open=open/> },
+                    ),
                 }}
             </div>
         </div>
@@ -72,16 +81,38 @@ pub fn AccountMenu(
 }
 
 #[component]
-fn SignedInPanel(email: String, date: Option<NaiveDate>) -> impl IntoView {
+fn SignedInPanel(
+    email: String,
+    date: Option<NaiveDate>,
+    /// This panel's own popover, so signing out can close it.
+    open: RwSignal<bool>,
+) -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
+    let status = RwSignal::new(String::new());
 
     let sign_out = move |_| {
         spawn_local(async move {
-            if logout().await.is_ok() {
-                // Clearing the signal flips `AuthCtx::backend()` to Local,
-                // which makes `use_persistent` re-read from localStorage —
-                // no reload needed.
-                auth.user.set(None);
+            match logout().await {
+                Ok(()) => {
+                    // Closed first, deliberately: the popover is describing
+                    // an account that is about to stop existing, and clearing
+                    // `auth.user` disposes this very panel. Setting `open`
+                    // beforehand keeps that write clear of the teardown it
+                    // triggers.
+                    open.set(false);
+                    // Clearing the signal flips `AuthCtx::backend()` to Local,
+                    // which makes `use_persistent` re-read from localStorage —
+                    // no reload needed.
+                    auth.user.set(None);
+                }
+                Err(e) => {
+                    // A failed sign-out leaves the session cookie in place.
+                    // Silence here is the difference between a user knowing
+                    // to try again and one walking away from a shared
+                    // machine believing they are signed out.
+                    error!("sign-out failed: {e}");
+                    status.set("Couldn't sign out. Check your connection and try again.".into());
+                }
             }
         });
     };
@@ -113,6 +144,10 @@ fn SignedInPanel(email: String, date: Option<NaiveDate>) -> impl IntoView {
         >
             "Sign out"
         </button>
+        {move || {
+            let s = status.get();
+            (!s.is_empty()).then(|| view! { <p class="text-xs text-red-600 mt-2">{s}</p> })
+        }}
     }
 }
 
@@ -159,8 +194,15 @@ fn SignInPanel() -> impl IntoView {
             Either::Left(view! {
                 <div>
                     <p class="text-sm font-semibold text-gray-900 mb-1">"Check your email"</p>
+                    // No specific lifetime: `MAGIC_LINK_TTL_SECONDS` is
+                    // operator-tunable and read only under `ssr`
+                    // (`magic_link::ttl`), so this panel — which renders on
+                    // both targets and must hydrate byte-identically —
+                    // cannot know it. The mailed link states its own real
+                    // TTL (`email::magic_link_email`), which is where the
+                    // number belongs anyway.
                     <p class="text-xs text-gray-600">
-                        "If that address has an account or can have one, a sign-in link is on its way. It works once and expires in 15 minutes."
+                        "If that address has an account or can have one, a sign-in link is on its way. It works once, and the email says how long it lasts."
                     </p>
                     <button
                         type="button"
