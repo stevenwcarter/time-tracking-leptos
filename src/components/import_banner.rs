@@ -47,6 +47,41 @@ pub fn importable(local: &[NaiveDate], remote: &[NaiveDate]) -> Vec<NaiveDate> {
         .collect()
 }
 
+/// Whether an import of `total` offered days that landed `copied` of them
+/// may settle this device, and the status line to show for it.
+///
+/// Pure — no `web_sys` dependency — so unlike the `spawn_local` loop that
+/// calls it, this is host-tested directly (mirrors `storage::unwrap_bodies`:
+/// pull the decision out of the code a wasm-only harness would be needed to
+/// exercise, not the arithmetic itself).
+///
+/// Settling requires *every* offered day to have landed. A partial or total
+/// failure — offline, a transient 5xx, a session that expired between the
+/// offer and the click — must not mark this device done: that would strand
+/// the un-copied days in `localStorage` with no way back short of
+/// hand-editing it, which is exactly the "your work vanished" outcome this
+/// feature exists to prevent. Leaving the flag unset needs no bookkeeping
+/// of *which* days still need it, either: `importable` already filters
+/// against what the server has, so the next time this runs, the days that
+/// did land are naturally excluded and only the genuine remainder is
+/// re-offered.
+#[cfg(any(feature = "hydrate", test))]
+fn import_outcome(copied: usize, total: usize) -> (bool, String) {
+    let fully_succeeded = copied == total;
+    let message = if fully_succeeded {
+        format!(
+            "Imported {copied} {}.",
+            if copied == 1 { "day" } else { "days" }
+        )
+    } else {
+        format!(
+            "Imported {copied} of {total} {}.",
+            if total == 1 { "day" } else { "days" }
+        )
+    };
+    (fully_succeeded, message)
+}
+
 /// Offers to copy a signed-out user's local entries into their account, the
 /// first time they sign in on a browser that has any this account lacks.
 #[component]
@@ -135,6 +170,7 @@ pub fn ImportBanner() -> impl IntoView {
         #[cfg(feature = "hydrate")]
         {
             let days = candidates.get_untracked();
+            let total = days.len();
             spawn_local(async move {
                 let (Some(&first), Some(&last)) = (days.first(), days.last()) else {
                     return;
@@ -158,12 +194,12 @@ pub fn ImportBanner() -> impl IntoView {
                         copied += 1;
                     }
                 }
-                mark_done();
+                let (fully_succeeded, message) = import_outcome(copied, total);
+                if fully_succeeded {
+                    mark_done();
+                }
                 candidates.set(Vec::new());
-                status.set(Some(format!(
-                    "Imported {copied} {}.",
-                    if copied == 1 { "day" } else { "days" }
-                )));
+                status.set(Some(message));
             });
         }
     };
@@ -268,5 +304,45 @@ mod tests {
     #[test]
     fn done_flag_key_is_pinned() {
         assert_eq!(DONE_FLAG_KEY, "time_entry_import_done");
+    }
+
+    #[test]
+    fn a_full_import_is_settled() {
+        let (fully_succeeded, message) = import_outcome(3, 3);
+        assert!(fully_succeeded, "every offered day landed");
+        assert_eq!(message, "Imported 3 days.");
+    }
+
+    #[test]
+    fn a_single_day_import_uses_singular_wording() {
+        let (fully_succeeded, message) = import_outcome(1, 1);
+        assert!(fully_succeeded);
+        assert_eq!(message, "Imported 1 day.");
+    }
+
+    /// The regression this guards against: a partial import must not settle
+    /// this device, or the days that failed would be stranded in
+    /// `localStorage` with no way back short of hand-editing it.
+    #[test]
+    fn a_partial_import_is_not_settled() {
+        let (fully_succeeded, message) = import_outcome(3, 5);
+        assert!(!fully_succeeded, "a partial import must be re-offered");
+        assert_eq!(message, "Imported 3 of 5 days.");
+    }
+
+    /// The extreme case of the same regression: every write failing must
+    /// not look like success just because nothing panicked.
+    #[test]
+    fn a_total_failure_is_not_settled() {
+        let (fully_succeeded, message) = import_outcome(0, 5);
+        assert!(!fully_succeeded);
+        assert_eq!(message, "Imported 0 of 5 days.");
+    }
+
+    #[test]
+    fn a_failed_single_day_import_uses_singular_wording() {
+        let (fully_succeeded, message) = import_outcome(0, 1);
+        assert!(!fully_succeeded);
+        assert_eq!(message, "Imported 0 of 1 day.");
     }
 }
