@@ -456,11 +456,21 @@ mod tests {
     /// A row this build cannot classify is not a route. The alternative —
     /// treating an unknown kind as one of the two known ones — would derive
     /// under the wrong `info` and fail as a corrupt row.
+    ///
+    /// Covers both wrong defaults, not just one: a recovery-shaped row with
+    /// an unrecognized `kind` would slip past an implementation that defaults
+    /// to `WrapKind::Recovery`, and a passkey-shaped row whose credential
+    /// matches the query would slip past one that defaults to
+    /// `WrapKind::Passkey`.
     #[test]
     fn a_row_of_an_unrecognized_kind_is_skipped() {
-        let mut rows = vec![wrap(WrapKind::Recovery, None, 1)];
-        rows[0].kind = "future".to_string();
-        assert!(choose_route(&rows, None).is_none());
-        assert!(choose_route(&rows, Some(b"cred-a")).is_none());
+        let mut recovery_shaped = wrap(WrapKind::Recovery, None, 1);
+        recovery_shaped.kind = "future".to_string();
+        assert!(choose_route(&[recovery_shaped.clone()], None).is_none());
+        assert!(choose_route(&[recovery_shaped], Some(b"cred-a")).is_none());
+
+        let mut passkey_shaped = wrap(WrapKind::Passkey, Some(b"cred-x"), 2);
+        passkey_shaped.kind = "future".to_string();
+        assert!(choose_route(&[passkey_shaped], Some(b"cred-x")).is_none());
     }
 }
