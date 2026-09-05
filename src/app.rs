@@ -12,7 +12,7 @@ use crate::components::header::AppHeader;
 use crate::components::import_banner::ImportBanner;
 use crate::components::time_display::TimeDisplay;
 use crate::components::time_entry_area::TimeEntryArea;
-use crate::components::unlock::UnlockPrompt;
+use crate::components::unlock::{UnlockPrompt, UnlockReason};
 use crate::components::week_view::WeekView;
 use crate::date::parse_iso;
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
@@ -156,20 +156,34 @@ fn DayView(date: NaiveDate) -> impl IntoView {
             <AppHeader date=Some(date)/>
             <div class="w-full max-w-7xl mx-auto px-4 py-8">
                 <ImportBanner/>
-                // The gate spec section 7.4 requires: only `Locked` swaps in
-                // the unlock prompt. `Unknown` renders the entry area in its
-                // ordinary unloaded state — exactly what the server already
-                // renders for every visitor — rather than blanking it; the
-                // server is always `Unknown` (invariant E2), so blanking it
-                // would remove the entry area from every server-rendered
-                // page, not just a locked one. The cost of *not* blanking is
-                // narrower: a locked session sees the same unloaded shell for
-                // the width of the post-hydration probe before this swaps it
-                // for the prompt, since a `Locked` read fails the same way
-                // `hook::loaded_value` maps any other one — a brief flash on
-                // a rare path, not a permanent wrong answer.
+                // The gate spec section 7.4 requires: only a state the user
+                // has to act on swaps in the prompt. `Unknown` renders the
+                // entry area in its ordinary unloaded state — exactly what
+                // the server already renders for every visitor — rather than
+                // blanking it; the server is always `Unknown` (invariant
+                // E2), so blanking it would remove the entry area from every
+                // server-rendered page, not just a locked one. The cost of
+                // *not* blanking is narrower: a locked session sees the same
+                // unloaded shell for the width of the post-hydration probe
+                // before this swaps it for the prompt, since a `Locked` read
+                // fails the same way `hook::loaded_value` maps any other one
+                // — a brief flash on a rare path, not a permanent wrong
+                // answer.
+                //
+                // `Unreachable` joins `Locked` rather than `Unknown`, and the
+                // difference is who can end the state. `Unknown` ends by
+                // itself, in milliseconds; `Unreachable` ends only if the
+                // user asks for another try, and until they do every save is
+                // refused. Leaving the entry area mounted there would invite
+                // exactly the typing that cannot be saved. The server never
+                // reaches it, so E2 is untouched.
                 {move || match encryption.state() {
-                    EncryptionState::Locked => Either::Right(view! { <UnlockPrompt/> }),
+                    EncryptionState::Locked => {
+                        Either::Right(view! { <UnlockPrompt reason=UnlockReason::Locked/> })
+                    }
+                    EncryptionState::Unreachable => {
+                        Either::Right(view! { <UnlockPrompt reason=UnlockReason::Unreachable/> })
+                    }
                     EncryptionState::Unknown
                     | EncryptionState::Disabled
                     | EncryptionState::Unlocked(_) => Either::Left(view! {
@@ -278,6 +292,28 @@ mod tests {
         );
     }
 
+    /// The failure mode a retry exists for: a probe that could not answer
+    /// must say so and offer another try, not leave the entry area mounted
+    /// over a session that refuses every save. The copy matters as much as
+    /// the mount — this user is not locked out of anything, the app simply
+    /// does not know yet.
+    #[test]
+    fn day_view_offers_a_retry_when_the_probe_could_not_answer() {
+        let html = render_day_view(EncryptionState::Unreachable);
+        assert!(
+            html.contains("Try again"),
+            "an unanswered probe must offer another try"
+        );
+        assert!(
+            !html.contains("Unlock your entries"),
+            "an unanswered probe is not a lockout and must not read as one"
+        );
+        assert!(
+            !html.contains("<textarea"),
+            "the entry area must not mount over a session that cannot save"
+        );
+    }
+
     /// The gate's other half: every other state still mounts the entry
     /// area, exactly as it did before this gate existed (spec 7.4's
     /// correction — `Unknown` is not a second reason to hide it).
@@ -381,7 +417,7 @@ mod tests {
     ///
     /// This cannot distinguish `Unknown` from `Disabled` — neither renders
     /// unlock UI — so `encryption_ctx`'s
-    /// `a_context_that_has_not_probed_yet_is_unknown` pins that half.
+    /// `a_context_starts_unknown_and_refuses_writes` pins that half.
     #[test]
     fn ssr_renders_unknown_encryption_state() {
         let html = render_at("/2026-09-05", Some("alice@example.com"));

@@ -20,6 +20,16 @@
 //! "this account has no encryption" — and asserting it about a signed-in
 //! visitor before anything has been read is what starts writing plaintext
 //! rows into an encrypted account.
+//!
+//! # Identity lives here
+//!
+//! This module is the only place that asks *whose* key a session holds. The
+//! storage seam takes the key it is handed and tries it (see
+//! [`crate::storage`]'s header), so the three guarantees that keep a key and
+//! an account together are all below: the probe resets to `Unknown` whenever
+//! `AuthCtx::user` changes, `SessionKey::restore` reads the keystore under
+//! the signed-in address, and `EncryptionCtx::unlock` refuses a key whose
+//! `SessionKey::user` is not the one signed in now.
 
 use leptos::prelude::*;
 
@@ -72,12 +82,25 @@ fn unknown_state() -> StateSignal {
 
 /// What the view layer knows about this account's encryption.
 ///
-/// Four states rather than the three an account can be in, because "not yet
-/// known" is a state the UI has to render — see this module's header.
+/// Five states rather than the three an account can be in, because "not yet
+/// known" is a state the UI has to render — see this module's header — and
+/// because a probe that *failed* has to be told apart from one that has not
+/// finished (see [`Unreachable`](Self::Unreachable)).
 #[derive(Clone)]
 pub enum EncryptionState {
     /// Before the probe resolves, and everything the server ever renders.
     Unknown,
+    /// The probe ran and could not answer: the status call failed.
+    ///
+    /// Every decision this feeds is `Unknown`'s — no key, no write — and it
+    /// differs in exactly one respect, which is why it is a state rather
+    /// than a comment on `Unknown`: nothing more will happen on its own.
+    /// The probe's effect re-runs only when `AuthCtx::user` changes, so
+    /// without `EncryptionCtx::retry` one dropped request would refuse
+    /// every write for the rest of the session, with a console line as the
+    /// only trace. The server never probes and so never reaches this,
+    /// which is what keeps invariant E2 intact.
+    Unreachable,
     /// The account has no encryption; bodies are stored in the clear.
     Disabled,
     /// Encrypted, and this device holds no key for it.
@@ -96,14 +119,18 @@ pub enum EncryptionState {
 impl EncryptionState {
     /// The key to open stored bodies with, or `None` when there is none.
     ///
-    /// `Unknown` and `Locked` both read as "no key", and that is safe: a v2
-    /// row then surfaces as [`crate::storage::StorageError::Locked`], which
-    /// is the honest answer for a reader who has not unlocked yet, and a v1
-    /// row reads identically either way (spec E3).
+    /// `Unknown`, `Unreachable` and `Locked` all read as "no key", and that
+    /// is safe: a v2 row then surfaces as
+    /// [`crate::storage::StorageError::Locked`], which is the honest answer
+    /// for a reader who has not unlocked yet, and a v1 row reads identically
+    /// either way (spec E3).
     pub fn key(&self) -> Option<&SessionKey> {
         match self {
             EncryptionState::Unlocked(key) => Some(key),
-            EncryptionState::Unknown | EncryptionState::Disabled | EncryptionState::Locked => None,
+            EncryptionState::Unknown
+            | EncryptionState::Unreachable
+            | EncryptionState::Disabled
+            | EncryptionState::Locked => None,
         }
     }
 
@@ -114,22 +141,65 @@ impl EncryptionState {
     /// answer, because the row itself says which it is. A write cannot: the
     /// body is on its way out and nothing downstream would ever notice that
     /// an encrypted account had just taken a plaintext row. So `Locked`
-    /// refuses — and so does `Unknown`, because a write that cannot yet say
-    /// whether the account is encrypted must not guess, and the wrong guess
-    /// is unrecoverable in exactly the same way (see [`WriteKey`]).
+    /// refuses — and so do `Unknown` and `Unreachable`, because a write that
+    /// cannot yet say whether the account is encrypted must not guess, and
+    /// the wrong guess is unrecoverable in exactly the same way (see
+    /// [`WriteKey`]).
     pub fn write_key(&self) -> WriteKey<'_> {
         match self {
             EncryptionState::Disabled => WriteKey::Plaintext,
             EncryptionState::Unlocked(key) => WriteKey::Sealed(key),
-            EncryptionState::Unknown | EncryptionState::Locked => WriteKey::Locked,
+            EncryptionState::Unknown | EncryptionState::Unreachable | EncryptionState::Locked => {
+                WriteKey::Locked
+            }
         }
     }
+}
+
+/// Which key a read would use, reduced to something a `Memo` can compare.
+///
+/// The load in [`crate::storage::hook::use_persistent`] has to re-run when
+/// the key changes — an unlock is what turns a sealed row into readable
+/// text — and must *not* re-run when anything else about the state does. A
+/// re-run resets the value to `None` and republishes whatever storage holds,
+/// so a probe resolving in the window between a keystroke and its save would
+/// wipe what the user had just typed off the screen. Every keyless state
+/// therefore collapses to one value: a load run under any of them reads
+/// exactly the same rows with exactly no key.
+///
+/// Keys are told apart by a counter rather than by their contents, because
+/// [`SessionKey`] is neither comparable nor even inhabited off the browser:
+/// this is the `n`th key the page load published. Two publishes of the same
+/// key material read as two keys, which costs one redundant load — the safe
+/// direction, since the alternative is a load that should have happened and
+/// did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyIdentity {
+    /// No key at all: `Unknown`, `Unreachable`, `Disabled` or `Locked`.
+    NoKey,
+    /// The `n`th key published in this page load.
+    Key(u64),
 }
 
 /// This account's encryption state, shared across the component tree.
 #[derive(Clone, Copy)]
 pub struct EncryptionCtx {
     state: StateSignal,
+    /// How many keys this page load has published, which is what gives
+    /// [`KeyIdentity`] something to compare. See
+    /// [`publish`](Self::publish).
+    keys: StoredValue<u64>,
+    /// Who the state is about.
+    ///
+    /// `hydrate`-only because the browser is the only target that can hold
+    /// a key to check against it — a `cfg` rather than an `allow`, so the
+    /// field's absence says so rather than a comment.
+    #[cfg(feature = "hydrate")]
+    auth: AuthCtx,
+    /// Shared by the first probe and every [`retry`](Self::retry), so the
+    /// two can invalidate each other.
+    #[cfg(feature = "hydrate")]
+    generation: StoredValue<Generation>,
 }
 
 impl EncryptionCtx {
@@ -139,7 +209,14 @@ impl EncryptionCtx {
     /// until the probe lands; on the server it stays that way forever,
     /// which is the whole point (see this module's header).
     pub fn probing(auth: AuthCtx) -> Self {
-        let state = unknown_state();
+        let ctx = Self {
+            state: unknown_state(),
+            keys: StoredValue::new(0),
+            #[cfg(feature = "hydrate")]
+            auth,
+            #[cfg(feature = "hydrate")]
+            generation: StoredValue::new(Generation::default()),
+        };
 
         // Browser-only in full, not merely dormant under `ssr`: the probe
         // reaches a server function and this device's IndexedDB, and a
@@ -148,100 +225,180 @@ impl EncryptionCtx {
         // a keystore read out of the server binary.
         #[cfg(feature = "hydrate")]
         {
-            let generation = StoredValue::new(Generation::default());
-
             Effect::new(move |_| {
-                // Tracked: signing in and out are live, no-reload toggles
-                // (`AccountMenu` flips `AuthCtx::user` in place), and each
-                // one changes the answer.
-                let user = auth.user.get();
-
-                // Captured synchronously, before the `spawn_local` below,
-                // for the reason `week_view`'s range load spells out: this
-                // effect can re-run — and start a second probe — while an
-                // earlier one is still awaiting the server, and reading the
-                // token back out after the await would race that second run
-                // for the increment.
-                let token = generation
-                    .try_update_value(Generation::next)
-                    .unwrap_or_default();
-
-                let Some(user) = user else {
-                    // Signed out means `localStorage`, which is never
-                    // encrypted (spec section 1.2). So this needs no server
-                    // call — and must not make one, since there is no
-                    // session to make it with.
-                    state.set(EncryptionState::Disabled);
-                    return;
-                };
-
-                // Back to "not known yet" before the probe starts, so an
-                // `Unlocked` reached for the previous account never survives
-                // into the next one's render — the same reset
-                // `use_persistent` does when its key changes.
-                state.set(EncryptionState::Unknown);
-
-                spawn_local(async move {
-                    let probed = probe(&user).await;
-                    // Only the newest probe may publish; an older one
-                    // landing after a sign-in or sign-out must be discarded
-                    // rather than overwrite it. `try_with_value` rather than
-                    // the panicking form, since this owner can be disposed
-                    // while a probe is still in flight.
-                    let is_current = generation
-                        .try_with_value(|g| g.is_current(token))
-                        .unwrap_or(false);
-                    if is_current {
-                        state.set(probed);
-                    }
-                });
+                // Tracked: signing *out* is a live, no-reload toggle
+                // (`AccountMenu` clears `AuthCtx::user` in place) and it
+                // changes the answer. Signing in reloads the page instead,
+                // so this effect meets that one as a fresh page load rather
+                // than as a change.
+                ctx.start_probe(auth.user.get());
             });
         }
         #[cfg(not(feature = "hydrate"))]
         let _ = auth;
 
-        Self { state }
+        ctx
+    }
+
+    /// Starts a probe for `user`, discarding any probe still in flight.
+    ///
+    /// The token is captured synchronously, before the `spawn_local` below,
+    /// for the reason `week_view`'s range load spells out: this can be
+    /// called again — from the effect, or from [`retry`](Self::retry) —
+    /// while an earlier probe is still awaiting the server, and reading the
+    /// token back out after the await would race that later run for the
+    /// increment.
+    #[cfg(feature = "hydrate")]
+    fn start_probe(self, user: Option<String>) {
+        let token = self
+            .generation
+            .try_update_value(Generation::next)
+            .unwrap_or_default();
+
+        let Some(user) = user else {
+            // Signed out means `localStorage`, which is never encrypted
+            // (spec section 1.2). So this needs no server call — and must
+            // not make one, since there is no session to make it with.
+            self.publish(EncryptionState::Disabled);
+            return;
+        };
+
+        // Back to "not known yet" before the probe starts, so an `Unlocked`
+        // reached for the previous account never survives into the next
+        // one's render — the same reset `use_persistent` does when its key
+        // changes.
+        self.publish(EncryptionState::Unknown);
+
+        spawn_local(async move {
+            let probed = probe(&user).await;
+            // Only the newest probe may publish; an older one landing after
+            // a sign-out, or after a retry overtook it, must be discarded
+            // rather than overwrite it. `try_with_value` rather than the
+            // panicking form, since this owner can be disposed while a
+            // probe is still in flight.
+            let is_current = self
+                .generation
+                .try_with_value(|g| g.is_current(token))
+                .unwrap_or(false);
+            if is_current {
+                self.publish(probed);
+            }
+        });
+    }
+
+    /// Runs the probe again, which is the only thing that can move
+    /// [`EncryptionState::Unreachable`].
+    ///
+    /// Without it a single dropped request refuses every write for the rest
+    /// of the session: the probe's effect re-runs only when `AuthCtx::user`
+    /// changes, and a failed probe changes nothing that would trigger it.
+    /// `UnlockPrompt`'s retry button is the way out.
+    ///
+    /// Shares the probe's `Generation` rather than taking one of its own. A
+    /// retry and the probe it retries are two runs of the same thing and
+    /// only the newest may publish; two counters would each read itself as
+    /// current, and whichever answer arrived last would win regardless of
+    /// which was asked for last.
+    #[cfg(feature = "hydrate")]
+    pub fn retry(self) {
+        // Untracked: this runs from a click handler rather than an effect,
+        // so there is no dependency worth registering — and registering one
+        // would make the handler's owner a subscriber of `AuthCtx`.
+        self.start_probe(self.auth.user.get_untracked());
+    }
+
+    /// Publishes `state`, giving a newly unlocked key an identity of its
+    /// own.
+    ///
+    /// Every write to the signal goes through here, and the counter is
+    /// bumped *before* the set, so a `Memo` over
+    /// [`key_identity`](Self::key_identity) recomputing in response to that
+    /// set already sees the new number.
+    #[cfg(any(feature = "hydrate", test))]
+    fn publish(self, state: EncryptionState) {
+        if matches!(state, EncryptionState::Unlocked(_)) {
+            let _ = self.keys.try_update_value(|n| *n += 1);
+        }
+        self.state.set(state);
     }
 
     /// Builds a context already parked at `state`, bypassing the probe
     /// entirely.
     ///
-    /// Test-only, and the only way to reach `Locked` — or to pin
-    /// `Disabled`/`Unlocked` explicitly — on the host: `probing` always
-    /// starts at `Unknown`, and the `Effect` that could move it anywhere
-    /// else is `hydrate`-only. `DayView`'s and `WeekView`'s mount-gate tests
-    /// need exactly this to prove those components actually branch on
-    /// `EncryptionState`, not merely that the states exist.
+    /// Test-only, and the only way to reach `Locked` or `Unreachable` — or
+    /// to pin `Disabled` explicitly — on the host: `probing` always starts
+    /// at `Unknown`, and the `Effect` that could move it anywhere else is
+    /// `hydrate`-only. `DayView`'s and `WeekView`'s mount-gate tests need
+    /// exactly this to prove those components actually branch on
+    /// `EncryptionState`, not merely that the states exist, and
+    /// `storage::hook`'s reload test needs it to drive a transition.
     ///
-    /// `ssr` as well as `test`: both call sites render with `.to_html()`,
-    /// which needs `leptos`'s `ssr` feature, so this has no caller — and
-    /// would be dead code — under a bare `cargo test --no-default-features`.
+    /// `ssr` as well as `test`: the mount-gate call sites render with
+    /// `.to_html()`, which needs `leptos`'s `ssr` feature, so this has no
+    /// caller — and would be dead code — under a bare
+    /// `cargo test --no-default-features`.
     #[cfg(all(test, feature = "ssr"))]
     pub(crate) fn for_state(state: EncryptionState) -> Self {
-        #[cfg(feature = "hydrate")]
-        let state = RwSignal::new_local(state);
-        #[cfg(not(feature = "hydrate"))]
-        let state = RwSignal::new(state);
-        Self { state }
+        let ctx = Self {
+            state: unknown_state(),
+            keys: StoredValue::new(0),
+            #[cfg(feature = "hydrate")]
+            auth: AuthCtx {
+                user: RwSignal::new(None),
+            },
+            #[cfg(feature = "hydrate")]
+            generation: StoredValue::new(Generation::default()),
+        };
+        ctx.publish(state);
+        ctx
+    }
+
+    /// Moves a [`for_state`](Self::for_state) context to another state, so a
+    /// test can drive a transition rather than only observe one. Goes
+    /// through [`publish`](Self::publish), so key identities behave here
+    /// exactly as they do in the browser.
+    #[cfg(all(test, feature = "ssr"))]
+    pub(crate) fn set_for_test(self, state: EncryptionState) {
+        self.publish(state);
     }
 
     /// The current state, tracked.
     ///
     /// Tracked is what makes an unlock visible without a reload: the day and
-    /// week loads read through here, so resolving the probe — or unlocking
-    /// later — re-runs them and the text appears.
+    /// week views render through here, so resolving the probe — or
+    /// unlocking later — swaps the unlock prompt for the entry area.
+    ///
+    /// Reads that only want to know *which key* should not use this; see
+    /// [`key_identity`](Self::key_identity).
     pub fn state(self) -> EncryptionState {
         self.state.get()
     }
 
     /// The current state, without subscribing.
     ///
-    /// The write path's read. A save must use the session as it is right
-    /// now, not turn itself into a reactive dependency of the effect it was
-    /// spawned from — the same reason `Persistent::set` reads its key and
-    /// backend untracked.
+    /// The write path's read, and the load path's read of the key itself. A
+    /// save must use the session as it is right now, not turn itself into a
+    /// reactive dependency of the effect it was spawned from — the same
+    /// reason `Persistent::set` reads its key and backend untracked.
     pub fn state_untracked(self) -> EncryptionState {
         self.state.get_untracked()
+    }
+
+    /// Which key a read would use, tracked — the narrow dependency the
+    /// storage load subscribes to instead of [`state`](Self::state).
+    ///
+    /// See [`KeyIdentity`] for why the load must not track the state's
+    /// shape.
+    pub fn key_identity(self) -> KeyIdentity {
+        match self.state.get() {
+            EncryptionState::Unlocked(_) => {
+                KeyIdentity::Key(self.keys.try_get_value().unwrap_or_default())
+            }
+            EncryptionState::Unknown
+            | EncryptionState::Unreachable
+            | EncryptionState::Disabled
+            | EncryptionState::Locked => KeyIdentity::NoKey,
+        }
     }
 
     /// Publishes a session an unlock ceremony just opened (spec section 6.3).
@@ -251,14 +408,25 @@ impl EncryptionCtx {
     /// `crypto::unlock_with_prf`/`unlock_with_recovery` have already called
     /// `SessionKey::adopt`, which writes the keystore record — this call
     /// only tells the rest of the tree the session changed, which is what
-    /// makes the day and week loads (tracked through [`state`](Self::state))
-    /// re-run and show the now-readable entries without a reload.
+    /// makes the day and week views (rendered through
+    /// [`state`](Self::state)) swap the prompt for the entries.
     ///
     /// `hydrate`-only, like the type it takes: nothing off the browser ever
     /// holds a `SessionKey` to pass here.
     #[cfg(feature = "hydrate")]
     pub fn unlock(self, key: SessionKey) {
-        self.state.set(EncryptionState::Unlocked(key));
+        // The ceremony that produced this key is async and the account menu
+        // stays mounted throughout it, so the account can change underneath
+        // it — signing out is a live toggle. A key adopted for the account
+        // that has just left must not become this session's: on the
+        // signed-out page it would seal `localStorage` rows under a key
+        // nothing can restore afterwards. This is the check the storage
+        // seam relies on and never repeats (see `storage`'s header).
+        if self.auth.user.get_untracked().as_deref() != Some(key.user()) {
+            error!("discarding an unlock for an account that is no longer signed in");
+            return;
+        }
+        self.publish(EncryptionState::Unlocked(key));
     }
 }
 
@@ -272,11 +440,12 @@ async fn probe(user: &str) -> EncryptionState {
             // Not `Disabled`. That is a conclusion about the account, and
             // reaching it from a failed request would mount the entry area
             // and start writing v1 rows into an account that may well be
-            // encrypted. Staying `Unknown` says only what is true — nothing
-            // was learned — and refuses writes until something is
-            // (`EncryptionState::write_key`).
+            // encrypted. `Unreachable` says only what is true — nothing was
+            // learned — refuses writes until something is
+            // (`EncryptionState::write_key`), and unlike `Unknown` says so
+            // to the user, who can then ask for another try.
             error!("could not read the account's encryption status: {err}");
-            return EncryptionState::Unknown;
+            return EncryptionState::Unreachable;
         }
     };
     if !status.enabled {
@@ -303,9 +472,14 @@ mod tests {
     /// Spec E2 at the unit level, and the half the SSR test cannot reach:
     /// `Unknown` and `Disabled` both hydrate cleanly, so a render is blind
     /// to the difference between them. The difference is what a signed-in
-    /// visitor's *writes* then do — see `write_key` below.
+    /// visitor's *writes* then do.
+    ///
+    /// What this can pin is only the starting value, not that a probe ran
+    /// and found nothing: the probe is an `Effect`, `hydrate`-only, and
+    /// absent from this build entirely. The `AuthCtx` is decorative for the
+    /// same reason — a signed-in one would produce this same result here.
     #[test]
-    fn a_context_that_has_not_probed_yet_is_unknown() {
+    fn a_context_starts_unknown_and_refuses_writes() {
         let owner = Owner::new();
         owner.with(|| {
             let auth = AuthCtx {
@@ -326,17 +500,18 @@ mod tests {
     /// the write rather than fall back to plaintext. `Unknown` is included
     /// deliberately — it is the state every signed-in page load starts in,
     /// so treating it as "no encryption" would downgrade the first save
-    /// after every reload.
+    /// after every reload — and so is `Unreachable`, which is the state a
+    /// failed probe leaves behind and would otherwise downgrade every save
+    /// for the rest of the session.
     #[test]
     fn a_session_that_cannot_seal_refuses_to_write() {
-        assert!(matches!(
-            EncryptionState::Unknown.write_key(),
-            WriteKey::Locked
-        ));
-        assert!(matches!(
-            EncryptionState::Locked.write_key(),
-            WriteKey::Locked
-        ));
+        for state in [
+            EncryptionState::Unknown,
+            EncryptionState::Unreachable,
+            EncryptionState::Locked,
+        ] {
+            assert!(matches!(state.write_key(), WriteKey::Locked));
+        }
     }
 
     #[test]
@@ -347,18 +522,40 @@ mod tests {
         ));
     }
 
-    /// The read side's complement: only `Unlocked` offers a key, and it is
-    /// the one arm no host test can build — `SessionKey` is uninhabited off
-    /// the browser. What is testable is that nothing *else* offers one, so a
-    /// state that cannot decrypt never claims it can.
+    // `EncryptionState::key` has no host test of its own, deliberately. The
+    // only arm that can answer `Some` is `Unlocked`, which needs a
+    // `SessionKey` — uninhabited off the browser — so the three arms a host
+    // test can build could not return one whatever the body of the function
+    // said. An assertion over them passes against every possible
+    // implementation, which reads as coverage of the read path while
+    // guarding nothing. `write_key`, above, is where the same decision is
+    // genuinely discriminable, and it is tested there.
+
+    /// The narrowing A1 turns on, at the unit level: every state without a
+    /// key reduces to one identity, so a `Memo` over it stays silent across
+    /// a transition between them. The reload that a notification would
+    /// trigger is what erased a keystroke made while the probe was still
+    /// running — `storage::hook` pins that end of it.
+    #[cfg(feature = "ssr")]
     #[test]
-    fn only_an_unlocked_session_offers_a_read_key() {
-        for state in [
-            EncryptionState::Unknown,
-            EncryptionState::Disabled,
-            EncryptionState::Locked,
-        ] {
-            assert!(state.key().is_none());
-        }
+    fn every_keyless_state_shares_one_key_identity() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let ctx = EncryptionCtx::for_state(EncryptionState::Unknown);
+            assert_eq!(ctx.key_identity(), KeyIdentity::NoKey);
+            for state in [
+                EncryptionState::Unreachable,
+                EncryptionState::Disabled,
+                EncryptionState::Locked,
+            ] {
+                ctx.set_for_test(state);
+                assert_eq!(
+                    ctx.key_identity(),
+                    KeyIdentity::NoKey,
+                    "a state with no key must not read as a new key"
+                );
+            }
+        });
+        owner.cleanup();
     }
 }

@@ -1,16 +1,20 @@
-//! The unlock prompt for a `Locked` session (spec section 6.3).
+//! The unlock prompt for a session the user has to act on (spec section 6.3).
 //!
 //! `DayView` and `WeekView` mount this in place of the entry area whenever
-//! `EncryptionCtx` reads `Locked` — never on the server, which always reads
-//! `Unknown` (invariant E2), so the WebAuthn/WebCrypto ceremonies below are
-//! dead code there, not merely unreachable UI.
+//! `EncryptionCtx` reads `Locked` — or `Unreachable`, the state a failed
+//! probe leaves behind, which needs a different panel and offers a retry
+//! rather than an unlock. Which of the two arrives as [`UnlockReason`],
+//! decided by the gate that mounted this; see there for why it is a prop.
+//! Neither state ever happens on the server, which always reads `Unknown`
+//! (invariant E2), so the WebAuthn/WebCrypto ceremonies below are dead code
+//! there, not merely unreachable UI.
 //!
 //! Two routes open the account's data key: a passkey assertion with the PRF
 //! extension evaluated, and a typed recovery code. A recovery unlock has one
 //! more step than a passkey one — spec section 6.4's offer of a fresh code —
 //! which is why the flow below has more than two states.
 
-use leptos::either::EitherOf4;
+use leptos::either::{Either, EitherOf4};
 use leptos::prelude::*;
 #[cfg(feature = "hydrate")]
 use leptos::task::spawn_local;
@@ -21,6 +25,21 @@ use crate::auth_ctx::AuthCtx;
 use crate::crypto::SessionKey;
 #[cfg(feature = "hydrate")]
 use crate::encryption_ctx::EncryptionCtx;
+
+/// Why this prompt is on screen, decided by whoever mounted it.
+///
+/// A prop rather than a second read of `EncryptionCtx`. The two states that
+/// mount this component are exactly the two the gates in `DayView` and
+/// `WeekBody` have already matched on, so re-deriving the answer here would
+/// buy three match arms that cannot happen and a subscription to a signal
+/// whose very next change unmounts this component.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UnlockReason {
+    /// The account is encrypted and this device holds no key for it.
+    Locked,
+    /// The probe could not say whether the account is encrypted at all.
+    Unreachable,
+}
 
 /// Where the prompt is in its flow.
 ///
@@ -56,13 +75,14 @@ enum Mode {
 }
 
 #[component]
-pub fn UnlockPrompt() -> impl IntoView {
+pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
     // Neither context is read anywhere below except inside a
-    // `#[cfg(feature = "hydrate")]` block: this component structurally never
-    // renders under `ssr` (`EncryptionCtx` there is always `Unknown`, never
-    // `Locked`), so there is nothing for either to do on that target — and
-    // fetching them anyway would leave both unused there, which is exactly
-    // what `#[cfg]`-ing the fetch alongside every use avoids.
+    // `#[cfg(feature = "hydrate")]` block: everything either does — an
+    // unlock ceremony, a re-probe — reaches WebAuthn, WebCrypto or the
+    // network, and this component structurally never renders on the server
+    // (both states that mount it are post-probe, and the server always reads
+    // `Unknown`). Fetching them anyway would leave both unused there, which
+    // is exactly what `#[cfg]`-ing the fetch alongside every use avoids.
     #[cfg(feature = "hydrate")]
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
     #[cfg(feature = "hydrate")]
@@ -70,6 +90,12 @@ pub fn UnlockPrompt() -> impl IntoView {
     let mode = RwSignal::new(Mode::default());
     let status = RwSignal::new(String::new());
     let code_input = RwSignal::new(String::new());
+    // Whether a ceremony is in flight. Every button that starts one — and
+    // every button that would tear this component down while one is running
+    // — is disabled on it, so a double-click cannot open two assertions, and
+    // "keep my current code" cannot unmount the panel out from under a
+    // re-issue that is still awaiting the server.
+    let busy = RwSignal::new(false);
 
     // Bridges a recovery unlock's two clicks: the code submit, which
     // produces the key, and the reissue answer, which is what actually
@@ -95,8 +121,14 @@ pub fn UnlockPrompt() -> impl IntoView {
                 // panicking costs nothing if that ever stops holding.
                 return;
             };
+            busy.set(true);
             spawn_local(async move {
-                match ceremony::unlock_with_passkey(&user).await {
+                let outcome = ceremony::unlock_with_passkey(&user).await;
+                // Cleared before the branch, not inside each arm: the
+                // success arm unmounts this component, so anything after it
+                // would be writing to a disposed signal.
+                busy.set(false);
+                match outcome {
                     Ok(key) => encryption.unlock(key),
                     Err(msg) => status.set(msg),
                 }
@@ -122,8 +154,11 @@ pub fn UnlockPrompt() -> impl IntoView {
                 return;
             };
             let typed = code_input.get_untracked();
+            busy.set(true);
             spawn_local(async move {
-                match ceremony::unlock_with_recovery_code(&typed, &user).await {
+                let outcome = ceremony::unlock_with_recovery_code(&typed, &user).await;
+                busy.set(false);
+                match outcome {
                     Ok((key, code, wrap)) => {
                         pending_key.set_value(Some(key));
                         mode.set(Mode::OfferReissue { code, wrap });
@@ -148,8 +183,11 @@ pub fn UnlockPrompt() -> impl IntoView {
             let Mode::OfferReissue { code, wrap } = mode.get_untracked() else {
                 return;
             };
+            busy.set(true);
             spawn_local(async move {
-                match ceremony::reissue_recovery_code(&code, &wrap).await {
+                let outcome = ceremony::reissue_recovery_code(&code, &wrap).await;
+                busy.set(false);
+                match outcome {
                     Ok(new_code) => mode.set(Mode::ShowNewCode(new_code)),
                     Err(msg) => {
                         status.set(msg);
@@ -167,106 +205,148 @@ pub fn UnlockPrompt() -> impl IntoView {
         }
     };
 
+    let retry_probe = move |_| {
+        status.set(String::new());
+        // The context owns the `Generation` this re-uses, so a retry started
+        // while the first probe is still in flight invalidates it rather
+        // than racing it.
+        #[cfg(feature = "hydrate")]
+        encryption.retry();
+    };
+
     view! {
         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
             {move || {
                 let s = status.get();
                 (!s.is_empty()).then(|| view! { <p class="text-xs text-red-600 mb-3">{s}</p> })
             }}
-            {move || match mode.get() {
-                Mode::Choosing => EitherOf4::A(view! {
+            {match reason {
+                // Nothing here mentions a key, deliberately: the account may
+                // not even be encrypted, and "unlock" would tell the user
+                // they are shut out of something that might not exist. What
+                // is true is narrower — the app could not find out, and
+                // until it does it will not write.
+                UnlockReason::Unreachable => Either::Left(view! {
                     <div>
-                        <h2 class="text-lg font-semibold text-gray-800 mb-1">"Unlock your entries"</h2>
+                        <h2 class="text-lg font-semibold text-gray-800 mb-1">"Couldn't check this account"</h2>
                         <p class="text-sm text-gray-600 mb-4">
-                            "This account's entries are encrypted, and this device doesn't hold the key yet."
-                        </p>
-                        <button
-                            type="button"
-                            class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 mb-2"
-                            on:click=use_passkey
-                        >
-                            "Use a passkey"
-                        </button>
-                        <button
-                            type="button"
-                            class="w-full border border-gray-300 text-sm rounded py-2 hover:bg-gray-50"
-                            on:click=open_code_entry
-                        >
-                            "Enter your recovery code"
-                        </button>
-                    </div>
-                }),
-                Mode::EnteringCode => EitherOf4::B(view! {
-                    <div>
-                        <h2 class="text-lg font-semibold text-gray-800 mb-1">"Enter your recovery code"</h2>
-                        <p class="text-sm text-gray-600 mb-3">"Thirty-two characters, in groups of four."</p>
-                        <input
-                            type="text"
-                            autocomplete="off"
-                            spellcheck="false"
-                            class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm mb-3 font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                            placeholder="0000-0000-0000-0000-0000-0000-0000-0000"
-                            prop:value=move || code_input.get()
-                            on:input=move |ev| code_input.set(event_target_value(&ev))
-                        />
-                        <button
-                            type="button"
-                            class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 mb-2"
-                            on:click=submit_code
-                        >
-                            "Unlock"
-                        </button>
-                        <button
-                            type="button"
-                            class="w-full text-sm text-gray-600 hover:text-gray-900 py-1"
-                            on:click=back_to_choosing
-                        >
-                            "Back"
-                        </button>
-                    </div>
-                }),
-                Mode::OfferReissue { .. } => EitherOf4::C(view! {
-                    <div>
-                        <h2 class="text-lg font-semibold text-gray-800 mb-1">"Get a new recovery code?"</h2>
-                        <p class="text-sm text-gray-600 mb-4">
-                            "You just typed the code you have, so treat it as less private than it was. \
-                             A new one replaces it — the old code stops working once this finishes — or \
-                             you can keep the one you have."
-                        </p>
-                        <button
-                            type="button"
-                            class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 mb-2"
-                            on:click=generate_new_code
-                        >
-                            "Generate a new code"
-                        </button>
-                        <button
-                            type="button"
-                            class="w-full border border-gray-300 text-sm rounded py-2 hover:bg-gray-50"
-                            on:click=skip_reissue
-                        >
-                            "Keep my current code"
-                        </button>
-                    </div>
-                }),
-                Mode::ShowNewCode(code) => EitherOf4::D(view! {
-                    <div>
-                        <h2 class="text-lg font-semibold text-gray-800 mb-1">"Your new recovery code"</h2>
-                        <p class="text-sm text-gray-600 mb-3">
-                            "Write this down or save it somewhere safe. It won't be shown again, and the \
-                             code you just used no longer works."
-                        </p>
-                        <p class="font-mono text-sm bg-gray-50 border border-gray-200 rounded px-3 py-2 mb-4 break-all">
-                            {code}
+                            "We couldn't tell whether this account's entries are encrypted, so \
+                             nothing is being saved — guessing wrong would store your entries \
+                             unencrypted. This is usually a connection problem."
                         </p>
                         <button
                             type="button"
                             class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700"
-                            on:click=finish_after_new_code
+                            on:click=retry_probe
                         >
-                            "I've saved it"
+                            "Try again"
                         </button>
                     </div>
+                }),
+                // The flow this component was written for.
+                UnlockReason::Locked => Either::Right(view! {
+                    {move || match mode.get() {
+                        Mode::Choosing => EitherOf4::A(view! {
+                            <div>
+                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Unlock your entries"</h2>
+                                <p class="text-sm text-gray-600 mb-4">
+                                    "This account's entries are encrypted, and this device doesn't hold the key yet."
+                                </p>
+                                <button
+                                    type="button"
+                                    class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 mb-2 disabled:opacity-60"
+                                    disabled=move || busy.get()
+                                    on:click=use_passkey
+                                >
+                                    "Use a passkey"
+                                </button>
+                                <button
+                                    type="button"
+                                    class="w-full border border-gray-300 text-sm rounded py-2 hover:bg-gray-50 disabled:opacity-60"
+                                    disabled=move || busy.get()
+                                    on:click=open_code_entry
+                                >
+                                    "Enter your recovery code"
+                                </button>
+                            </div>
+                        }),
+                        Mode::EnteringCode => EitherOf4::B(view! {
+                            <div>
+                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Enter your recovery code"</h2>
+                                <p class="text-sm text-gray-600 mb-3">"Thirty-two characters, in groups of four."</p>
+                                <input
+                                    type="text"
+                                    autocomplete="off"
+                                    spellcheck="false"
+                                    class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm mb-3 font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                    placeholder="0000-0000-0000-0000-0000-0000-0000-0000"
+                                    prop:value=move || code_input.get()
+                                    on:input=move |ev| code_input.set(event_target_value(&ev))
+                                />
+                                <button
+                                    type="button"
+                                    class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 mb-2 disabled:opacity-60"
+                                    disabled=move || busy.get()
+                                    on:click=submit_code
+                                >
+                                    "Unlock"
+                                </button>
+                                <button
+                                    type="button"
+                                    class="w-full text-sm text-gray-600 hover:text-gray-900 py-1 disabled:opacity-60"
+                                    disabled=move || busy.get()
+                                    on:click=back_to_choosing
+                                >
+                                    "Back"
+                                </button>
+                            </div>
+                        }),
+                        Mode::OfferReissue { .. } => EitherOf4::C(view! {
+                            <div>
+                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Get a new recovery code?"</h2>
+                                <p class="text-sm text-gray-600 mb-4">
+                                    "You just typed the code you have, so treat it as less private than it was. \
+                                     A new one replaces it — the old code stops working once this finishes — or \
+                                     you can keep the one you have."
+                                </p>
+                                <button
+                                    type="button"
+                                    class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 mb-2 disabled:opacity-60"
+                                    disabled=move || busy.get()
+                                    on:click=generate_new_code
+                                >
+                                    "Generate a new code"
+                                </button>
+                                <button
+                                    type="button"
+                                    class="w-full border border-gray-300 text-sm rounded py-2 hover:bg-gray-50 disabled:opacity-60"
+                                    disabled=move || busy.get()
+                                    on:click=skip_reissue
+                                >
+                                    "Keep my current code"
+                                </button>
+                            </div>
+                        }),
+                        Mode::ShowNewCode(code) => EitherOf4::D(view! {
+                            <div>
+                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Your new recovery code"</h2>
+                                <p class="text-sm text-gray-600 mb-3">
+                                    "Write this down or save it somewhere safe. It won't be shown again, and the \
+                                     code you just used no longer works."
+                                </p>
+                                <p class="font-mono text-sm bg-gray-50 border border-gray-200 rounded px-3 py-2 mb-4 break-all">
+                                    {code}
+                                </p>
+                                <button
+                                    type="button"
+                                    class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700"
+                                    on:click=finish_after_new_code
+                                >
+                                    "I've saved it"
+                                </button>
+                            </div>
+                        }),
+                    }}
                 }),
             }}
         </div>
@@ -282,6 +362,7 @@ pub fn UnlockPrompt() -> impl IntoView {
 mod ceremony {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use leptos::logging::error;
     use leptos::prelude::ServerFnError;
 
     use crate::crypto::wire::APP_SALT;
@@ -345,8 +426,21 @@ mod ceremony {
         };
 
         let wraps = encryption_wraps().await.map_err(server_unreachable)?;
-        let credential_id = credential_id_from_response(&response);
-        let route = choose_route(&wraps, credential_id.as_deref()).ok_or_else(|| {
+        // Branched here rather than handed to `choose_route` as the
+        // `Option` it takes. `None` there means "the user chose the recovery
+        // route", and a `rawId` this could not parse is not that: sharing
+        // one representation would send the passkey path off to open the
+        // *recovery* wrap with a PRF output. The unwrap would fail, so the
+        // user is never told a wrong thing succeeded — but they would be
+        // told the wrong reason it failed.
+        let Some(credential_id) = credential_id_from_response(&response) else {
+            return Err(
+                "That passkey didn't identify itself to this browser. Try your recovery \
+                 code instead."
+                    .to_string(),
+            );
+        };
+        let route = choose_route(&wraps, Some(&credential_id)).ok_or_else(|| {
             "That passkey can't unlock this account. Try your recovery code instead.".to_string()
         })?;
 
@@ -382,6 +476,35 @@ mod ceremony {
         Ok((key, typed.to_string(), route.wrapped_key))
     }
 
+    /// Stores a re-issued recovery wrap, retrying once with the identical
+    /// bytes.
+    ///
+    /// The failure this exists for is a *lost response*, not a lost request.
+    /// If the replace commits and the reply never arrives, the client
+    /// reports "couldn't reach the server" and sends the user back to the
+    /// offer screen believing their old code still works — while the server
+    /// now holds a wrap derived from a code they were never shown. They find
+    /// out when they have lost every passkey and reach for the recovery
+    /// code, at which point the entries are unreadable for good. Low
+    /// probability, total consequence, and it defeats the one safety net the
+    /// design rests on.
+    ///
+    /// `encryption_replace_recovery_wrap` is idempotent for a given wrap
+    /// (see its own doc), which is what makes a retry safe: the second call
+    /// either finds the work already done or finishes it, and either way the
+    /// account ends up holding the code the user is about to be shown.
+    async fn store_recovery_wrap(wrapped_key: Vec<u8>) -> Result<(), String> {
+        match encryption_replace_recovery_wrap(wrapped_key.clone()).await {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                error!("storing the re-issued recovery wrap failed, retrying once: {first}");
+                encryption_replace_recovery_wrap(wrapped_key)
+                    .await
+                    .map_err(server_unreachable)
+            }
+        }
+    }
+
     /// Spec section 6.4's offer: wraps the data key under a fresh code and
     /// replaces the stored recovery wrap.
     ///
@@ -397,9 +520,7 @@ mod ceremony {
             "Couldn't generate a new recovery code. Your current one still works.".to_string()
         })?;
 
-        encryption_replace_recovery_wrap(new_wrap)
-            .await
-            .map_err(server_unreachable)?;
+        store_recovery_wrap(new_wrap).await?;
 
         Ok(new_code)
     }

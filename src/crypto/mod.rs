@@ -159,10 +159,14 @@ mod ceremony {
 
         /// The account this key belongs to.
         ///
-        /// Read by the encryption context (spec section 7.4) when
-        /// `AuthCtx::user` changes: an in-memory handle unlocked for the
-        /// previous account outlives the keystore's own user check, which
-        /// only runs on a read.
+        /// Read by `EncryptionCtx::unlock` (spec section 7.4), which refuses
+        /// a key that does not belong to the account signed in *now*. An
+        /// unlock ceremony is async and the account menu stays mounted
+        /// throughout it, so a sign-out can land in the middle; the
+        /// keystore's own user check would not catch that, because it runs
+        /// on the read that already happened. That one call is why this
+        /// accessor exists — the storage seam deliberately never asks (see
+        /// `storage`'s header).
         pub fn user(&self) -> &str {
             &self.user
         }

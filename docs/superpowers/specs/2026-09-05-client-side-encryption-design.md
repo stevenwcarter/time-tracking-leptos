@@ -402,15 +402,26 @@ failures that look like corruption.
 ```rust
 pub enum EncryptionState {
     Unknown,     // before the post-hydration probe resolves
+    Unreachable, // the probe ran and the status call failed
     Disabled,    // account has no encryption
     Locked,      // encrypted, no key on this device
     Unlocked,    // key available
 }
 ```
 
-Provided at the app root beside `AuthCtx`. `Locked` renders the unlock
-prompt. **`Unknown`, `Disabled` and `Unlocked` all render the entry area** —
+Provided at the app root beside `AuthCtx`. `Locked` and `Unreachable` render
+the prompt — `Locked` offering the two unlock routes, `Unreachable` offering
+a retry. **`Unknown`, `Disabled` and `Unlocked` all render the entry area** —
 `Unknown` in exactly the unloaded state the server renders today.
+
+`Unreachable` differs from `Unknown` in exactly one respect, and it is the
+one that matters to the user: nothing will move it on its own. Both refuse
+writes, hold no key, and are conclusions about *this client*, not about the
+account. But `Unknown` ends by itself in milliseconds, while `Unreachable`
+ends only if the user asks for another try — so leaving the entry area
+mounted under it would invite typing that cannot be saved, for the rest of
+the session. The server never probes and so never reaches it, which is why
+the extra state does not disturb E2.
 
 An earlier draft said `Unknown` renders blank, and that was wrong. The server
 always renders `Unknown`, so blanking it removes the day view from every
@@ -426,11 +437,26 @@ a rare path, against an empty page on the universal one.
 It resolves after hydration, in one `Effect` that reruns whenever
 `AuthCtx::user` changes. Signed out → `Disabled` without a server call.
 Signed in → `encryption_status()`; if that reports the account is not
-encrypted, `Disabled`; otherwise read the keystore, and land on `Unlocked`
-or `Locked` according to whether a key for this user was found. That
-`Effect` takes a `Generation` token like every other async effect in this
-codebase — sign-in and sign-out can flip the backend mid-flight, and only the
-newest probe may publish.
+encrypted, `Disabled`; if the call *fails*, `Unreachable`; otherwise read the
+keystore, and land on `Unlocked` or `Locked` according to whether a key for
+this user was found. That `Effect` takes a `Generation` token like every
+other async effect in this codebase — sign-in and sign-out can flip the
+backend mid-flight, and only the newest probe may publish.
+
+`EncryptionCtx::retry()` re-runs that same probe on demand, sharing the one
+`Generation` rather than taking a second: a retry and the probe it retries
+are two runs of the same thing, and two counters would each read itself as
+current, letting whichever answer arrived last win regardless of which was
+asked for last.
+
+The load in `storage::hook` subscribes to a `Memo` over *which key* the
+state holds, not to the state itself. Every keyless state — `Unknown`,
+`Unreachable`, `Disabled`, `Locked` — is one value to that memo, because a
+load run under any of them reads the same rows with the same (absent) key.
+Tracking the state instead made the probe resolving restart the load, and a
+restart blanks the value and republishes what storage holds: a keystroke
+made during the probe window, which that same window refused to save, was
+reverted on screen in front of the user.
 
 **The server always renders `Unknown`.** It could read `encrypted_at`
 cheaply, but rendering `Locked` would put user-derived state in the SSR body,
@@ -445,6 +471,12 @@ the existing entry tri-state, and the same reasoning that keeps
 `envelope::wrap`/`unwrap` become async and take `Option<&SessionKey>`:
 `None` writes v1, `Some` writes v2. `load`, `clear`, `dates_with_entries` and
 `bodies_in_range` are already `async`.
+
+`clear` takes a `WriteKey` too, not just `store`. On `Remote` clearing a day
+*is* a write — it stores an empty body rather than deleting the row — so a
+locked session let through there would put a v1 row into an encrypted
+account, which is exactly the downgrade E7 forbids, arriving through the one
+door nobody was watching.
 
 `store` is **not** an `async fn` — it is a plain fn returning
 `impl Future`, and its doc comment says why: `value` is copied into an owned
@@ -463,7 +495,7 @@ Every one of these moves opaque blobs. None can derive a DEK.
 | `encryption_wraps` | `() -> Result<Vec<WrapRow>>` | The signed-in user's wraps: `kind`, `credential_id`, `wrapped_key`, `kdf`, `wrap_alg`. |
 | `encryption_enable` | `(passkey_wrap: Vec<u8>, credential_id: Vec<u8>, recovery_wrap: Vec<u8>) -> Result<()>` | One transaction: sets `encrypted_at`, inserts both rows. Errors if already enabled. |
 | `encryption_add_passkey_wrap` | `(credential_id: Vec<u8>, wrapped_key: Vec<u8>) -> Result<()>` | §6.5. Rejects a credential that is not the caller's. |
-| `encryption_replace_recovery_wrap` | `(wrapped_key: Vec<u8>) -> Result<()>` | §6.4's re-issue. Replaces the single recovery row. |
+| `encryption_replace_recovery_wrap` | `(wrapped_key: Vec<u8>) -> Result<()>` | §6.4's re-issue. Replaces the single recovery row. Idempotent for a given wrap — resubmitting the stored one succeeds without touching it — so a client whose response was lost can safely retry (§12). |
 | `entries_all` | `() -> Result<Vec<(String, String)>>` | §8. Opaque strings. |
 | `entry_save_many` | `(entries: Vec<(String, String)>) -> Result<()>` | §8. One transaction. Same per-body length cap as `entry_save`. |
 
@@ -603,10 +635,12 @@ it — the phase-1 spec's §10 convention.
   unmigrated account legitimately holds.
 
   *Guarded by:* the type. `store` takes `WriteKey { Plaintext, Sealed, Locked }`
-  and refuses `Locked` with `StorageError::Locked` rather than writing.
+  and refuses `Locked` with `StorageError::Locked` rather than writing, and so
+  does `clear` — which on `Remote` is a write of an empty body, not a delete,
+  and so is the same downgrade wearing a different name.
   `EncryptionCtx::write_key()` is the single conversion from state to key, so
-  no call site derives one ad hoc. `Unknown` maps to `Locked`: refusing costs
-  a retry, writing costs a silent plaintext row.
+  no call site derives one ad hoc. `Unknown` and `Unreachable` both map to
+  `Locked`: refusing costs a retry, writing costs a silent plaintext row.
 
 - **E6. `APP_SALT` and the two HKDF `info` strings never change.** Changing
   one silently makes every existing wrap unopenable. *Guarded by:*
@@ -621,6 +655,8 @@ it — the phase-1 spec's §10 convention.
 | Migration interrupted | Mixed v1/v2. All rows readable. Resumes on demand. |
 | Wrong recovery code | AES-KW unwrap fails; "That recovery code didn't work." No lockout counter — the code is 160 bits. |
 | Passkey lost, code lost | Data is unreadable, permanently, by everyone. Stated in the enable dialog in those words. |
+| `encryption_status()` fails (dropped request, blip) | `Unreachable`, not `Disabled` — a failed request is not a conclusion about the account, and concluding "no encryption" would start writing v1 rows into an encrypted one. Writes are refused meanwhile. The state is terminal on its own (the probe's `Effect` reruns only on an `AuthCtx::user` change), so the prompt says the app could not determine the account's encryption state and offers `EncryptionCtx::retry()`. |
+| Re-issued recovery wrap committed, response lost | `encryption_replace_recovery_wrap` is idempotent for a given wrap, and the client retries once with the identical bytes. Without both, the server would hold a wrap derived from a code the user was never shown while the client told them their old code still works — discovered only after every passkey is gone, when the entries are already unreadable for good. |
 | Keystore cleared (private window, site data cleared) | `Locked`. Unlock re-populates it. |
 | Authenticator without PRF | Cannot unlock by passkey; recovery code works. `/account` labels the row. |
 | v2 row reaching a pre-phase-2 client | `UnsupportedVersion(2)` — a loud error, never rendered as text. Already tested. |

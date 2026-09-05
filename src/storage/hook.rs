@@ -31,7 +31,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use super::{Backend, Generation, StorageError, StorageKey, load, store};
-use crate::encryption_ctx::EncryptionCtx;
+use crate::encryption_ctx::{EncryptionCtx, EncryptionState, KeyIdentity};
 
 /// A value persisted across reloads, with the load state made explicit.
 #[derive(Clone, Copy)]
@@ -129,6 +129,39 @@ fn begin_operation(generation: StoredValue<Generation>) -> u64 {
         .unwrap_or_default()
 }
 
+/// Which key the load would use, as a `Memo` so that a change in the
+/// session's *shape* which leaves the key alone notifies nobody.
+///
+/// The load has to re-run when the key changes — an unlock is what turns a
+/// sealed row into readable text — and must not re-run when anything else
+/// about the session does. Tracking the whole state made the probe resolving
+/// (`Unknown` to `Disabled`, say) restart the load, and a restart blanks the
+/// value and republishes whatever storage holds: a keystroke made during the
+/// probe window, which the same window refused to save, was reverted on
+/// screen in front of the user. `Memo` is what turns "the state changed" into
+/// "the key changed" — see [`KeyIdentity`].
+fn session_identity(encryption: EncryptionCtx) -> Memo<KeyIdentity> {
+    Memo::new(move |_| encryption.key_identity())
+}
+
+/// Reads the load's three inputs with exactly the reactive dependencies the
+/// load should have.
+///
+/// The session itself is read *untracked*: `identity` is the only
+/// session-shaped thing this subscribes to, and it has already decided
+/// whether this load should happen at all. Reading [`EncryptionCtx::state`]
+/// here instead is the bug [`session_identity`] describes, so the two reads
+/// live together where the difference is visible.
+fn load_inputs(
+    key: Signal<StorageKey>,
+    backend: Signal<Backend>,
+    encryption: EncryptionCtx,
+    identity: Memo<KeyIdentity>,
+) -> (StorageKey, Backend, EncryptionState) {
+    identity.track();
+    (key.get(), backend.get(), encryption.state_untracked())
+}
+
 /// Reads `key` from `backend`, re-reading whenever either changes.
 ///
 /// The session comes from context rather than an argument, because unlike
@@ -141,17 +174,13 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
     let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     let generation = StoredValue::new(Generation::default());
 
+    let identity = session_identity(encryption);
+
     // `Effect::new` never runs during SSR, and on the client it runs after
     // the first render — so the DOM has already been matched by the time
     // this can change anything.
     Effect::new(move |_| {
-        let key = key.get();
-        let backend = backend.get();
-        // Tracked, unlike the write path's read of the same context: the
-        // probe resolving — and an unlock after it — is what turns a sealed
-        // row into readable text, so this load has to run again when it
-        // happens rather than leave the day looking empty until a reload.
-        let session = encryption.state();
+        let (key, backend, session) = load_inputs(key, backend, encryption, identity);
         let token = begin_operation(generation);
 
         // Back to "not loaded" before the new read starts. Without this the
@@ -192,6 +221,10 @@ mod tests {
     use super::*;
     use crate::auth_ctx::AuthCtx;
 
+    fn date(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, day).expect("valid date")
+    }
+
     /// A `Persistent` wired the way [`use_persistent`] wires one, minus the
     /// `Effect` — which never runs under `ssr` anyway (see this module's
     /// header), so there is nothing to drive it with here. Everything the
@@ -203,7 +236,7 @@ mod tests {
     /// does *before* spawning, and nothing polls the spawned future.
     fn persistent(generation: StoredValue<Generation>) -> Persistent {
         let (value, set_value) = signal::<Option<String>>(None);
-        let date = NaiveDate::from_ymd_opt(2026, 9, 4).expect("valid date");
+        let date = date(4);
         Persistent {
             value,
             set_value,
@@ -272,6 +305,53 @@ mod tests {
                     .try_with_value(|g| g.is_current(in_flight))
                     .unwrap_or(false)
             );
+        });
+        owner.cleanup();
+    }
+
+    /// The regression this guards against: the probe resolving must not
+    /// restart the load. A restart blanks the value and republishes what
+    /// storage holds, so anything typed since the load began — while the
+    /// textarea was editable and the probe still in flight — is wiped off
+    /// the screen, and the write that raced it was refused for being made
+    /// before the account's encryption was known. Nothing about one keyless
+    /// state becoming another changes what the load would read.
+    ///
+    /// A `Memo` stands in for the effect: `Effect::new` never runs under
+    /// `ssr` (this module's header), while a memo recomputes on exactly the
+    /// dependency changes an effect would re-run on.
+    #[test]
+    fn a_session_change_that_keeps_the_key_does_not_reload() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let encryption = EncryptionCtx::for_state(EncryptionState::Unknown);
+            let identity = session_identity(encryption);
+            let day = RwSignal::new(StorageKey::TimeEntry(date(4)));
+            let key: Signal<StorageKey> = day.into();
+            let backend = Signal::stored(Backend::Local);
+            let loads = StoredValue::new(0usize);
+            let load = Memo::new(move |_| {
+                load_inputs(key, backend, encryption, identity);
+                loads.update_value(|n| *n += 1);
+            });
+
+            load.get();
+            assert_eq!(loads.get_value(), 1, "the first render loads");
+
+            encryption.set_for_test(EncryptionState::Disabled);
+            load.get();
+            assert_eq!(
+                loads.get_value(),
+                1,
+                "the probe resolving must not restart the load"
+            );
+
+            // The complement, and the reason this is a narrowing rather than
+            // a removal: the load must still re-run for the reasons it
+            // always did.
+            day.set(StorageKey::TimeEntry(date(5)));
+            load.get();
+            assert_eq!(loads.get_value(), 2, "a new day must still reload");
         });
         owner.cleanup();
     }

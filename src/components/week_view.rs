@@ -17,7 +17,7 @@ use time_tracking_parser::{Time, parse_time_tracking_data};
 
 use crate::auth_ctx::AuthCtx;
 use crate::components::header::AppHeader;
-use crate::components::unlock::UnlockPrompt;
+use crate::components::unlock::{UnlockPrompt, UnlockReason};
 use crate::date::{parse_iso, to_iso, week_bounds};
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 use crate::storage::{Backend, Generation, StorageError, bodies_in_range};
@@ -182,20 +182,27 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
                 </div>
 
                 // Gated the same way `DayView` gates the entry area, and for
-                // the same reason (spec section 7.4): only `Locked` swaps in
-                // the unlock prompt. `Unknown` falls through to the ordinary
-                // loading/empty states below, exactly as it did before this
-                // gate existed — the server is always `Unknown` (invariant
-                // E2), so treating it as a reason to hide the totals shell
-                // would remove this page's chrome for every visitor, not
-                // just a locked one. A genuinely `Locked` session still gets
-                // there in the end: its range read comes back with every row
-                // unreadable, `loaded_rows` turns that into an empty week,
-                // and this arm replaces that empty week with the prompt once
-                // the post-hydration probe resolves — a brief flash of
-                // "Nothing logged", not a permanent wrong answer.
+                // the same reason (spec section 7.4): only a state the user
+                // has to act on swaps in the prompt. `Unknown` falls through
+                // to the ordinary loading/empty states below, exactly as it
+                // did before this gate existed — the server is always
+                // `Unknown` (invariant E2), so treating it as a reason to
+                // hide the totals shell would remove this page's chrome for
+                // every visitor, not just a locked one. A genuinely `Locked`
+                // session still gets there in the end: its range read comes
+                // back with every row unreadable, `loaded_rows` turns that
+                // into an empty week, and this arm replaces that empty week
+                // with the prompt once the post-hydration probe resolves — a
+                // brief flash of "Nothing logged", not a permanent wrong
+                // answer. `Unreachable` joins `Locked` for the reason
+                // `DayView`'s gate spells out: only the user can end it.
                 {move || match (encryption.state(), totals.get()) {
-                    (EncryptionState::Locked, _) => EitherOf3::C(view! { <UnlockPrompt/> }),
+                    (EncryptionState::Locked, _) => {
+                        EitherOf3::C(view! { <UnlockPrompt reason=UnlockReason::Locked/> })
+                    }
+                    (EncryptionState::Unreachable, _) => {
+                        EitherOf3::C(view! { <UnlockPrompt reason=UnlockReason::Unreachable/> })
+                    }
                     (_, None) => EitherOf3::A(view! {
                         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
                             <p class="value-slot"></p>
@@ -429,6 +436,22 @@ mod gate_tests {
         assert!(
             !html.contains("Nothing logged this week."),
             "the totals shell must not mount alongside the unlock prompt"
+        );
+    }
+
+    /// The week view's half of the retry gate: a probe that could not answer
+    /// must offer another try here too, rather than render a week that will
+    /// stay empty for as long as the session lasts.
+    #[test]
+    fn week_body_offers_a_retry_when_the_probe_could_not_answer() {
+        let html = render_week_body(EncryptionState::Unreachable);
+        assert!(
+            html.contains("Try again"),
+            "an unanswered probe must offer another try"
+        );
+        assert!(
+            !html.contains("Nothing logged this week."),
+            "an unanswered probe must not read as an empty week"
         );
     }
 
