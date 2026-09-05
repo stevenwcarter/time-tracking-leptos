@@ -13,11 +13,27 @@
 //! behind `--cfg=web_sys_unstable_apis`, which this project does not set, so
 //! they are invoked here through `js_sys::Reflect` instead.)
 
+/// The fixed wrapper `ServerFnError`'s own `Display` puts in front of every
+/// `ServerFnError::ServerError` message — the only variant this crate's
+/// server fns ever return (see `server_fns::server_err` and
+/// `server_fns::log_and_fail`). Every caller below hands [`friendly_error`]
+/// `err.to_string()`, never the message itself, so it always arrives wearing
+/// this prefix.
+const SERVER_FN_ERROR_PREFIX: &str = "error running server function: ";
+
 /// Maps a raw WebAuthn or server error to something a person can act on.
 ///
 /// Deliberately narrow: server-fn messages are already user-facing and pass
 /// through by prefix; everything else collapses, so raw JS internals never
 /// reach the UI.
+///
+/// [`SERVER_FN_ERROR_PREFIX`] is stripped first, before any of the matching
+/// below runs. Without that, every `starts_with` check below is matching
+/// against text that no longer starts with what it names — `raw` starts
+/// with "error running server function: ", never with "This is your last
+/// passkey" — so none of them could ever fire, and every server-fn refusal
+/// this function exists to preserve would silently collapse to the generic
+/// fallback instead.
 ///
 /// The pass-through prefixes are a coupling to server-fn message text (see
 /// the `server_err` calls in `server_fns::passkey` and `server_fns::mod`) —
@@ -25,6 +41,10 @@
 /// collapses to the generic text below instead of failing loudly. Known
 /// trade-off, not something to solve here.
 pub fn friendly_error(raw: String) -> String {
+    let raw = raw
+        .strip_prefix(SERVER_FN_ERROR_PREFIX)
+        .map(str::to_string)
+        .unwrap_or(raw);
     let lower = raw.to_lowercase();
     if lower.contains("cancel") || lower.contains("notallowederror") {
         "Sign-in was cancelled.".to_string()
@@ -349,7 +369,26 @@ pub use browser::{WebauthnUserError, authenticate_with_prf, register};
 
 #[cfg(test)]
 mod tests {
+    use leptos::prelude::ServerFnError;
+
     use super::{friendly_error, prf_enabled_from_json};
+
+    /// What every real call site actually hands `friendly_error`: a
+    /// `ServerFnError`'s own `Display`, wrapper prefix included — not the
+    /// message a server fn built.
+    ///
+    /// Every server fn in this crate returns `ServerFnError::ServerError`
+    /// (`server_fns::server_err`, `server_fns::log_and_fail`), so that is the
+    /// one variant worth reproducing here. A test that instead fed
+    /// `friendly_error` the bare message — as this file's tests used to —
+    /// exercises a shape production never produces: `err.to_string()` always
+    /// carries `SERVER_FN_ERROR_PREFIX`, and a `starts_with` match against
+    /// the un-prefixed message proves nothing about whether the same match
+    /// survives it.
+    fn server_fn_message(msg: &str) -> String {
+        let err: ServerFnError = ServerFnError::ServerError(msg.to_string());
+        err.to_string()
+    }
 
     #[test]
     fn cancellation_is_named_plainly() {
@@ -376,6 +415,11 @@ mod tests {
 
     /// Server-fn errors are already user-facing and pass through, so the
     /// account page can show "That passkey no longer exists." verbatim.
+    ///
+    /// Goes through [`server_fn_message`], not a bare literal: this is the
+    /// prefixed shape `account_page::passkey_error` actually hands
+    /// `friendly_error`, and the un-prefixed shape would pass this assertion
+    /// whether or not the prefix was ever stripped.
     #[test]
     fn server_messages_pass_through() {
         for raw in [
@@ -385,7 +429,7 @@ mod tests {
             "That passkey no longer exists.",
             "Not signed in",
         ] {
-            assert_eq!(friendly_error(raw.into()), raw);
+            assert_eq!(friendly_error(server_fn_message(raw)), raw);
         }
     }
 
@@ -399,6 +443,13 @@ mod tests {
     /// test, rather than folded into `server_messages_pass_through` above,
     /// because these two are the ones where the generic fallback is
     /// actively harmful rather than merely unhelpful.
+    ///
+    /// Goes through [`server_fn_message`] for the same reason
+    /// `server_messages_pass_through` does — and this is the test that once
+    /// did not: it fed `friendly_error` the bare message, which matched the
+    /// `starts_with` allowlist by construction and would keep passing
+    /// however the prefix was handled, proving nothing about the shape that
+    /// actually ships.
     #[test]
     fn encryption_refusals_keep_their_explanation() {
         for raw in [
@@ -409,7 +460,7 @@ mod tests {
             // `server_fns::encryption::encryption_enable`.
             "Encryption is already enabled for this account.",
         ] {
-            assert_eq!(friendly_error(raw.into()), raw);
+            assert_eq!(friendly_error(server_fn_message(raw)), raw);
         }
     }
 
