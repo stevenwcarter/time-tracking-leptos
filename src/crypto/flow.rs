@@ -288,8 +288,12 @@ pub async fn add_passkey_key(user: &str, target: &[u8], source: KeySource) -> Re
 /// cause is logged server-side, not sent here — so there is nothing to
 /// forward and a connection hint is the more useful thing to say.
 #[cfg(feature = "hydrate")]
+pub const SERVER_UNREACHABLE: &str =
+    "Couldn't reach the server. Check your connection and try again.";
+
+#[cfg(feature = "hydrate")]
 pub fn server_unreachable(_: ServerFnError) -> String {
-    "Couldn't reach the server. Check your connection and try again.".to_string()
+    SERVER_UNREACHABLE.to_string()
 }
 
 /// Stores a re-issued recovery wrap, retrying once with the identical bytes.

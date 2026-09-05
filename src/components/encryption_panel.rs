@@ -29,7 +29,6 @@
 //! probes on its own, so on the server it renders the "checking" branch for
 //! everybody (invariant E2) and hydrates against itself.
 
-use leptos::either::{Either, EitherOf3, EitherOf6};
 use leptos::prelude::*;
 
 use crate::auth_ctx::AuthCtx;
@@ -37,8 +36,13 @@ use crate::clipboard::copy_to_clipboard;
 use crate::crypto::KeySource;
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 
+use chrono::NaiveDate;
+use leptos::either::{Either, EitherOf3, EitherOf6};
+
 #[cfg(any(feature = "hydrate", test))]
 use crate::crypto::choose_route;
+#[cfg(any(feature = "hydrate", test))]
+use crate::date::parse_iso;
 #[cfg(any(feature = "hydrate", test))]
 use crate::dto::{PasskeyListItem, WrapDto};
 #[cfg(any(feature = "hydrate", test))]
@@ -50,7 +54,7 @@ use leptos::task::spawn_local;
 #[cfg(feature = "hydrate")]
 use crate::storage::Generation;
 #[cfg(feature = "hydrate")]
-use ceremony::PendingEnable;
+use ceremony::{PendingEnable, Refresh};
 
 /// What the account's encryption state means for this panel, with the key
 /// itself dropped.
@@ -188,14 +192,17 @@ fn classify(row: PasskeyListItem, wraps: &[WrapDto]) -> PasskeyRoute {
 
 /// One row the migration is going to re-write.
 ///
-/// A struct rather than the `(String, String)` it arrived as: both halves
-/// are `String`, and the pass carries them together through a seal step
-/// before handing them back to `entry_save_many`. Swapping them there would
-/// compile, and would file every entry under a date made of its own text.
+/// A struct rather than the `(String, String)` it arrived as, and the date
+/// is parsed on the way in. Both halves were `String` and the pass carries
+/// them together through a seal step before handing them to the storage
+/// seam: swapping them would have compiled, and would have filed every entry
+/// under a date made of its own text. Parsing here also means an
+/// uninterpretable date is caught by the pass, which can name it, rather
+/// than by `entry_save_many`, which refuses the whole batch over it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
 struct PendingRow {
-    date: String,
+    date: NaiveDate,
     /// The plaintext, already unwrapped from its v1 envelope.
     body: String,
 }
@@ -237,13 +244,31 @@ impl MigrationPlan {
     fn of(rows: Vec<(String, String)>) -> Self {
         let mut plan = Self::default();
         for (date, raw) in rows {
+            // A date this build cannot read is as unreadable as a body it
+            // cannot parse, and belongs in the same list: the pass would
+            // otherwise have to guess which day the row is, and sending it
+            // on would have `entry_save_many` refuse — and roll back — the
+            // entire batch over the one row.
+            let Some(day) = parse_iso(&date) else {
+                plan.unreadable.push(date);
+                continue;
+            };
             match plan_read(&raw) {
-                Ok(ReadPlan::Plaintext(body)) => plan.pending.push(PendingRow { date, body }),
+                Ok(ReadPlan::Plaintext(body)) => plan.pending.push(PendingRow { date: day, body }),
                 Ok(ReadPlan::Sealed(_)) => {}
                 Err(_) => plan.unreadable.push(date),
             }
         }
         plan
+    }
+
+    /// The pass's work, in the shape the storage seam takes.
+    #[cfg(feature = "hydrate")]
+    fn into_rows(self) -> Vec<(NaiveDate, String)> {
+        self.pending
+            .into_iter()
+            .map(|row| (row.date, row.body))
+            .collect()
     }
 }
 
@@ -268,6 +293,42 @@ impl Overview {
         self.routes
             .iter()
             .any(|route| route.status != RouteStatus::NeverCapable)
+    }
+}
+
+/// What the panel knows about the account beyond its phase.
+///
+/// Three states rather than `Option<Overview>`, because the fetch has two
+/// ways of not producing one and only one of them is a spinner. The failure
+/// used to be written into `status` — the line every ceremony writes — which
+/// gave that line two writers, and they raced: a refresh failing during a
+/// migration painted over "Encrypting your entries… day 3 of 40", and the
+/// pass's next progress line painted over the failure. Keeping the fetch's
+/// own answer here leaves `status` with exactly one writer.
+#[derive(Clone, Default)]
+#[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
+enum Fetched {
+    /// Not answered yet — which is everything the server renders, since it
+    /// never asks.
+    #[default]
+    Pending,
+    Loaded(Overview),
+    /// The fetch failed, with the sentence to show for it.
+    Failed(String),
+}
+
+impl Fetched {
+    /// The account's routes, once they have arrived.
+    ///
+    /// `Pending` and `Failed` collapse here on purpose: neither knows
+    /// anything about the account's passkeys, and every control that reads
+    /// this has to stay shut for both. What tells them apart is the line the
+    /// panel renders from `Failed`, which is where that difference belongs.
+    fn loaded(self) -> Option<Overview> {
+        match self {
+            Fetched::Loaded(overview) => Some(overview),
+            Fetched::Pending | Fetched::Failed(_) => None,
+        }
     }
 }
 
@@ -431,7 +492,17 @@ enum Screen {
 }
 
 impl Screen {
-    fn of(mode: Mode, phase: Phase) -> Self {
+    /// `phase` is a closure, not a value, so the caller's read of it happens
+    /// only on the arm that uses it.
+    ///
+    /// This runs inside a reactive closure, and a phase read on an arm that
+    /// ignores the answer still subscribes to it: any phase change would
+    /// then rebuild the card on screen, and a rebuilt
+    /// [`RecoveryCodeCard`] is a fresh `copied` flag — the "Copied."
+    /// confirmation vanishing from beside a code the user may have copied
+    /// but not yet saved. No shipped flow moves the phase while a code is
+    /// up; this makes the card not depend on that staying true.
+    fn of(mode: Mode, phase: impl FnOnce() -> Phase) -> Self {
         match mode {
             Mode::NewCode(code) => Screen::Code {
                 code,
@@ -448,7 +519,7 @@ impl Screen {
                 credential_id,
                 name,
             },
-            Mode::Idle => match phase {
+            Mode::Idle => match phase() {
                 Phase::Checking => Screen::Checking,
                 Phase::Unreachable => Screen::Unreachable,
                 Phase::Off => Screen::Enable,
@@ -514,9 +585,17 @@ pub fn EncryptionPanel(
     // only one of them would open anything.
     let busy = RwSignal::new(false);
     let understood = RwSignal::new(false);
-    let overview = RwSignal::new(Option::<Overview>::None);
+    let overview = RwSignal::new(Fetched::default());
 
     let phase = Memo::new(move |_| Phase::of(&encryption.state()));
+
+    // Whether a migration pass is running. A `StoredValue` rather than a
+    // signal precisely because the overview effect below reads it and must
+    // not become its subscriber: this says "skip work that is about to be
+    // redone", and re-running the effect to learn that would be the very
+    // fetch it exists to avoid.
+    #[cfg(feature = "hydrate")]
+    let migrating = StoredValue::new(false);
 
     // Bridges the enable ceremony's two clicks: everything computed before
     // the server hears about it waits here while the recovery code is on
@@ -546,26 +625,32 @@ pub fn EncryptionPanel(
                 .unwrap_or_default();
 
             if !phase.wants_overview() {
-                overview.set(None);
+                overview.set(Fetched::Pending);
                 return;
             }
             let encrypted = phase.encrypted();
+            let refresh = Refresh {
+                encrypted,
+                // Enabling encryption wakes this effect and starts a
+                // migration from the same click, and that pass reads every
+                // row itself. Surveying them here too would be a second full
+                // `entries_all()` for numbers the pass replaces with better
+                // ones a moment later.
+                survey_entries: encrypted && !migrating.get_value(),
+            };
 
             spawn_local(async move {
-                let loaded = ceremony::load_overview(encrypted).await;
+                let loaded = ceremony::load_overview(refresh).await;
                 let is_current = generation
                     .try_with_value(|g| g.is_current(token))
                     .unwrap_or(false);
                 if !is_current {
                     return;
                 }
-                match loaded {
-                    Ok(loaded) => overview.set(Some(loaded)),
-                    Err(message) => {
-                        overview.set(None);
-                        status.set(Some(Status::Problem(message)));
-                    }
-                }
+                overview.set(match loaded {
+                    Ok(loaded) => Fetched::Loaded(loaded),
+                    Err(message) => Fetched::Failed(message),
+                });
             });
         });
     }
@@ -578,6 +663,11 @@ pub fn EncryptionPanel(
         #[cfg(feature = "hydrate")]
         {
             busy.set(true);
+            // Set before the spawn, so the overview effect that the same
+            // click wakes — via the phase change enabling produces — sees it
+            // and skips its own survey of the rows this pass is about to
+            // re-write.
+            migrating.set_value(true);
             status.set(Some(Status::Note(
                 "Encrypting the entries already saved…".to_string(),
             )));
@@ -605,32 +695,49 @@ pub fn EncryptionPanel(
                         .to_string()),
                 };
                 busy.set(false);
-                match outcome {
-                    Err(message) => status.set(Some(Status::Problem(message))),
-                    Ok(done) if done.unreadable.is_empty() => {
-                        status.set(Some(Status::Note(match done.encrypted {
-                            0 => "Everything is already encrypted.".to_string(),
-                            count => format!("Encrypted {}.", days(count)),
-                        })));
+                migrating.set_value(false);
+                let done = match outcome {
+                    Ok(done) => done,
+                    Err(message) => {
+                        // The batch is one transaction, so a failure changed
+                        // nothing and the counts already on screen are still
+                        // right. Nothing to refresh.
+                        status.set(Some(Status::Problem(message)));
+                        return;
                     }
-                    // A row the pass could not read is the one outcome that
-                    // needs the user, so it is reported as a problem even
-                    // when the rest of the account went through — and by
-                    // date, because "look at these two days" is the only
-                    // action available to them.
-                    Ok(done) => {
-                        let encrypted = match done.encrypted {
-                            0 => String::new(),
-                            count => format!("Encrypted {}. ", days(count)),
-                        };
-                        status.set(Some(Status::Problem(format!(
-                            "{encrypted}{} could not be read at all and stayed unencrypted: {}.",
-                            days(done.unreadable.len()),
-                            done.unreadable.join(", "),
-                        ))));
+                };
+                // The pass has just surveyed every row in the account, so it
+                // knows the new numbers exactly — better than a refetch
+                // would, and without the third `entries_all()` a `reload`
+                // bump would have cost. Nothing about the account's passkeys
+                // changed here, which is the other thing `reload` refreshes.
+                overview.update(|fetched| {
+                    if let Fetched::Loaded(overview) = fetched {
+                        overview.unencrypted_days = 0;
+                        overview.unreadable_dates.clone_from(&done.unreadable);
                     }
+                });
+                if done.unreadable.is_empty() {
+                    status.set(Some(Status::Note(match done.encrypted {
+                        0 => "Everything is already encrypted.".to_string(),
+                        count => format!("Encrypted {}.", days(count)),
+                    })));
+                    return;
                 }
-                reload.update(|n| *n += 1);
+                // A row the pass could not read is the one outcome that
+                // needs the user, so it is reported as a problem even when
+                // the rest of the account went through — and by date,
+                // because "look at these two days" is the only action
+                // available to them.
+                let encrypted = match done.encrypted {
+                    0 => String::new(),
+                    count => format!("Encrypted {}. ", days(count)),
+                };
+                status.set(Some(Status::Problem(format!(
+                    "{encrypted}{} could not be read at all and stayed unencrypted: {}.",
+                    days(done.unreadable.len()),
+                    done.unreadable.join(", "),
+                ))));
             });
         }
     };
@@ -827,13 +934,15 @@ pub fn EncryptionPanel(
             {move || status.get().map(|line| view! {
                 <p class=line.class()>{line.message().to_string()}</p>
             })}
-            {move || match Screen::of(mode.get(), phase.get()) {
+            <FetchProblem overview=overview/>
+            {move || match Screen::of(mode.get(), move || phase.get()) {
                 Screen::Code { code, kind } => EitherOf6::A(view! {
                     <RecoveryCodeCard
                         code=code
                         heading=kind.heading()
                         intro=kind.intro()
                         confirm=kind.confirm()
+                        busy=busy
                         on_confirm=move || match kind {
                             CodeKind::New => confirm_new_code(),
                             CodeKind::Reissued => close_card(),
@@ -899,6 +1008,23 @@ pub fn EncryptionPanel(
     }
 }
 
+/// The last refresh's own failure, if it had one.
+///
+/// Kept out of `status` so the ceremonies and the fetch cannot paint over
+/// each other mid-migration — see [`Fetched`] — and a component rather than
+/// an inline closure so a test can reach it: the signal behind it is
+/// internal to [`EncryptionPanel`], and the fetch that would set it lives in
+/// an `Effect`, which never runs on the host.
+#[component]
+fn FetchProblem(overview: RwSignal<Fetched>) -> impl IntoView {
+    move || match overview.get() {
+        Fetched::Failed(message) => {
+            Some(view! { <p class="text-sm text-red-700 mb-3">{message}</p> })
+        }
+        Fetched::Pending | Fetched::Loaded(_) => None,
+    }
+}
+
 /// The one-time display of a recovery code (spec section 6.1 step 5).
 ///
 /// The confirmation is a button rather than a timer or a plain dismiss: the
@@ -910,6 +1036,12 @@ fn RecoveryCodeCard(
     heading: &'static str,
     intro: &'static str,
     confirm: &'static str,
+    /// Whether a ceremony is already in flight. Double-firing is already
+    /// prevented synchronously — `confirm_new_code` *takes* the pending
+    /// enable rather than reading it — so this is for consistency with every
+    /// other control that starts a ceremony, and so a click during the
+    /// server call looks like what it is.
+    busy: RwSignal<bool>,
     on_confirm: impl Fn() + Copy + Send + 'static,
 ) -> impl IntoView {
     let copied = RwSignal::new(false);
@@ -946,7 +1078,8 @@ fn RecoveryCodeCard(
             </div>
             <button
                 type="button"
-                class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700"
+                class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 disabled:opacity-60"
+                disabled=move || busy.get()
                 on:click=move |_| on_confirm()
             >
                 {confirm}
@@ -958,7 +1091,7 @@ fn RecoveryCodeCard(
 /// The pitch, the warning, and the gate (spec section 6.1).
 #[component]
 fn EnableSection(
-    overview: RwSignal<Option<Overview>>,
+    overview: RwSignal<Fetched>,
     understood: RwSignal<bool>,
     busy: RwSignal<bool>,
     on_enable: impl Fn() + Copy + Send + 'static,
@@ -969,10 +1102,11 @@ fn EnableSection(
     // not yet *say* the account has no usable passkey. That claim is only
     // true once the list is in, and rendering it before then would flash a
     // false alarm on every visit, including the server's own render.
-    let known = move || overview.get().is_some();
+    let known = move || overview.get().loaded().is_some();
     let capable = move || {
         overview
             .get()
+            .loaded()
             .is_some_and(|overview| overview.has_capable_passkey())
     };
 
@@ -1009,9 +1143,10 @@ fn EnableSection(
                 </li>
                 <li>"Entries you've already saved are re-encrypted in place. Nothing is deleted."</li>
                 <li>
-                    "Adding another passkey afterwards takes three passkey prompts, every time. \
-                     That's a consequence of the key never leaving your authenticator in a \
-                     copyable form, not a bug to be fixed later."
+                    "Adding another passkey afterwards takes three passkey prompts, unless you \
+                     use your recovery code in place of one of them. That's a consequence of \
+                     the key never leaving your authenticator in a copyable form, not a bug to \
+                     be fixed later."
                 </li>
             </ul>
 
@@ -1053,7 +1188,7 @@ fn EnableSection(
 #[component]
 fn ManageSection(
     unlocked: bool,
-    overview: RwSignal<Option<Overview>>,
+    overview: RwSignal<Fetched>,
     busy: RwSignal<bool>,
     on_lock: impl Fn() + Copy + Send + 'static,
     on_reissue: impl Fn() + Copy + Send + 'static,
@@ -1096,7 +1231,7 @@ fn ManageSection(
             }}
 
             <h3 class="text-sm font-medium text-gray-800 mb-1">"What can unlock your entries"</h3>
-            {move || match overview.get() {
+            {move || match overview.get().loaded() {
                 None => Either::Left(view! { <p class="text-sm text-gray-500">"Loading…"</p> }),
                 Some(overview) => Either::Right(view! {
                     <div>
@@ -1199,7 +1334,7 @@ fn ManageSection(
 fn GiveKeyCard(
     name: String,
     credential_id: Vec<u8>,
-    overview: RwSignal<Option<Overview>>,
+    overview: RwSignal<Fetched>,
     busy: RwSignal<bool>,
     on_open: impl Fn(Vec<u8>, KeySource) + Copy + Send + 'static,
     on_cancel: impl Fn() + Copy + Send + 'static,
@@ -1221,7 +1356,7 @@ fn GiveKeyCard(
                  ask for this passkey once more to finish."
             </p>
 
-            {move || match overview.get().map(|overview| Openers::of(&overview)) {
+            {move || match overview.get().loaded().map(|overview| Openers::of(&overview)) {
                 // The list has not arrived, so nothing is known about what
                 // could open this account — and claiming either answer here
                 // would be a guess the user would act on.
@@ -1368,24 +1503,43 @@ mod ceremony {
     use crate::crypto::flow::{self, PrfAssertion};
     use crate::crypto::{Enabled, Opener, SessionKey, choose_route, enable};
     use crate::server_fns::encryption::{encryption_enable, encryption_wraps};
-    use crate::server_fns::entries::{entries_all, entry_save_many};
+    use crate::server_fns::entries::entries_all;
     use crate::server_fns::passkey::passkey_list;
-    use crate::storage::envelope;
+    use crate::storage::{Progress, StorageError, WriteKey, store_many};
+
+    /// What one refresh of the panel's overview should go and ask for.
+    ///
+    /// A named pair rather than two `bool` arguments, which a caller could
+    /// swap without the compiler minding. They ask for very different
+    /// amounts of data — a list of passkeys against every row in the account
+    /// — so swapping them would either skip the wraps the panel classifies
+    /// by, or pull the whole account down for nothing.
+    #[derive(Clone, Copy)]
+    pub struct Refresh {
+        /// Whether the account is encrypted, and so whether its wraps are
+        /// worth asking for at all.
+        pub encrypted: bool,
+        /// Whether to survey every row for un-migrated bodies. Skipped while
+        /// a migration is running: that pass reads the same rows and reports
+        /// better numbers a moment later, and enabling encryption starts
+        /// both from one click.
+        pub survey_entries: bool,
+    }
 
     /// Fetches everything the panel reports on.
     ///
-    /// `entries_all` is only called for an encrypted account, and only
-    /// because there is no server-side answer to "how many rows are still
-    /// plaintext": producing one would mean the server parsing bodies,
+    /// `entries_all` is only called when the panel actually needs the count,
+    /// and only because there is no server-side answer to "how many rows are
+    /// still plaintext": producing one would mean the server parsing bodies,
     /// which invariant E1 forbids (see `dto::EncryptionStatus`).
-    pub async fn load_overview(encrypted: bool) -> Result<Overview, String> {
+    pub async fn load_overview(refresh: Refresh) -> Result<Overview, String> {
         let rows = passkey_list().await.map_err(flow::server_unreachable)?;
-        let wraps = if encrypted {
+        let wraps = if refresh.encrypted {
             encryption_wraps().await.map_err(flow::server_unreachable)?
         } else {
             Vec::new()
         };
-        let plan = if encrypted {
+        let plan = if refresh.survey_entries {
             MigrationPlan::of(entries_all().await.map_err(flow::server_unreachable)?)
         } else {
             MigrationPlan::default()
@@ -1503,18 +1657,6 @@ mod ceremony {
         .await
     }
 
-    /// Which row the sealing loop is on, for the line on screen.
-    ///
-    /// A pair rather than two `usize` arguments, which a caller could swap
-    /// without the compiler minding and which would then count backwards.
-    /// `day` is the row being worked on, not the row finished — it is
-    /// reported before the seal so the first one is visible too.
-    #[derive(Debug, Clone, Copy)]
-    pub struct Progress {
-        pub day: usize,
-        pub total: usize,
-    }
-
     /// What one migration pass did, and what it declined to touch.
     pub struct MigrationOutcome {
         /// How many days this pass re-wrote as v2.
@@ -1526,50 +1668,51 @@ mod ceremony {
         pub unreadable: Vec<String>,
     }
 
+    /// What a failed pass leaves the user holding.
+    ///
+    /// One transaction, so every failure has the same headline — nothing was
+    /// saved and nothing was changed — and only the cause differs. The day
+    /// is no longer named: a seal failure is a property of this browser
+    /// rather than of any one entry, and naming a day would suggest there is
+    /// something in it to go and fix.
+    fn pass_failed(err: StorageError) -> String {
+        match err {
+            StorageError::Crypto { .. } => "This browser couldn't encrypt your entries, so \
+                                            nothing was saved and nothing was changed."
+                .to_string(),
+            _ => flow::SERVER_UNREACHABLE.to_string(),
+        }
+    }
+
     /// Re-encrypts every row still stored as v1, in one transaction (spec
     /// section 8), calling `progress` as it reaches each row.
     ///
-    /// Resumable by construction: a run that never reaches `entry_save_many`
-    /// changes nothing, and a run that does leaves fewer v1 rows for the
-    /// next one to find. A v2 row is never re-sent — re-sealing one means
-    /// decrypting it first, work with nothing to gain and data to lose.
-    /// Rows this build cannot read at all are not sent either, for the same
-    /// reason, and come back named in the outcome.
+    /// Through the storage seam's [`store_many`], not around it: `WriteKey`
+    /// is what stops a session that cannot seal writing plaintext into an
+    /// encrypted account, and a pass with a write path of its own would be
+    /// the one place that guard did not apply (invariant E7).
+    ///
+    /// Resumable by construction: a run that never reaches the write changes
+    /// nothing, and a run that does leaves fewer v1 rows for the next one to
+    /// find. A v2 row is never re-sent — re-sealing one means decrypting it
+    /// first, work with nothing to gain and data to lose. Rows this build
+    /// cannot read at all are not sent either, for the same reason, and come
+    /// back named in the outcome.
     pub async fn migrate(
         key: &SessionKey,
         progress: impl Fn(Progress),
     ) -> Result<MigrationOutcome, String> {
         let rows = entries_all().await.map_err(flow::server_unreachable)?;
         let plan = MigrationPlan::of(rows);
-        let unreadable = plan.unreadable;
-        if plan.pending.is_empty() {
-            return Ok(MigrationOutcome {
-                encrypted: 0,
-                unreadable,
-            });
-        }
+        let unreadable = plan.unreadable.clone();
+        let encrypted = plan.pending.len();
 
-        let total = plan.pending.len();
-        let mut sealed = Vec::with_capacity(total);
-        for (index, row) in plan.pending.into_iter().enumerate() {
-            progress(Progress {
-                day: index + 1,
-                total,
-            });
-            let wrapped = envelope::wrap(&row.body, Some(key)).await.map_err(|_| {
-                format!(
-                    "Couldn't encrypt the entry for {}; nothing was saved.",
-                    row.date
-                )
-            })?;
-            sealed.push((row.date, wrapped));
-        }
-
-        entry_save_many(sealed)
+        store_many(plan.into_rows(), WriteKey::Sealed(key), progress)
             .await
-            .map_err(flow::server_unreachable)?;
+            .map_err(pass_failed)?;
+
         Ok(MigrationOutcome {
-            encrypted: total,
+            encrypted,
             unreadable,
         })
     }
@@ -1660,7 +1803,7 @@ mod tests {
 
     fn pending(date: &str, body: &str) -> PendingRow {
         PendingRow {
-            date: date.to_string(),
+            date: parse_iso(date).expect("valid date"),
             body: body.to_string(),
         }
     }
@@ -1710,12 +1853,22 @@ mod tests {
                 "2026-09-02".to_string(),
                 r#"{"v":9,"alg":"future"}"#.to_string(),
             ),
+            // A key this build cannot read as a date belongs in the same
+            // list: sending it on would have `entry_save_many` refuse — and
+            // roll back — the whole batch over the one row, so a readable
+            // body under an unreadable date is still work the pass must
+            // decline and name.
+            ("not-a-date".to_string(), wrap_v1("stranded")),
             ("2026-09-03".to_string(), wrap_v1("real")),
         ]);
 
         assert_eq!(
             plan.unreadable,
-            vec!["2026-09-01".to_string(), "2026-09-02".to_string()]
+            vec![
+                "2026-09-01".to_string(),
+                "2026-09-02".to_string(),
+                "not-a-date".to_string()
+            ]
         );
         assert_eq!(plan.pending, vec![pending("2026-09-03", "real")]);
     }
@@ -1738,46 +1891,45 @@ mod tests {
     /// `Phase` won, the panel would paint the enable pitch or the manage
     /// view over a code that had just been made the account's only backup —
     /// and nothing would fail, because the ceremony would have succeeded.
+    ///
+    /// The phase arrives as a closure that panics, which pins the second
+    /// half of the same rule: not only does the code win, the phase is never
+    /// *read*. Reading it subscribes the card's reactive closure to it, and
+    /// a rebuild on any phase change takes the "Copied." confirmation with
+    /// it.
     #[test]
     fn a_code_on_screen_outranks_the_account_state() {
-        for phase in [
-            Phase::Checking,
-            Phase::Unreachable,
-            Phase::Off,
-            Phase::Locked,
-            Phase::Unlocked,
-        ] {
-            assert_eq!(
-                Screen::of(Mode::NewCode("K7M2".to_string()), phase),
-                Screen::Code {
-                    code: "K7M2".to_string(),
-                    kind: CodeKind::New,
-                },
-            );
-            assert_eq!(
-                Screen::of(Mode::ReissuedCode("K7M2".to_string()), phase),
-                Screen::Code {
-                    code: "K7M2".to_string(),
-                    kind: CodeKind::Reissued,
-                },
-            );
-            // The same rule, one ceremony over. Nothing irreplaceable is on
-            // this screen, but a half-typed recovery code being painted over
-            // by a re-render of the manage view is the same class of loss.
-            assert_eq!(
-                Screen::of(
-                    Mode::GiveKey {
-                        credential_id: b"cred-b".to_vec(),
-                        name: "New phone".to_string(),
-                    },
-                    phase,
-                ),
-                Screen::GiveKey {
+        let unread = || panic!("the phase must not be read while a code is on screen");
+        assert_eq!(
+            Screen::of(Mode::NewCode("K7M2".to_string()), unread),
+            Screen::Code {
+                code: "K7M2".to_string(),
+                kind: CodeKind::New,
+            },
+        );
+        assert_eq!(
+            Screen::of(Mode::ReissuedCode("K7M2".to_string()), unread),
+            Screen::Code {
+                code: "K7M2".to_string(),
+                kind: CodeKind::Reissued,
+            },
+        );
+        // The same rule, one ceremony over. Nothing irreplaceable is on this
+        // screen, but a half-typed recovery code painted over by a re-render
+        // of the manage view is the same class of loss.
+        assert_eq!(
+            Screen::of(
+                Mode::GiveKey {
                     credential_id: b"cred-b".to_vec(),
                     name: "New phone".to_string(),
                 },
-            );
-        }
+                unread,
+            ),
+            Screen::GiveKey {
+                credential_id: b"cred-b".to_vec(),
+                name: "New phone".to_string(),
+            },
+        );
     }
 
     /// And with no ceremony of its own running, the panel shows what the
@@ -1785,18 +1937,21 @@ mod tests {
     /// server renders for everybody (invariant E2).
     #[test]
     fn an_idle_panel_follows_the_account_state() {
-        assert_eq!(Screen::of(Mode::Idle, Phase::Checking), Screen::Checking);
         assert_eq!(
-            Screen::of(Mode::Idle, Phase::Unreachable),
+            Screen::of(Mode::Idle, || Phase::Checking),
+            Screen::Checking
+        );
+        assert_eq!(
+            Screen::of(Mode::Idle, || Phase::Unreachable),
             Screen::Unreachable
         );
-        assert_eq!(Screen::of(Mode::Idle, Phase::Off), Screen::Enable);
+        assert_eq!(Screen::of(Mode::Idle, || Phase::Off), Screen::Enable);
         assert_eq!(
-            Screen::of(Mode::Idle, Phase::Locked),
+            Screen::of(Mode::Idle, || Phase::Locked),
             Screen::Manage { unlocked: false }
         );
         assert_eq!(
-            Screen::of(Mode::Idle, Phase::Unlocked),
+            Screen::of(Mode::Idle, || Phase::Unlocked),
             Screen::Manage { unlocked: true }
         );
     }
@@ -1900,14 +2055,22 @@ mod tests {
         html
     }
 
+    /// Renders the enable pitch with the account's routes at `overview` and
+    /// the acknowledgement checkbox at `understood`.
+    ///
+    /// `understood` is a parameter and not a fixed `false` because the gate
+    /// is an `||` chain: with the box unticked the button is disabled
+    /// whatever else is true, so every assertion about the *capability* half
+    /// of that gate passes vacuously. Ticking it is what makes the
+    /// capability check the only thing left holding the button shut.
     #[cfg(feature = "ssr")]
-    fn render_enable(overview: Overview) -> String {
+    fn render_enable(overview: Fetched, understood: bool) -> String {
         let runtime = Owner::new();
         let html = runtime.with(move || {
             view! {
                 <EnableSection
-                    overview=RwSignal::new(Some(overview))
-                    understood=RwSignal::new(false)
+                    overview=RwSignal::new(overview)
+                    understood=RwSignal::new(understood)
                     busy=RwSignal::new(false)
                     on_enable=|| {}
                 />
@@ -1925,7 +2088,7 @@ mod tests {
             view! {
                 <ManageSection
                     unlocked=unlocked
-                    overview=RwSignal::new(Some(overview))
+                    overview=RwSignal::new(Fetched::Loaded(overview))
                     busy=RwSignal::new(false)
                     on_lock=|| {}
                     on_reissue=|| {}
@@ -1940,7 +2103,7 @@ mod tests {
     }
 
     #[cfg(feature = "ssr")]
-    fn render_give_key(overview: Option<Overview>) -> String {
+    fn render_give_key(overview: Fetched) -> String {
         let runtime = Owner::new();
         let html = runtime.with(move || {
             view! {
@@ -1966,7 +2129,7 @@ mod tests {
     #[cfg(feature = "ssr")]
     #[test]
     fn the_give_key_card_offers_the_routes_the_account_actually_has() {
-        let recovered = render_give_key(Some(Overview {
+        let recovered = render_give_key(Fetched::Loaded(Overview {
             routes: vec![classify(passkey("New phone", b"cred-b", true), &[])],
             has_recovery_wrap: true,
             ..Overview::default()
@@ -1978,7 +2141,7 @@ mod tests {
         );
 
         let wraps = vec![passkey_wrap(b"cred-a")];
-        let healthy = render_give_key(Some(Overview {
+        let healthy = render_give_key(Fetched::Loaded(Overview {
             routes: vec![
                 classify(passkey("Laptop", b"cred-a", true), &wraps),
                 classify(passkey("New phone", b"cred-b", true), &wraps),
@@ -1989,7 +2152,7 @@ mod tests {
         assert!(healthy.contains("Use another passkey"));
         assert!(healthy.contains("Use my recovery code"));
 
-        let unknown = render_give_key(None);
+        let unknown = render_give_key(Fetched::Pending);
         for control in ["Use another passkey", "Use my recovery code"] {
             assert!(
                 !unknown.contains(control),
@@ -2014,6 +2177,7 @@ mod tests {
                     heading="Save your recovery code"
                     intro="Shown once."
                     confirm="I've saved it"
+                    busy=RwSignal::new(false)
                     on_confirm=|| {}
                 />
             }
@@ -2089,17 +2253,36 @@ mod tests {
     /// It must not yet *claim* there is no usable passkey either — that
     /// sentence is only true once the list has arrived, and rendering it
     /// here would flash a false alarm on every visit.
+    ///
+    /// Rendered with the acknowledgement already ticked, and against a
+    /// control that renders enabled. The gate is `busy || !understood ||
+    /// !capable`, so an unticked box shuts the button on its own and an
+    /// assertion made under one holds however the capability check behaves
+    /// — including if it were deleted.
     #[cfg(feature = "ssr")]
     #[test]
     fn enabling_is_shut_until_the_account_is_known() {
-        let html = render_panel(EncryptionState::Disabled);
+        let unknown = render_enable(Fetched::Pending, true);
         assert!(
-            html.contains(r#"<button type="button" disabled"#),
-            "the enable button must render disabled: {html}"
+            unknown.contains(r#"<button type="button" disabled"#),
+            "the enable button must render disabled while nothing is known: {unknown}"
         );
         assert!(
-            !html.contains("Encryption needs a passkey"),
+            !unknown.contains("Encryption needs a passkey"),
             "an unknown passkey list must not read as a missing one"
+        );
+
+        let known = render_enable(
+            Fetched::Loaded(Overview {
+                routes: vec![classify(passkey("Phone", b"cred-b", true), &[])],
+                ..Overview::default()
+            }),
+            true,
+        );
+        assert!(
+            !known.contains(r#"<button type="button" disabled"#),
+            "an account that can enable, from a user who has acknowledged the loss, must be \
+             offered the ceremony: {known}"
         );
     }
 
@@ -2107,24 +2290,144 @@ mod tests {
     /// rather than presenting a dead control with no explanation. The
     /// ceremony would fail at its first assertion, and "the button does
     /// nothing" is the least useful way to learn that.
+    ///
+    /// Ticked here too, and for the same reason: an unticked box would shut
+    /// the button by itself and the `disabled` assertion would prove nothing
+    /// about the capability check it is aimed at.
     #[cfg(feature = "ssr")]
     #[test]
     fn an_account_with_no_usable_passkey_is_told_why_it_cannot_enable() {
-        let html = render_enable(Overview {
-            routes: vec![classify(passkey("Old token", b"cred-c", false), &[])],
-            ..Overview::default()
-        });
-        assert!(html.contains(r#"<button type="button" disabled"#));
+        let html = render_enable(
+            Fetched::Loaded(Overview {
+                routes: vec![classify(passkey("Old token", b"cred-c", false), &[])],
+                ..Overview::default()
+            }),
+            true,
+        );
+        assert!(
+            html.contains(r#"<button type="button" disabled"#),
+            "an account with no capable passkey must not be offered the ceremony: {html}"
+        );
         assert!(html.contains("Encryption needs a passkey that can hold a key"));
 
-        let usable = render_enable(Overview {
-            routes: vec![classify(passkey("Phone", b"cred-b", true), &[])],
-            ..Overview::default()
-        });
+        let usable = render_enable(
+            Fetched::Loaded(Overview {
+                routes: vec![classify(passkey("Phone", b"cred-b", true), &[])],
+                ..Overview::default()
+            }),
+            true,
+        );
         assert!(
             !usable.contains("Encryption needs a passkey"),
             "an account that can enable must not be told it cannot"
         );
+    }
+
+    /// The other half of the gate, which the two tests above deliberately
+    /// tick past: the acknowledgement is not decoration. A user who has not
+    /// said they understand that losing every passkey and their recovery
+    /// code loses their entries must not be able to start the one ceremony
+    /// in this application that cannot be undone.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn enabling_is_shut_until_the_loss_is_acknowledged() {
+        let capable = Fetched::Loaded(Overview {
+            routes: vec![classify(passkey("Phone", b"cred-b", true), &[])],
+            ..Overview::default()
+        });
+        let html = render_enable(capable, false);
+        assert!(
+            html.contains(r#"<button type="button" disabled"#),
+            "an unacknowledged warning must hold the ceremony shut: {html}"
+        );
+    }
+
+    /// The state a failed probe leaves behind, which nothing else on this
+    /// panel can end. It has to say that nothing is being saved — that is
+    /// the part the user would otherwise discover by losing an entry — and
+    /// offer the retry, which is the only way out of `Unreachable` short of
+    /// a reload.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn an_unanswered_probe_says_so_and_offers_another_try() {
+        let html = render_panel(EncryptionState::Unreachable);
+        assert!(html.contains("couldn't tell whether this account's entries are encrypted"));
+        assert!(
+            html.contains("Nothing is being saved"),
+            "a state that refuses every write must say so"
+        );
+        assert!(html.contains("Try again"));
+        for leaked in ["Encryption is on", "Turn on encryption"] {
+            assert!(
+                !html.contains(leaked),
+                "a probe that answered nothing must not render `{leaked}`"
+            );
+        }
+    }
+
+    /// Never reached by a healthy account — `encryption_enable` writes the
+    /// recovery wrap in the same transaction that turns encryption on, and
+    /// re-issuing replaces it in one — but an account that got here is one
+    /// lost authenticator away from unreadable, and silence is the worst
+    /// possible way to report that.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn an_account_with_no_recovery_wrap_is_told_it_has_none() {
+        let wraps = vec![passkey_wrap(b"cred-a")];
+        let routes = vec![classify(passkey("Laptop", b"cred-a", true), &wraps)];
+
+        let missing = render_manage(
+            true,
+            Overview {
+                routes: routes.clone(),
+                has_recovery_wrap: false,
+                ..Overview::default()
+            },
+        );
+        assert!(missing.contains("No recovery code is on file for this account"));
+        assert!(
+            missing.contains("your entries are gone"),
+            "the consequence must be stated, not left to be inferred"
+        );
+
+        let present = render_manage(
+            true,
+            Overview {
+                routes,
+                has_recovery_wrap: true,
+                ..Overview::default()
+            },
+        );
+        assert!(
+            !present.contains("No recovery code is on file"),
+            "an account that has one must not be told it does not"
+        );
+    }
+
+    /// The other thing `Fetched` exists for: a failed refresh has a sentence
+    /// of its own, and it renders beside `status` rather than inside it, so
+    /// a migration's progress line and a refresh failure cannot paint over
+    /// each other. Nothing rendered this branch before.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn a_failed_refresh_is_reported_where_a_ceremony_cannot_paint_over_it() {
+        let render = |fetched| {
+            let runtime = Owner::new();
+            let html = runtime
+                .with(move || view! { <FetchProblem overview=RwSignal::new(fetched)/> }.to_html());
+            runtime.cleanup();
+            html
+        };
+
+        let failed = render(Fetched::Failed("Couldn't reach the server.".to_string()));
+        assert!(failed.contains("Couldn't reach the server."));
+
+        for quiet in [Fetched::Pending, Fetched::Loaded(Overview::default())] {
+            assert!(
+                !render(quiet).contains("Couldn't reach the server."),
+                "a refresh that did not fail must say nothing"
+            );
+        }
     }
 
     /// A locked device is told what it is and offered nothing it cannot do —

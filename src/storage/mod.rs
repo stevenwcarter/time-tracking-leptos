@@ -130,6 +130,18 @@ pub enum WriteKey<'a> {
     Locked,
 }
 
+/// Which row a bulk write is on, for whatever is reporting it.
+///
+/// A pair rather than two `usize` arguments, which a caller could swap
+/// without the compiler minding and which would then count backwards. `day`
+/// is the row being worked on, not the row finished — it is reported before
+/// the seal, so the first one is visible too.
+#[derive(Debug, Clone, Copy)]
+pub struct Progress {
+    pub day: usize,
+    pub total: usize,
+}
+
 /// Monotonic counter identifying the newest in-flight load.
 ///
 /// Loads are async and can overlap — re-running one while an earlier call is
@@ -335,14 +347,21 @@ pub async fn load(
 /// one: it declares that the returned future captures no lifetime at all,
 /// so moving either inside the block fails here instead of at some distant
 /// `spawn_local` (spec E4).
-pub fn store(
-    backend: Backend,
+/// Turns a [`WriteKey`] into "seal with this, or don't", refusing the one
+/// state that must never reach a backend.
+///
+/// **The single place the plaintext-downgrade refusal is made**, shared by
+/// [`store`] and [`store_many`]. A second write path that decided this for
+/// itself is exactly how the refusal gets lost: nothing downstream would
+/// notice an encrypted account taking v1 rows (invariant E7).
+///
+/// Owned rather than borrowed because [`store`] hands its future to
+/// `spawn_local`, which needs `'static`.
+fn sealing_key(
     key: StorageKey,
-    value: &str,
     session: WriteKey<'_>,
-) -> impl Future<Output = Result<(), StorageError>> + use<> {
-    let value = value.to_owned();
-    let sealing = match session {
+) -> Result<Option<SessionKey>, StorageError> {
+    match session {
         WriteKey::Plaintext => Ok(None),
         // `Option::cloned`, not a direct `session.clone()`: on a target
         // where `SessionKey` is uninhabited this arm cannot be reached, and
@@ -351,7 +370,17 @@ pub fn store(
         // inhabited and the arm silent.
         WriteKey::Sealed(session) => Ok(Some(session).cloned()),
         WriteKey::Locked => Err(StorageError::Locked { key: key.as_key() }),
-    };
+    }
+}
+
+pub fn store(
+    backend: Backend,
+    key: StorageKey,
+    value: &str,
+    session: WriteKey<'_>,
+) -> impl Future<Output = Result<(), StorageError>> + use<> {
+    let value = value.to_owned();
+    let sealing = sealing_key(key, session);
     async move {
         let session = sealing?;
         #[cfg(feature = "hydrate")]
@@ -372,6 +401,63 @@ pub fn store(
             let _ = (backend, key, value, session);
             Ok(())
         }
+    }
+}
+
+/// Seals a whole account's worth of days and writes them in one call — the
+/// encryption migration pass of spec section 8.
+///
+/// Here rather than in the panel that runs it, because of what [`WriteKey`]
+/// guards. A pass that sealed its own bodies and posted them itself would be
+/// a second write path, and the first thing a second write path loses is the
+/// refusal: a locked session would rewrite a whole account as v1 with
+/// nothing downstream to notice (invariant E7). Going through
+/// [`sealing_key`] means that decision is made once, for the batch, before
+/// any row is touched.
+///
+/// No `Backend`, deliberately. A signed-out device stores in `localStorage`,
+/// which is never encrypted (spec section 1.2), so there is no migration for
+/// it to run and no local bulk write to reach.
+///
+/// `progress` is called before each row is sealed, on the await that yields
+/// to the event loop, so a caller reporting it actually sees the count move.
+pub async fn store_many(
+    rows: Vec<(NaiveDate, String)>,
+    session: WriteKey<'_>,
+    progress: impl Fn(Progress),
+) -> Result<(), StorageError> {
+    let total = rows.len();
+    // An empty batch is a real outcome — a pass that found nothing left to
+    // do — and writing nothing needs no key at all.
+    let Some(&(first, _)) = rows.first() else {
+        return Ok(());
+    };
+    let sealing = sealing_key(StorageKey::TimeEntry(first), session)?;
+
+    #[cfg(feature = "hydrate")]
+    {
+        let mut sealed = Vec::with_capacity(total);
+        for (index, (date, body)) in rows.into_iter().enumerate() {
+            progress(Progress {
+                day: index + 1,
+                total,
+            });
+            let key = StorageKey::TimeEntry(date);
+            let wrapped =
+                envelope::wrap(&body, sealing.as_ref())
+                    .await
+                    .map_err(|err| StorageError::Crypto {
+                        key: key.as_key(),
+                        detail: err.to_string(),
+                    })?;
+            sealed.push((date, wrapped));
+        }
+        remote::store_many(sealed).await
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        let _ = (rows, sealing, progress, total);
+        Ok(())
     }
 }
 
@@ -676,6 +762,38 @@ mod tests {
                 "{backend:?} must refuse to clear a day it cannot seal"
             );
         }
+    }
+
+    /// The same refusal as `store`, at the one other door into the write
+    /// path. The migration pass rewrites a whole account in one call, so a
+    /// locked session let through here would downgrade every row at once —
+    /// the widest possible version of invariant E7's failure, and the reason
+    /// the pass goes through this seam rather than sealing and posting on
+    /// its own.
+    #[test]
+    fn a_locked_session_refuses_the_whole_migration_batch() {
+        let day = d(2026, 9, 1);
+        assert_eq!(
+            block_on(store_many(
+                vec![(day, "9-10 code1".to_string())],
+                WriteKey::Locked,
+                |_| {},
+            )),
+            Err(StorageError::Locked {
+                key: StorageKey::TimeEntry(day).as_key()
+            })
+        );
+    }
+
+    /// An empty batch is a real outcome — a pass that found nothing left to
+    /// do — and writing nothing needs no key. Reporting it as a refusal
+    /// would turn "already finished" into an error on every re-run.
+    #[test]
+    fn an_empty_migration_batch_is_not_a_refusal() {
+        assert_eq!(
+            block_on(store_many(Vec::new(), WriteKey::Locked, |_| {})),
+            Ok(())
+        );
     }
 
     /// Same invariant as `ssr_backends_return_none`, for the range read the

@@ -26,6 +26,22 @@ pub async fn store(key: StorageKey, envelope: &str) -> Result<(), StorageError> 
         .map_err(server_error)
 }
 
+/// Writes many days in one transaction, still envelope-wrapped.
+///
+/// The bulk half of the seam's [`store_many`](super::store_many): the
+/// endpoint applies `entry_save`'s own length cap to each body and rolls the
+/// whole batch back if any row is refused, which is what makes the migration
+/// pass resumable rather than half-applied.
+pub async fn store_many(rows: Vec<(NaiveDate, String)>) -> Result<(), StorageError> {
+    entries::entry_save_many(
+        rows.into_iter()
+            .map(|(date, envelope)| (to_iso(date), envelope))
+            .collect(),
+    )
+    .await
+    .map_err(server_error)
+}
+
 pub async fn dates_with_entries(
     from: NaiveDate,
     to: NaiveDate,
