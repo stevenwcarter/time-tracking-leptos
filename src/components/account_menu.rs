@@ -93,22 +93,22 @@ fn SignedInPanel(
     let status = RwSignal::new(String::new());
 
     let on_sign_out = move |_| {
+        // Built here, in the click handler, rather than inside the
+        // `spawn_local` below: `sign_out`'s first step invalidates anything
+        // in flight, and it is synchronous precisely so that it happens at
+        // the click. Constructing the future in the spawned block would put
+        // it a microtask later, which is a window in which a probe already
+        // running can still publish `Unlocked` (spec section 6.7).
+        let signing_out = sign_out(encryption, forget_device_key(), logout());
         spawn_local(async move {
-            // `sign_out` invalidates anything in flight and forgets this
-            // device's data key first, regardless of what the server then
-            // says, which is why the whole call goes through it rather than
-            // adding a line to either arm below (spec section 6.7). Clearing
-            // `auth.user` on success re-runs `EncryptionCtx`'s probe, and a
-            // probe for a signed-out visitor publishes `Disabled`, which
-            // holds no key — but that happens a round trip later, which is
-            // what `signing_out` covers.
-            match sign_out(
-                move || encryption.signing_out(),
-                forget_device_key(),
-                logout(),
-            )
-            .await
-            {
+            // The device's data key is forgotten first, regardless of what
+            // the server then says, which is why the whole call goes through
+            // `sign_out` rather than adding a line to either arm below.
+            // Clearing `auth.user` on success re-runs `EncryptionCtx`'s
+            // probe, and a probe for a signed-out visitor publishes
+            // `Disabled`, which holds no key — but that happens a round trip
+            // later, which is what the invalidation covers.
+            match signing_out.await {
                 Ok(()) => {
                     // Closed first, deliberately: the popover is describing
                     // an account that is about to stop existing, and clearing

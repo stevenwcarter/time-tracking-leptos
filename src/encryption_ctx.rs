@@ -328,10 +328,15 @@ impl EncryptionCtx {
     /// starting now.
     ///
     /// Every path that changes what a probe should answer goes through here
-    /// — [`start_probe`](Self::start_probe), [`retry`](Self::retry) and
-    /// [`signing_out`](Self::signing_out) — so there is one counter and one
-    /// rule about who may publish.
-    fn begin_probe(self) -> u64 {
+    /// — [`start_probe`](Self::start_probe), [`retry`](Self::retry),
+    /// [`signing_out`](Self::signing_out), [`unlock`](Self::unlock) and
+    /// [`lock`](Self::lock) — so there is one counter and one rule about who
+    /// may publish.
+    ///
+    /// `pub(crate)` for the last of those reasons only: [`crate::auth_ctx`]'s
+    /// host test drives sign-out's ordering, and the invalidation is the
+    /// step it has to be able to see happen.
+    pub(crate) fn begin_probe(self) -> u64 {
         self.generation
             .try_update_value(Generation::next)
             .unwrap_or_default()
@@ -343,8 +348,11 @@ impl EncryptionCtx {
     /// `try_with_value` rather than the panicking form, since this owner can
     /// be disposed while a probe is still in flight. A fallback of `false`
     /// degrades to "discard the answer", which is the safe direction.
+    ///
+    /// `pub(crate)` alongside [`begin_probe`](Self::begin_probe), and for the
+    /// same test.
     #[cfg(any(feature = "hydrate", test))]
-    fn may_publish(self, token: u64) -> bool {
+    pub(crate) fn may_publish(self, token: u64) -> bool {
         self.generation
             .try_with_value(|g| g.is_current(token))
             .unwrap_or(false)
@@ -638,6 +646,23 @@ impl EncryptionCtx {
             error!("discarding an unlock for an account that is no longer signed in");
             return;
         }
+        // An unlock is a newer answer than any probe already in flight, and
+        // it is also something `lock` and `signing_out` must be able to
+        // outrank — so it takes a token like everything else that publishes.
+        let token = self.begin_probe();
+        // Published *before* the keystore write, and this is invariant E7's
+        // second half rather than a nicety. The enable ceremony reaches here
+        // with the account already encrypted server-side while this context
+        // still says `Disabled`, whose write key is `Plaintext`; the await
+        // below yields to the event loop, and the event loop is where clicks
+        // come from. `Locked` is the strictly safe answer for that window —
+        // it refuses writes rather than downgrading one — and it is a no-op
+        // on every other unlock path, which is already `Locked`.
+        //
+        // It goes *after* the identity check above, not before, so a key for
+        // an account that has already signed out still publishes nothing at
+        // all.
+        self.publish(EncryptionState::Locked);
         if let Err(e) = key.remember().await {
             error!("could not remember the data key on this device: {e}");
         }
@@ -652,6 +677,16 @@ impl EncryptionCtx {
             if let Err(e) = crate::crypto::forget_device_key().await {
                 error!("could not forget the key written for a signed-out account: {e}");
             }
+            return;
+        }
+        // "Lock now" and sign-out both bump the counter, and `Forgets`
+        // already stopped `remember` writing anything durable. Without this
+        // the in-memory half would go through anyway: the user would press
+        // "Lock now" mid-ceremony, watch it take, and find the session
+        // unlocked again a moment later with nothing on the device to
+        // explain it.
+        if !self.may_publish(token) {
+            error!("this device was asked to forget its key while an unlock was in flight");
             return;
         }
         self.publish(EncryptionState::Unlocked(key));
@@ -674,9 +709,14 @@ impl EncryptionCtx {
     ///
     /// Goes through [`crate::crypto::forget_device_key`] rather than the
     /// keystore directly, so an unlock ceremony still running when the user
-    /// pressed this cannot write its key back afterwards.
+    /// pressed this cannot write its key back afterwards. The counter is
+    /// bumped for the same reason one step further out: a probe that read
+    /// the keystore *before* the clear is still holding a key, and without
+    /// this it would land afterwards and publish `Unlocked` straight over
+    /// the `Locked` the user just asked for.
     #[cfg(feature = "hydrate")]
     pub async fn lock(self) -> Result<(), crate::crypto::subtle::CryptoError> {
+        let _ = self.begin_probe();
         self.publish(EncryptionState::Locked);
         crate::crypto::forget_device_key().await
     }

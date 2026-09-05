@@ -170,19 +170,16 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
     // Without a control, a user who loses a device has no way to reach it,
     // and session cookies live 30 days.
     let sign_out_all = move |_| {
+        // Through `sign_out` for the same reason the header's control is:
+        // this device's data key goes first, and goes whether or not the
+        // server manages to revoke anything (spec section 6.7). Revoking
+        // every session and leaving a working key on the device in front of
+        // you would be the wrong half of the job. Built in the handler, not
+        // in the spawned block, so the invalidation lands at the click —
+        // see `sign_out`.
+        let signing_out = sign_out(encryption, forget_device_key(), sign_out_everywhere());
         leptos::task::spawn_local(async move {
-            // Through `sign_out` for the same reason the header's control
-            // is: this device's data key goes first, and goes whether or not
-            // the server manages to revoke anything (spec section 6.7).
-            // Revoking every session and leaving a working key on the device
-            // in front of you would be the wrong half of the job.
-            match sign_out(
-                move || encryption.signing_out(),
-                forget_device_key(),
-                sign_out_everywhere(),
-            )
-            .await
-            {
+            match signing_out.await {
                 // Same local teardown as the header's sign-out: clear the
                 // signal rather than reload, so `use_persistent` re-reads
                 // from localStorage in place. This flips the page to its

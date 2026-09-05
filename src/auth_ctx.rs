@@ -5,6 +5,7 @@ use leptos::prelude::*;
 
 #[cfg(feature = "ssr")]
 use crate::context::AppCtx;
+use crate::encryption_ctx::EncryptionCtx;
 use crate::storage::Backend;
 #[cfg(feature = "hydrate")]
 use wasm_bindgen::JsCast;
@@ -73,32 +74,35 @@ pub async fn forget_device_key() {
 /// that has to hold whether or not the server agreed the sign-out happened
 /// (spec section 6.7).
 ///
-/// `invalidate` comes first and is synchronous, which is the whole reason it
-/// is a separate step rather than folded into `forget`. It is
-/// [`EncryptionCtx::signing_out`](crate::encryption_ctx::EncryptionCtx::signing_out),
-/// and until it has run, a probe already in flight is still allowed to
+/// **Not an `async fn`, and it takes the context rather than a closure over
+/// it.** Both halves of that are the same point.
+/// [`EncryptionCtx::signing_out`] has to run *synchronously*, at the click,
+/// because until it does a probe already in flight is still allowed to
 /// publish `Unlocked` — and `AuthCtx::user`, the only other thing that would
-/// invalidate it, is not cleared until `end_session` has answered. Running
-/// it after `forget` would leave that probe free to republish a key across
-/// the very delete meant to remove it.
+/// invalidate it, is not cleared until `end_session` has answered. An
+/// `async fn` would defer it to the first poll, which at both call sites is
+/// a microtask later, inside `spawn_local`. Doing it here rather than
+/// leaving it to a `FnOnce` the caller supplies is what stops a third call
+/// site forgetting the step: there is nothing left to pass.
 ///
 /// The server's answer is passed straight back, so a caller still learns
 /// that its half failed and can say so. What it cannot do is make the key
 /// clearing wait on that answer.
 ///
-/// All three steps are parameters rather than calls in the body so the order
-/// is pinned by a host test: the real ones reach a reactive context,
-/// IndexedDB and the network, none of which exists off the browser, so
-/// nothing about the sequence would otherwise be checkable by anything but
-/// reading it.
-pub async fn sign_out(
-    invalidate: impl FnOnce(),
+/// `forget` and `end_session` stay parameters so the order is pinned by a
+/// host test: the real ones reach IndexedDB and the network, neither of
+/// which exists off the browser, so nothing about the sequence would
+/// otherwise be checkable by anything but reading it.
+pub fn sign_out(
+    encryption: EncryptionCtx,
     forget: impl Future<Output = ()>,
     end_session: impl Future<Output = Result<(), ServerFnError>>,
-) -> Result<(), ServerFnError> {
-    invalidate();
-    forget.await;
-    end_session.await
+) -> impl Future<Output = Result<(), ServerFnError>> {
+    encryption.signing_out();
+    async move {
+        forget.await;
+        end_session.await
+    }
 }
 
 /// The signed-in address as of the first render, on either target.
@@ -141,6 +145,8 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+    #[cfg(feature = "ssr")]
+    use crate::encryption_ctx::EncryptionState;
     use crate::test_util::block_on;
 
     /// Records which half of [`sign_out`] ran, and in what order.
@@ -148,34 +154,54 @@ mod tests {
         RefCell::new(Vec::new())
     }
 
-    /// Spec section 6.7's ordering: anything in flight is invalidated and
-    /// the device key is gone, both before the server is asked for
-    /// anything.
+    /// Spec section 6.7's ordering, and the half a later edit could most
+    /// easily lose: the probe is invalidated *before the returned future is
+    /// even polled*, so nothing in flight can publish `Unlocked` across the
+    /// delete below and put the key straight back.
     ///
-    /// The `hydrate` halves of this — the IndexedDB delete, the probe
-    /// generation — have no host equivalent and are reviewed by reading
-    /// `crypto::keystore` and `encryption_ctx`. What is checkable here, and
-    /// is the part a later edit could quietly change, is the sequence. The
-    /// invalidation leads because a probe in flight stays allowed to publish
-    /// `Unlocked` until something bumps the counter, and publishing one
-    /// across the delete below would put the key straight back.
+    /// Both call sites hand this future to `spawn_local`, which is a
+    /// microtask away from the click, so "synchronous" here means exactly
+    /// what it says: turning this back into an `async fn` reopens that
+    /// window, and the assertion before `block_on` is what would catch it.
+    ///
+    /// The `hydrate` halves — the IndexedDB delete, the keystore itself —
+    /// have no host equivalent and are reviewed by reading
+    /// `crypto::keystore`.
+    #[cfg(feature = "ssr")]
     #[test]
-    fn signing_out_stops_the_probe_and_forgets_the_key_before_ending_the_session() {
-        let steps = trace();
-        let done = block_on(sign_out(
-            || steps.borrow_mut().push("invalidate"),
-            async { steps.borrow_mut().push("forget") },
-            async {
-                steps.borrow_mut().push("end session");
-                Ok(())
-            },
-        ));
-        assert!(done.is_ok());
-        assert_eq!(
-            *steps.borrow(),
-            ["invalidate", "forget", "end session"],
-            "a probe left running across the delete would republish the key it removed"
-        );
+    fn signing_out_stops_the_probe_before_anything_is_awaited() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let steps = trace();
+            let encryption = EncryptionCtx::for_state(EncryptionState::Unknown);
+            let in_flight = encryption.begin_probe();
+
+            let signing_out = sign_out(
+                encryption,
+                async { steps.borrow_mut().push("forget") },
+                async {
+                    steps.borrow_mut().push("end session");
+                    Ok(())
+                },
+            );
+
+            assert!(
+                !encryption.may_publish(in_flight),
+                "a probe in flight must be invalidated at the click, not one poll later"
+            );
+            assert!(
+                steps.borrow().is_empty(),
+                "nothing else may have run before the future is polled"
+            );
+
+            assert!(block_on(signing_out).is_ok());
+            assert_eq!(
+                *steps.borrow(),
+                ["forget", "end session"],
+                "the key must be gone before the server is asked for anything"
+            );
+        });
+        owner.cleanup();
     }
 
     /// The case the control exists for. A sign-out the server refused still
@@ -185,26 +211,31 @@ mod tests {
     ///
     /// The failure is still reported: the assertion on `done` is what stops
     /// this being satisfied by swallowing the error instead.
+    #[cfg(feature = "ssr")]
     #[test]
     fn a_sign_out_the_server_refused_still_forgets_the_device_key() {
-        let steps = trace();
-        let done = block_on(sign_out(
-            || steps.borrow_mut().push("invalidate"),
-            async { steps.borrow_mut().push("forget") },
-            async {
-                steps.borrow_mut().push("end session");
-                Err(ServerFnError::ServerError("offline".to_string()))
-            },
-        ));
-        assert!(
-            done.is_err(),
-            "the caller must still learn the server failed"
-        );
-        assert_eq!(
-            *steps.borrow(),
-            ["invalidate", "forget", "end session"],
-            "the key clearing must not be conditional on the server call"
-        );
+        let owner = Owner::new();
+        owner.with(|| {
+            let steps = trace();
+            let done = block_on(sign_out(
+                EncryptionCtx::for_state(EncryptionState::Unknown),
+                async { steps.borrow_mut().push("forget") },
+                async {
+                    steps.borrow_mut().push("end session");
+                    Err(ServerFnError::ServerError("offline".to_string()))
+                },
+            ));
+            assert!(
+                done.is_err(),
+                "the caller must still learn the server failed"
+            );
+            assert_eq!(
+                *steps.borrow(),
+                ["forget", "end session"],
+                "the key clearing must not be conditional on the server call"
+            );
+        });
+        owner.cleanup();
     }
 
     /// `backend()` is the one thing standing between a signed-in user's

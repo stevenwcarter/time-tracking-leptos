@@ -761,27 +761,33 @@ it — the phase-1 spec's §10 convention.
   into an encrypted account. The seam behaved correctly throughout; the UI
   simply never asked it the question.
 
-  So E7 has a second half: **the key is published on the same `Ok` branch
-  that returns from `encryption_enable`, with no intervening `await` and no
-  user interaction in between.** Any deferral reopens the window.
+  So E7 has a second half. It was first written as a rule about the code —
+  "the key is published on the same `Ok` branch that returns from
+  `encryption_enable`, with no intervening `await` and no user interaction
+  in between" — and then amended once, to "no `await` but the publish
+  itself", when `EncryptionCtx::unlock` became `async` so the keystore write
+  could be sequenced against the identity check guarding it (§6.1's third
+  amendment). Both wordings were statements about an implementation, and the
+  second was falsified by a later fix that was itself correct.
 
-  **Amended: "no intervening `await`" is now "no `await` but the publish
-  itself".** `EncryptionCtx::unlock` is `async` — the keystore write has to
-  be sequenced against the identity check that guards it (§6.1's third
-  amendment) — so the `Ok` branch awaits exactly once, on the call that does
-  the publishing. Nothing else may go between them, and nothing does.
+  **Amended again, to the property actually wanted: the state never reports
+  `Plaintext` for an account the server has already marked encrypted.**
+  Unlike an `await` count, that survives somebody making `unlock` slower.
 
-  What survives of the original wording is the part that matters: **no user
-  interaction.** The residual window is one IndexedDB round trip in which
-  `EncryptionCtx` still reports `Disabled`, and it is a real window rather
-  than a proven-impossible one — an `await` yields to the event loop, and the
-  event loop is where clicks come from. It is bounded by a local write with
-  no network in it, it is reachable only by navigating off `/account`
-  mid-write, and closing it entirely would mean publishing before the
-  identity check, which is the strictly worse bug §6.1's third amendment
-  exists to fix. Recorded rather than argued away, per §10's rule: if a
-  future change makes `unlock` slower or gives that window a network hop, it
-  stops being acceptable and E7's second half needs re-deciding.
+  *Guarded by:* `unlock` publishing `EncryptionState::Locked` between its
+  first identity check and the keystore write. `Locked` refuses writes, so
+  the window in which the account is encrypted server-side and this context
+  has not yet said `Unlocked` costs a retry rather than a plaintext row.
+  Nothing about the key is published or persisted before the identity check,
+  so the bug §6.1's third amendment fixed stays fixed; and the sign-out path
+  is unaffected, because the probe that a sign-out re-runs answers
+  `Disabled` for a signed-out visitor anyway. On the ordinary unlock paths
+  (`UnlockPrompt`, both `pending_key` arms) the state is already `Locked`
+  and the publish is a no-op.
+
+  The other half of the same property is E8: a state computed once per page
+  load can be wrong about an account that changed elsewhere, and a stored
+  row outranks it.
 
 - **E6. `APP_SALT` and the two HKDF `info` strings never change.** Changing
   one silently makes every existing wrap unopenable. *Guarded by:*
