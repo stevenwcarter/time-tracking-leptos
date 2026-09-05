@@ -97,6 +97,20 @@ pub fn entries_in_range(
         .collect())
 }
 
+/// Whether the user has saved anything at all, ignoring what it says.
+///
+/// The only caller is `encryption_status`'s `unmigrated_hint` (spec section
+/// 7.6): existence, not content, is all that hint needs, and existence is
+/// all this reads — no body ever crosses this function (invariant E1).
+pub fn user_has_any_entry(conn: &mut DbConn, user_id: i32) -> Result<bool> {
+    let n: i64 = time_entry::table
+        .filter(time_entry::user_id.eq(user_id))
+        .count()
+        .get_result(conn)
+        .context("count time_entry rows")?;
+    Ok(n > 0)
+}
+
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
     use super::*;
@@ -261,5 +275,15 @@ mod tests {
                 .expect("range")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn user_has_any_entry_reflects_whether_anything_is_saved() {
+        let pool = test_pool();
+        let mut conn = pool.get().expect("checkout");
+        let uid = user_id(&mut conn, "alice@example.com");
+        assert!(!user_has_any_entry(&mut conn, uid).expect("query"));
+        save(&mut conn, uid, d(2026, 9, 4), "x").expect("save");
+        assert!(user_has_any_entry(&mut conn, uid).expect("query"));
     }
 }

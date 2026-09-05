@@ -34,7 +34,7 @@ use tower::ServiceExt;
 
 use crate::app::{App, shell};
 use crate::context::AppCtx;
-use crate::dto::PasskeyListItem;
+use crate::dto::{EncryptionStatus, PasskeyListItem, WrapDto};
 use crate::{auth, db, email, session};
 
 /// Root-level static files that must be routed explicitly.
@@ -330,6 +330,61 @@ impl SessionClient {
         self.call("passkey/delete", &[("id", &id)]).await
     }
 
+    /// This client's encryption status: whether the account is encrypted,
+    /// and whether it looks worth checking for unmigrated entries.
+    pub async fn encryption_status(&self) -> Result<EncryptionStatus, String> {
+        self.call("encryption/status", &[]).await
+    }
+
+    /// This client's wraps — the routes this account's data key can be
+    /// opened through.
+    pub async fn encryption_wraps(&self) -> Result<Vec<WrapDto>, String> {
+        self.call("encryption/wraps", &[]).await
+    }
+
+    /// Turns encryption on for this account.
+    pub async fn encryption_enable(
+        &self,
+        passkey_wrap: &[u8],
+        credential_id: &[u8],
+        recovery_wrap: &[u8],
+    ) -> Result<(), String> {
+        self.call_bytes(
+            "encryption/enable",
+            &[
+                ("passkey_wrap", passkey_wrap),
+                ("credential_id", credential_id),
+                ("recovery_wrap", recovery_wrap),
+            ],
+        )
+        .await
+    }
+
+    /// Adds a wrap for a newly enrolled passkey.
+    pub async fn encryption_add_passkey_wrap(
+        &self,
+        credential_id: &[u8],
+        wrapped_key: &[u8],
+    ) -> Result<(), String> {
+        self.call_bytes(
+            "encryption/add_passkey_wrap",
+            &[
+                ("credential_id", credential_id),
+                ("wrapped_key", wrapped_key),
+            ],
+        )
+        .await
+    }
+
+    /// Re-issues this account's recovery wrap.
+    pub async fn encryption_replace_recovery_wrap(&self, wrapped_key: &[u8]) -> Result<(), String> {
+        self.call_bytes(
+            "encryption/replace_recovery_wrap",
+            &[("wrapped_key", wrapped_key)],
+        )
+        .await
+    }
+
     /// Posts a URL-encoded form body to `/api/{endpoint}` with this client's
     /// cookie, if any, and decodes a JSON response.
     ///
@@ -349,6 +404,34 @@ impl SessionClient {
             .map(|(key, value)| format!("{}={}", form_urlencode(key), form_urlencode(value)))
             .collect::<Vec<_>>()
             .join("&");
+        self.send(endpoint, body).await
+    }
+
+    /// Like [`Self::call`], for the handful of server functions whose
+    /// arguments are `Vec<u8>` rather than strings (the encryption wrap
+    /// blobs). A plain `&str` value can't stand in for a byte vector, so
+    /// this builds the array-indexed form the server macro's default POST
+    /// codec (`serde_qs`) expects for a sequence: `key[0]=<byte>&key[1]=...`.
+    async fn call_bytes<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        fields: &[(&str, &[u8])],
+    ) -> Result<T, String> {
+        let body = fields
+            .iter()
+            .map(|(key, bytes)| form_urlencode_byte_vec(key, bytes))
+            .collect::<Vec<_>>()
+            .join("&");
+        self.send(endpoint, body).await
+    }
+
+    /// The transport `call` and `call_bytes` share once each has built the
+    /// request body in its own encoding.
+    async fn send<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        body: String,
+    ) -> Result<T, String> {
         let mut req = Request::builder()
             .method("POST")
             .uri(format!("/api/{endpoint}"))
@@ -431,6 +514,22 @@ fn form_urlencode(raw: &str) -> String {
         }
     }
     out
+}
+
+/// Encodes one `Vec<u8>` server-fn argument the way `serde_qs` — the
+/// default POST codec `#[server]` uses — serializes a byte sequence:
+/// `key[0]=<byte>&key[1]=<byte>&...`, brackets unescaped. Confirmed against
+/// `serde_qs` itself, not guessed: it does not percent-encode `[`/`]`
+/// because it appends them to the key *after* encoding the rest, and its own
+/// parser round-trips this exact shape.
+fn form_urlencode_byte_vec(key: &str, bytes: &[u8]) -> String {
+    let key = form_urlencode(key);
+    bytes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| format!("{key}[{i}]={b}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// The router-assembly logic shared by [`router`] and [`app_with_magic_link`],

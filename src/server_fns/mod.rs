@@ -1,5 +1,6 @@
 //! Leptos server functions and their shared helpers.
 
+pub mod encryption;
 pub mod entries;
 pub mod passkey;
 pub mod session;

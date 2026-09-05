@@ -405,23 +405,69 @@ pub async fn passkey_rename(id: i32, name: String) -> Result<(), ServerFnError> 
 }
 
 /// Removes a passkey.
+///
+/// Refuses to remove the account's last passkey-unlock wrap while the
+/// account is encrypted (spec section 6.6): without this, a user with one
+/// passkey and a lost recovery code could destroy their own data with a
+/// single click and no way back in. The check and both deletes share one
+/// transaction, so a second concurrent delete cannot slip through between
+/// the check and the write.
 #[server(endpoint = "passkey/delete")]
 pub async fn passkey_delete(id: i32) -> Result<(), ServerFnError> {
+    use diesel::prelude::*;
+
+    use crate::crypto::wire::WrapKind;
+    use crate::entry_key::store as key_store;
     use crate::passkey::store;
+
     let (ctx, me) = super::require_user()?;
     let mut conn = ctx
         .conn()
         .map_err(super::log_and_fail("conn", "Internal server error"))?;
-    // Same scoping as `passkey_rename` above (invariant I7).
-    let deleted = store::delete_for_user(&mut conn, id, me.id).map_err(super::log_and_fail(
-        "delete passkey",
-        "Internal server error",
-    ))?;
-    if deleted {
-        Ok(())
-    } else {
-        Err(super::server_err("That passkey no longer exists."))
-    }
+
+    // The inner `Result<(), &str>` is the outcome the caller sees: every
+    // `Err` here is an expected, user-facing refusal, not a bug worth
+    // logging. `store` and `key_store` both return `anyhow::Result`, so the
+    // transaction's error type is `anyhow::Error` rather than
+    // `diesel::result::Error` — still explicit, still satisfies Diesel's
+    // `From<diesel::result::Error>` bound.
+    let outcome = conn
+        .transaction::<Result<(), &'static str>, anyhow::Error, _>(|conn| {
+            let rows = store::list_by_user(conn, me.id)?;
+            let Some(target) = rows.iter().find(|row| row.id == id) else {
+                return Ok(Err("That passkey no longer exists."));
+            };
+
+            let encrypted = key_store::is_encrypted(conn, me.id)?;
+            let wraps = key_store::list_wraps(conn, me.id)?;
+            let this_credential_has_a_wrap = wraps.iter().any(|w| {
+                w.kind == WrapKind::Passkey
+                    && w.credential_id.as_deref() == Some(target.credential_id.as_slice())
+            });
+            let passkey_wrap_count = wraps.iter().filter(|w| w.kind == WrapKind::Passkey).count();
+            if encrypted && this_credential_has_a_wrap && passkey_wrap_count <= 1 {
+                return Ok(Err(
+                    "This is your last passkey that can unlock your encrypted entries. \
+                     Removing it would lock you out for good — use your recovery code, \
+                     or add another passkey first.",
+                ));
+            }
+
+            // Same scoping as `passkey_rename` above (invariant I7).
+            if !store::delete_for_user(conn, id, me.id)? {
+                // Deleted between the lookup above and here; the caller sees
+                // the same "gone" outcome either way.
+                return Ok(Err("That passkey no longer exists."));
+            }
+            key_store::delete_wrap_for_credential(conn, me.id, &target.credential_id)?;
+            Ok(Ok(()))
+        })
+        .map_err(super::log_and_fail(
+            "delete passkey",
+            "Internal server error",
+        ))?;
+
+    outcome.map_err(super::server_err)
 }
 
 #[cfg(all(test, feature = "ssr"))]
