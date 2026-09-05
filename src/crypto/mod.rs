@@ -114,6 +114,30 @@ pub async fn forget_device_key() -> Result<(), subtle::CryptoError> {
 #[derive(Clone)]
 pub enum SessionKey {}
 
+/// Which secret a ceremony will open the account's data key with.
+///
+/// The user's half of an [`Opener`]: the wrap each one pairs with comes out
+/// of [`choose_route`] once the account's rows have been fetched, so the two
+/// can only be joined inside the ceremony itself.
+///
+/// It is a choice the caller has to make because there is not always one to
+/// fall back on. A user who lost every passkey and got back in with their
+/// recovery code has no passkey that can open anything, so a ceremony that
+/// only ever asks a passkey would leave that account unable to key a new one
+/// — recovery-code-only, on every device, permanently. See
+/// [`flow::add_passkey_key`].
+///
+/// Ungated, unlike `Opener` and the ceremonies that consume it: the panel's
+/// view has to name this type on every target, and the choice is plain data.
+/// Only acting on it needs a browser.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum KeySource {
+    /// Assert against an enrolled passkey that already holds a wrap.
+    Passkey,
+    /// The recovery code, as the user typed it.
+    Recovery(String),
+}
+
 /// The wrap this device is going to try to open, picked out of the rows the
 /// server offered.
 ///

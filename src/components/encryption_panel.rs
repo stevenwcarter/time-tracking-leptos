@@ -14,12 +14,14 @@
 //! 1. **Enabling asks for a passkey again.** Creating a credential reports
 //!    only *whether* PRF is available, never the output, so the key material
 //!    has to come from a fresh assertion (spec section 6.1 step 1).
-//! 2. **Adding a passkey costs three authenticator interactions, always** —
-//!    create it, assert against a credential that can already unlock to
-//!    re-derive the raw key, assert against the new one for its PRF output.
-//!    An unlocked session does not save one of them: what it holds is a
+//! 2. **Adding a passkey costs three authenticator interactions** — create
+//!    it, assert against a credential that can already unlock to re-derive
+//!    the raw key, assert against the new one for its PRF output. An
+//!    unlocked session does not save one of them: what it holds is a
 //!    *sealed* key, which by construction cannot yield its bytes (spec
-//!    section 6.5, invariant E5).
+//!    section 6.5, invariant E5). The recovery code can stand in for the
+//!    middle one, which is the only thing that works on an account whose
+//!    passkeys are all gone — see [`Openers`].
 //! 3. **The recovery code is shown once.** `reissue_recovery` mints a *new*
 //!    one; nothing anywhere can reproduce the old.
 //!
@@ -27,11 +29,12 @@
 //! probes on its own, so on the server it renders the "checking" branch for
 //! everybody (invariant E2) and hydrates against itself.
 
-use leptos::either::{Either, EitherOf5};
+use leptos::either::{Either, EitherOf3, EitherOf6};
 use leptos::prelude::*;
 
 use crate::auth_ctx::AuthCtx;
 use crate::clipboard::copy_to_clipboard;
+use crate::crypto::KeySource;
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 
 #[cfg(any(feature = "hydrate", test))]
@@ -268,6 +271,57 @@ impl Overview {
     }
 }
 
+/// Which of the account's secrets can open its data key right now, and so
+/// which of them can pass a copy on to a newly enrolled passkey.
+///
+/// Four answers rather than two booleans, because each is a different
+/// situation to be in and the panel offers different controls for each.
+/// `RecoveryOnly` is the one that earns the type: it is where an account
+/// lands when every passkey is lost and the recovery code gets the user back
+/// in — which is precisely when they enrol a replacement. A ceremony that
+/// only ever asked another passkey would find none, and the account would
+/// stay recovery-code-only on every device, permanently. The code exists to
+/// get somebody back in, not to cost them the way back (spec section 6.5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Openers {
+    /// No enrolled passkey holds a wrap and no recovery wrap is on file.
+    /// Nothing can open this account's entries, so nothing can key a new
+    /// passkey either.
+    Nothing,
+    /// Only the recovery code: every passkey here is keyless or incapable.
+    RecoveryOnly,
+    /// Only a passkey — an account with no recovery wrap, or one this build
+    /// cannot use.
+    PasskeyOnly,
+    /// Either, which is where a healthy encrypted account sits.
+    Either,
+}
+
+impl Openers {
+    fn of(overview: &Overview) -> Self {
+        let passkey = overview
+            .routes
+            .iter()
+            .any(|route| route.status == RouteStatus::CanUnlock);
+        match (passkey, overview.has_recovery_wrap) {
+            (true, true) => Openers::Either,
+            (true, false) => Openers::PasskeyOnly,
+            (false, true) => Openers::RecoveryOnly,
+            (false, false) => Openers::Nothing,
+        }
+    }
+
+    /// Whether a passkey assertion is worth offering as the opener.
+    fn passkey(self) -> bool {
+        matches!(self, Openers::PasskeyOnly | Openers::Either)
+    }
+
+    /// Whether the recovery code is worth offering as the opener.
+    fn recovery(self) -> bool {
+        matches!(self, Openers::RecoveryOnly | Openers::Either)
+    }
+}
+
 /// Where the panel is in a flow it started itself.
 ///
 /// Half of what decides the screen; [`Phase`] is the other half, and
@@ -288,6 +342,15 @@ enum Mode {
     NewCode(String),
     /// A re-issued code. Confirming it just closes.
     ReissuedCode(String),
+    /// One keyless passkey, and the choice of which secret will open the
+    /// data key to give it one.
+    GiveKey {
+        credential_id: Vec<u8>,
+        /// Carried so the card can name the passkey it is about to key. The
+        /// list it came from is a fetch away and may re-order underneath
+        /// this screen.
+        name: String,
+    },
 }
 
 /// Which of the two code screens is up.
@@ -362,6 +425,9 @@ enum Screen {
     Enable,
     /// An encrypted account, from a device that may or may not hold the key.
     Manage { unlocked: bool },
+    /// One passkey is being given an unlock key, and the account's openers
+    /// are the choice on offer.
+    GiveKey { credential_id: Vec<u8>, name: String },
 }
 
 impl Screen {
@@ -374,6 +440,13 @@ impl Screen {
             Mode::ReissuedCode(code) => Screen::Code {
                 code,
                 kind: CodeKind::Reissued,
+            },
+            Mode::GiveKey {
+                credential_id,
+                name,
+            } => Screen::GiveKey {
+                credential_id,
+                name,
             },
             Mode::Idle => match phase {
                 Phase::Checking => Screen::Checking,
@@ -638,7 +711,10 @@ pub fn EncryptionPanel(
         }
     };
 
-    let dismiss_code = move || {
+    // Shared by every card that can be closed without doing anything: the
+    // re-issued code screen and the give-a-key screen both return to
+    // whatever the account's state calls for.
+    let close_card = move || {
         mode.set(Mode::Idle);
         status.set(None);
     };
@@ -692,7 +768,18 @@ pub fn EncryptionPanel(
         }
     };
 
-    let give_key = move |credential_id: Vec<u8>| {
+    // Opens the choice of opener rather than starting a ceremony, because
+    // there is more than one and the account may only have the second: see
+    // `Openers`.
+    let start_give_key = move |name: String, credential_id: Vec<u8>| {
+        status.set(None);
+        mode.set(Mode::GiveKey {
+            credential_id,
+            name,
+        });
+    };
+
+    let give_key = move |credential_id: Vec<u8>, source: KeySource| {
         status.set(None);
         #[cfg(feature = "hydrate")]
         {
@@ -701,21 +788,26 @@ pub fn EncryptionPanel(
             };
             busy.set(true);
             spawn_local(async move {
-                let outcome = crate::crypto::flow::add_passkey_key(&user, &credential_id).await;
+                let outcome =
+                    crate::crypto::flow::add_passkey_key(&user, &credential_id, source).await;
                 busy.set(false);
                 match outcome {
                     Ok(()) => {
+                        mode.set(Mode::Idle);
                         status.set(Some(Status::Note(
                             "That passkey can now open your entries.".to_string(),
                         )));
                         reload.update(|n| *n += 1);
                     }
+                    // The card stays up on a failure, so a mistyped recovery
+                    // code can be corrected without walking back through the
+                    // list to find the same row again.
                     Err(message) => status.set(Some(Status::Problem(message))),
                 }
             });
         }
         #[cfg(not(feature = "hydrate"))]
-        let _ = credential_id;
+        let _ = (credential_id, source);
     };
 
     let retry_probe = move || {
@@ -736,7 +828,7 @@ pub fn EncryptionPanel(
                 <p class=line.class()>{line.message().to_string()}</p>
             })}
             {move || match Screen::of(mode.get(), phase.get()) {
-                Screen::Code { code, kind } => EitherOf5::A(view! {
+                Screen::Code { code, kind } => EitherOf6::A(view! {
                     <RecoveryCodeCard
                         code=code
                         heading=kind.heading()
@@ -744,19 +836,19 @@ pub fn EncryptionPanel(
                         confirm=kind.confirm()
                         on_confirm=move || match kind {
                             CodeKind::New => confirm_new_code(),
-                            CodeKind::Reissued => dismiss_code(),
+                            CodeKind::Reissued => close_card(),
                         }
                     />
                 }),
                 // What the server renders for everybody, and what the
                 // browser renders until the probe lands (invariant E2).
-                Screen::Checking => EitherOf5::B(view! {
+                Screen::Checking => EitherOf6::B(view! {
                     <div>
                         <h2 class="text-lg font-semibold text-gray-800 mb-1">"Encryption"</h2>
                         <p class="text-sm text-gray-500">"Checking this account…"</p>
                     </div>
                 }),
-                Screen::Unreachable => EitherOf5::C(view! {
+                Screen::Unreachable => EitherOf6::C(view! {
                     <div>
                         <h2 class="text-lg font-semibold text-gray-800 mb-1">"Encryption"</h2>
                         <p class="text-sm text-gray-600 mb-4">
@@ -773,7 +865,7 @@ pub fn EncryptionPanel(
                         </button>
                     </div>
                 }),
-                Screen::Enable => EitherOf5::D(view! {
+                Screen::Enable => EitherOf6::D(view! {
                     <EnableSection
                         overview=overview
                         understood=understood
@@ -781,7 +873,7 @@ pub fn EncryptionPanel(
                         on_enable=turn_on
                     />
                 }),
-                Screen::Manage { unlocked } => EitherOf5::E(view! {
+                Screen::Manage { unlocked } => EitherOf6::E(view! {
                     <ManageSection
                         unlocked=unlocked
                         overview=overview
@@ -789,7 +881,17 @@ pub fn EncryptionPanel(
                         on_lock=lock_now
                         on_reissue=new_recovery_code
                         on_migrate=run_migration
-                        on_give_key=give_key
+                        on_give_key=start_give_key
+                    />
+                }),
+                Screen::GiveKey { credential_id, name } => EitherOf6::F(view! {
+                    <GiveKeyCard
+                        name=name
+                        credential_id=credential_id
+                        overview=overview
+                        busy=busy
+                        on_open=give_key
+                        on_cancel=close_card
                     />
                 }),
             }}
@@ -956,7 +1058,7 @@ fn ManageSection(
     on_lock: impl Fn() + Copy + Send + 'static,
     on_reissue: impl Fn() + Copy + Send + 'static,
     on_migrate: impl Fn() + Copy + Send + 'static,
-    on_give_key: impl Fn(Vec<u8>) + Copy + Send + 'static,
+    on_give_key: impl Fn(String, Vec<u8>) + Copy + Send + 'static,
 ) -> impl IntoView {
     view! {
         <div>
@@ -1058,10 +1160,11 @@ fn ManageSection(
             }}
 
             <p class="text-xs text-gray-500 mt-3">
-                "Adding a passkey to an encrypted account takes three passkey prompts, every \
-                 time: one to create it, one against a passkey that can already unlock, and one \
-                 against the new one. An unlocked session doesn't save a prompt — the key it \
-                 holds is sealed and can't be copied out."
+                "Adding a passkey to an encrypted account takes three passkey prompts: one to \
+                 create it, one against a passkey that can already unlock, and one against the \
+                 new one. An unlocked session doesn't save a prompt — the key it holds is \
+                 sealed and can't be copied out. Your recovery code can take the place of the \
+                 middle prompt, which is what to use if none of your passkeys can unlock."
             </p>
 
             <div class="mt-6 pt-4 border-t border-gray-100">
@@ -1082,6 +1185,136 @@ fn ManageSection(
     }
 }
 
+/// Choosing which secret opens the account's data key, so a keyless passkey
+/// can be given a copy of it (spec section 6.5).
+///
+/// The recovery code is on this screen because of what leaving it off costs.
+/// A user who lost every passkey and got back in with their code has no
+/// passkey that can open anything — so a passkey-only ceremony would refuse
+/// to key the replacement they have just enrolled, and the account would
+/// stay recovery-code-only on every device, for good. Both routes are
+/// offered when both exist, because a passkey prompt is less to get wrong
+/// than thirty-two typed characters.
+#[component]
+fn GiveKeyCard(
+    name: String,
+    credential_id: Vec<u8>,
+    overview: RwSignal<Option<Overview>>,
+    busy: RwSignal<bool>,
+    on_open: impl Fn(Vec<u8>, KeySource) + Copy + Send + 'static,
+    on_cancel: impl Fn() + Copy + Send + 'static,
+) -> impl IntoView {
+    // Stored rather than cloned into each handler: both routes need the same
+    // credential, and the reactive block below rebuilds them whenever the
+    // overview lands.
+    let credential = StoredValue::new(credential_id);
+    let typed_code = RwSignal::new(String::new());
+
+    view! {
+        <div>
+            <h2 class="text-lg font-semibold text-gray-800 mb-1">
+                {format!("Give “{name}” an unlock key")}
+            </h2>
+            <p class="text-sm text-gray-600 mb-4">
+                "Your entries are encrypted, so this passkey needs its own copy of the key. \
+                 Open them with something that can already read them, and your browser will \
+                 ask for this passkey once more to finish."
+            </p>
+
+            {move || match overview.get().map(|overview| Openers::of(&overview)) {
+                // The list has not arrived, so nothing is known about what
+                // could open this account — and claiming either answer here
+                // would be a guess the user would act on.
+                None => EitherOf3::A(view! {
+                    <p class="text-sm text-gray-500">"Loading…"</p>
+                }),
+                // Not a state a healthy account reaches: `encryption_enable`
+                // writes a recovery wrap in the same transaction that turns
+                // encryption on. Said plainly anyway, because an account here
+                // has already lost its entries and a spinner would be the
+                // worst way to find that out.
+                Some(Openers::Nothing) => EitherOf3::B(view! {
+                    <p class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-4">
+                        "Nothing on this account can open your entries: no passkey here holds a \
+                         key, and there's no recovery code on file. There is no way to give this \
+                         passkey one."
+                    </p>
+                }),
+                Some(openers) => EitherOf3::C(view! {
+                    <div>
+                        {openers.passkey().then(|| view! {
+                            <div class="mb-4">
+                                <button
+                                    type="button"
+                                    class="bg-blue-600 text-white text-sm font-semibold rounded px-4 py-2 hover:bg-blue-700 disabled:opacity-60"
+                                    disabled=move || busy.get()
+                                    on:click=move |_| on_open(
+                                        credential.get_value(),
+                                        KeySource::Passkey,
+                                    )
+                                >
+                                    "Use another passkey"
+                                </button>
+                                <p class="text-xs text-gray-500 mt-1">
+                                    "Two prompts: one for a passkey that can already open your \
+                                     entries, then one for this one."
+                                </p>
+                            </div>
+                        })}
+                        {openers.recovery().then(|| view! {
+                            <div>
+                                <label
+                                    class="block text-sm font-medium text-gray-800 mb-1"
+                                    for="give-key-recovery-code"
+                                >
+                                    "Or use your recovery code"
+                                </label>
+                                <input
+                                    id="give-key-recovery-code"
+                                    type="text"
+                                    autocomplete="off"
+                                    spellcheck="false"
+                                    class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm mb-2 font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                    placeholder="0000-0000-0000-0000-0000-0000-0000-0000"
+                                    prop:value=move || typed_code.get()
+                                    on:input=move |ev| typed_code.set(event_target_value(&ev))
+                                />
+                                <button
+                                    type="button"
+                                    class="border border-gray-300 text-sm rounded px-3 py-1.5 hover:bg-gray-50 disabled:opacity-60"
+                                    disabled=move || busy.get()
+                                    on:click=move |_| on_open(
+                                        credential.get_value(),
+                                        KeySource::Recovery(typed_code.get_untracked()),
+                                    )
+                                >
+                                    "Use my recovery code"
+                                </button>
+                                <p class="text-xs text-gray-500 mt-1">
+                                    "One prompt, for this passkey. This is the route to use when \
+                                     none of your other passkeys can open your entries — after a \
+                                     recovery, it is the only one that works."
+                                </p>
+                            </div>
+                        })}
+                    </div>
+                }),
+            }}
+
+            <div class="mt-6 pt-4 border-t border-gray-100">
+                <button
+                    type="button"
+                    class="text-sm text-gray-600 hover:text-gray-900 underline disabled:opacity-60"
+                    disabled=move || busy.get()
+                    on:click=move |_| on_cancel()
+                >
+                    "Cancel"
+                </button>
+            </div>
+        </div>
+    }
+}
+
 /// One passkey's line in the unlock list.
 ///
 /// A credential that cannot unlock is labelled here, never hidden: a user
@@ -1091,26 +1324,32 @@ fn ManageSection(
 fn RouteRow(
     route: PasskeyRoute,
     busy: RwSignal<bool>,
-    on_give_key: impl Fn(Vec<u8>) + Copy + Send + 'static,
+    on_give_key: impl Fn(String, Vec<u8>) + Copy + Send + 'static,
 ) -> impl IntoView {
-    let status = route.status;
-    let credential_id = route.credential_id;
+    let PasskeyRoute {
+        name,
+        credential_id,
+        status,
+    } = route;
+    // Taken before `name` is moved into the row's own text, so the repair
+    // control can name the passkey it is about to key.
+    let repair = (status == RouteStatus::NoKeyYet).then(|| (name.clone(), credential_id));
 
     view! {
         <li class="flex items-start justify-between gap-3 py-2">
             <div class="min-w-0">
                 <p class="text-sm font-medium text-gray-900">
-                    {route.name}
+                    {name}
                     <span class="ml-2 text-xs font-normal text-gray-500">{status.label()}</span>
                 </p>
                 <p class="text-xs text-gray-500">{status.explanation()}</p>
             </div>
-            {(status == RouteStatus::NoKeyYet).then(|| view! {
+            {repair.map(|(name, credential_id)| view! {
                 <button
                     type="button"
                     class="text-sm text-blue-600 hover:text-blue-800 shrink-0 disabled:opacity-60"
                     disabled=move || busy.get()
-                    on:click=move |_| on_give_key(credential_id.clone())
+                    on:click=move |_| on_give_key(name.clone(), credential_id.clone())
                 >
                     "Give it an unlock key"
                 </button>
@@ -1522,6 +1761,22 @@ mod tests {
                     kind: CodeKind::Reissued,
                 },
             );
+            // The same rule, one ceremony over. Nothing irreplaceable is on
+            // this screen, but a half-typed recovery code being painted over
+            // by a re-render of the manage view is the same class of loss.
+            assert_eq!(
+                Screen::of(
+                    Mode::GiveKey {
+                        credential_id: b"cred-b".to_vec(),
+                        name: "New phone".to_string(),
+                    },
+                    phase,
+                ),
+                Screen::GiveKey {
+                    credential_id: b"cred-b".to_vec(),
+                    name: "New phone".to_string(),
+                },
+            );
         }
     }
 
@@ -1544,6 +1799,72 @@ mod tests {
             Screen::of(Mode::Idle, Phase::Unlocked),
             Screen::Manage { unlocked: true }
         );
+    }
+
+    /// A1's route selection, and the account it exists for. Somebody who
+    /// lost every passkey and got back in with their recovery code has no
+    /// passkey opener to offer — so a ceremony that only ever asked for one
+    /// would refuse to key the replacement passkey they have just enrolled,
+    /// and the account would stay recovery-code-only on every device, for
+    /// good. Recovering is meant to get them back in, not cost them the way
+    /// back.
+    ///
+    /// What this pins is the choice put in front of the user. The ceremony
+    /// behind it cannot be tested here at all: it reaches WebAuthn for the
+    /// new credential's PRF output, and there is no host equivalent and no
+    /// wasm test runner in this project.
+    #[test]
+    fn a_recovered_account_can_still_key_a_new_passkey() {
+        let wraps = vec![passkey_wrap(b"cred-a")];
+        let recovered = Overview {
+            // The replacement, enrolled after the recovery: capable, but
+            // with no wrap of its own yet.
+            routes: vec![classify(passkey("New phone", b"cred-b", true), &[])],
+            has_recovery_wrap: true,
+            ..Overview::default()
+        };
+        assert_eq!(Openers::of(&recovered), Openers::RecoveryOnly);
+        assert!(
+            Openers::of(&recovered).recovery(),
+            "the code that got this user back in must also be able to key a passkey"
+        );
+        assert!(!Openers::of(&recovered).passkey());
+
+        // The ordinary account keeps both, because a passkey prompt is less
+        // to get wrong than thirty-two typed characters.
+        let healthy = Overview {
+            routes: vec![
+                classify(passkey("Laptop", b"cred-a", true), &wraps),
+                classify(passkey("New phone", b"cred-b", true), &wraps),
+            ],
+            has_recovery_wrap: true,
+            ..Overview::default()
+        };
+        assert_eq!(Openers::of(&healthy), Openers::Either);
+    }
+
+    /// The two ends of the same selection. An account with a working passkey
+    /// and no recovery wrap has one route; an account with neither has none,
+    /// and offering a ceremony there would send the user through an
+    /// authenticator prompt to reach a failure.
+    #[test]
+    fn an_account_with_nothing_that_opens_it_is_offered_no_route() {
+        let wraps = vec![passkey_wrap(b"cred-a")];
+        let no_code = Overview {
+            routes: vec![classify(passkey("Laptop", b"cred-a", true), &wraps)],
+            has_recovery_wrap: false,
+            ..Overview::default()
+        };
+        assert_eq!(Openers::of(&no_code), Openers::PasskeyOnly);
+
+        let nothing = Overview {
+            routes: vec![classify(passkey("New phone", b"cred-b", true), &wraps)],
+            has_recovery_wrap: false,
+            ..Overview::default()
+        };
+        assert_eq!(Openers::of(&nothing), Openers::Nothing);
+        assert!(!Openers::of(&nothing).passkey());
+        assert!(!Openers::of(&nothing).recovery());
     }
 
     /// The two cards say different things, and saying the wrong one is a
@@ -1609,13 +1930,72 @@ mod tests {
                     on_lock=|| {}
                     on_reissue=|| {}
                     on_migrate=|| {}
-                    on_give_key=|_| {}
+                    on_give_key=|_, _| {}
                 />
             }
             .to_html()
         });
         runtime.cleanup();
         html
+    }
+
+    #[cfg(feature = "ssr")]
+    fn render_give_key(overview: Option<Overview>) -> String {
+        let runtime = Owner::new();
+        let html = runtime.with(move || {
+            view! {
+                <GiveKeyCard
+                    name="New phone".to_string()
+                    credential_id=b"cred-b".to_vec()
+                    overview=RwSignal::new(overview)
+                    busy=RwSignal::new(false)
+                    on_open=|_, _| {}
+                    on_cancel=|| {}
+                />
+            }
+            .to_html()
+        });
+        runtime.cleanup();
+        html
+    }
+
+    /// A1 at the view. The card must offer the recovery code when that is
+    /// all the account has, must not offer a passkey route that would find
+    /// no opener, and must not pre-judge either while the list is still on
+    /// its way.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn the_give_key_card_offers_the_routes_the_account_actually_has() {
+        let recovered = render_give_key(Some(Overview {
+            routes: vec![classify(passkey("New phone", b"cred-b", true), &[])],
+            has_recovery_wrap: true,
+            ..Overview::default()
+        }));
+        assert!(recovered.contains("Use my recovery code"));
+        assert!(
+            !recovered.contains("Use another passkey"),
+            "an account with no passkey that can unlock must not be sent to look for one"
+        );
+
+        let wraps = vec![passkey_wrap(b"cred-a")];
+        let healthy = render_give_key(Some(Overview {
+            routes: vec![
+                classify(passkey("Laptop", b"cred-a", true), &wraps),
+                classify(passkey("New phone", b"cred-b", true), &wraps),
+            ],
+            has_recovery_wrap: true,
+            ..Overview::default()
+        }));
+        assert!(healthy.contains("Use another passkey"));
+        assert!(healthy.contains("Use my recovery code"));
+
+        let unknown = render_give_key(None);
+        for control in ["Use another passkey", "Use my recovery code"] {
+            assert!(
+                !unknown.contains(control),
+                "`{control}` was offered before the account's routes were known"
+            );
+        }
     }
 
     /// The screen the whole recovery story depends on. If `code` ever

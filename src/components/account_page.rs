@@ -407,6 +407,8 @@ async fn run_registration() -> Result<Option<Vec<u8>>, String> {
 /// a second way back in when they had not.
 #[cfg(feature = "hydrate")]
 async fn finish_added_passkey(user: &str, encrypted: bool, credential: Option<Vec<u8>>) -> String {
+    use crate::crypto::KeySource;
+
     if !encrypted {
         return "Passkey added.".to_string();
     }
@@ -415,7 +417,12 @@ async fn finish_added_passkey(user: &str, encrypted: bool, credential: Option<Ve
                 has no unlock key yet. Use “Give it an unlock key” below."
             .to_string();
     };
-    match crate::crypto::flow::add_passkey_key(user, &credential).await {
+    // A passkey opener, because this path has just been through one
+    // authenticator prompt and can reasonably ask for another. When there is
+    // no passkey that can unlock — an account recovered with its code — this
+    // fails and says so, and the panel below offers the recovery route that
+    // does work (see `flow::add_passkey_key`).
+    match crate::crypto::flow::add_passkey_key(user, &credential, KeySource::Passkey).await {
         Ok(()) => "Passkey added, and it can open your entries.".to_string(),
         Err(message) => format!(
             "Passkey added, but it has no unlock key yet, so it won't open your entries: \

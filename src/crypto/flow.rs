@@ -21,7 +21,9 @@ use leptos::logging::error;
 use leptos::prelude::ServerFnError;
 
 #[cfg(feature = "hydrate")]
-use super::{Opener, reissue_recovery};
+use super::{KeySource, Opener, UnlockError, reissue_recovery};
+#[cfg(feature = "hydrate")]
+use crate::dto::WrapDto;
 
 /// Pulls the credential id back out of a WebAuthn response.
 ///
@@ -143,21 +145,113 @@ pub fn assertion_message(err: AssertionError) -> String {
     }
 }
 
+/// A route to the account's data key with the secret that opens it already
+/// in hand.
+///
+/// Owns both halves because [`Opener`] borrows both, and the passkey arm's
+/// PRF output exists only as a local of the assertion that produced it. The
+/// pairing is the one `Opener` documents: a KEK derived from the wrong
+/// secret fails exactly like a corrupt row, so the two must not be brought
+/// together at a call site.
+#[cfg(feature = "hydrate")]
+enum OpenedRoute {
+    Passkey { prf_output: Vec<u8>, wrap: Vec<u8> },
+    Recovery { code: String, wrap: Vec<u8> },
+}
+
+#[cfg(feature = "hydrate")]
+impl OpenedRoute {
+    fn opener(&self) -> Opener<'_> {
+        match self {
+            OpenedRoute::Passkey { prf_output, wrap } => Opener::Passkey { prf_output, wrap },
+            OpenedRoute::Recovery { code, wrap } => Opener::Recovery { code, wrap },
+        }
+    }
+
+    /// What a failed re-wrap means, which depends on which secret was meant
+    /// to open the key.
+    ///
+    /// A passkey's PRF output either derives the KEK or the authenticator
+    /// cannot do it at all, and there is nothing for the user to correct. A
+    /// recovery code is something they typed: telling them "couldn't derive
+    /// an unlock key" for a mistyped code would send them looking for a
+    /// fault in the passkey instead of in the twenty characters they just
+    /// entered.
+    fn rewrap_failed(&self, err: UnlockError) -> String {
+        match (self, err) {
+            (OpenedRoute::Recovery { .. }, UnlockError::Malformed(_)) => {
+                "That doesn't look like a recovery code, so nothing was changed.".to_string()
+            }
+            (OpenedRoute::Recovery { .. }, UnlockError::Crypto(_)) => {
+                "That recovery code didn't open your entries, so that passkey was left as it \
+                 was. Check the code and try again."
+                    .to_string()
+            }
+            (OpenedRoute::Passkey { .. }, _) => {
+                "Couldn't derive an unlock key for that passkey.".to_string()
+            }
+        }
+    }
+}
+
+/// Opens the route `source` names, ready to be re-wrapped under a new one.
+#[cfg(feature = "hydrate")]
+async fn open_existing_route(
+    user: &str,
+    source: KeySource,
+    wraps: &[WrapDto],
+) -> Result<OpenedRoute, String> {
+    use super::choose_route;
+
+    match source {
+        KeySource::Passkey => {
+            let existing = assert_with_prf(user).await.map_err(assertion_message)?;
+            let route = choose_route(wraps, Some(&existing.credential_id)).ok_or_else(|| {
+                "That passkey can't open your entries either, so it has no key to pass on. \
+                 Choose one that already can."
+                    .to_string()
+            })?;
+            Ok(OpenedRoute::Passkey {
+                prf_output: existing.prf_output,
+                wrap: route.wrapped_key,
+            })
+        }
+        KeySource::Recovery(code) => {
+            let route = choose_route(wraps, None).ok_or_else(|| {
+                "This account has no recovery code on file, so there's nothing left to open \
+                 your entries with."
+                    .to_string()
+            })?;
+            Ok(OpenedRoute::Recovery {
+                code,
+                wrap: route.wrapped_key,
+            })
+        }
+    }
+}
+
 /// Gives `target` its own route to the account's data key (spec 6.5).
 ///
-/// **Two authenticator interactions, and there is no version with fewer.**
 /// `wrapKey` needs the raw data key, and neither this device's keystore copy
 /// nor an unlocked [`super::SessionKey`] can produce it (invariant E5) — so
-/// an existing route has to be reopened in the moment. Counting the creation
-/// of the credential itself, enrolling a passkey on an encrypted account
-/// costs three, always. The panel says so before it starts.
+/// an existing route has to be reopened in the moment. `source` says which
+/// one, and the recovery route is not a convenience: a user who lost every
+/// passkey and got back in with their code has no passkey opener to offer,
+/// so a passkey-only ceremony would leave that account unable to key the
+/// replacement passkey they just enrolled — recovery-code-only, on every
+/// device, for good. Recovering is meant to get somebody back in, not cost
+/// them the way back.
 ///
-/// The second assertion must answer with `target`. Filing the wrap under
-/// whichever credential happened to reply would leave `target` still
-/// keyless while quietly keying something else, and the user would be told
-/// it worked.
+/// The cost differs by route, which is why the panel names it before it
+/// starts. A passkey opener means two authenticator interactions here, three
+/// counting the credential's own creation, and there is no version with
+/// fewer. A recovery opener means one: the assertion against `target`.
+///
+/// That assertion must answer with `target`. Filing the wrap under whichever
+/// credential happened to reply would leave `target` still keyless while
+/// quietly keying something else, and the user would be told it worked.
 #[cfg(feature = "hydrate")]
-pub async fn add_passkey_key(user: &str, target: &[u8]) -> Result<(), String> {
+pub async fn add_passkey_key(user: &str, target: &[u8], source: KeySource) -> Result<(), String> {
     use crate::server_fns::encryption::{encryption_add_passkey_wrap, encryption_wraps};
 
     use super::{add_passkey_route, choose_route};
@@ -167,31 +261,20 @@ pub async fn add_passkey_key(user: &str, target: &[u8]) -> Result<(), String> {
         return Err("That passkey can already open your entries.".to_string());
     }
 
-    let existing = assert_with_prf(user).await.map_err(assertion_message)?;
-    let route = choose_route(&wraps, Some(&existing.credential_id)).ok_or_else(|| {
-        "That passkey can't open your entries either, so it has no key to pass on. Choose one \
-         that already can."
-            .to_string()
-    })?;
+    let existing = open_existing_route(user, source, &wraps).await?;
 
     let fresh = assert_with_prf(user).await.map_err(assertion_message)?;
     if fresh.credential_id != target {
         return Err(
             "That wasn't the passkey this step is for. Start again and choose it when \
-                    your browser asks the second time."
+                    your browser asks for it."
                 .to_string(),
         );
     }
 
-    let wrapped = add_passkey_route(
-        &Opener::Passkey {
-            prf_output: &existing.prf_output,
-            wrap: &route.wrapped_key,
-        },
-        &fresh.prf_output,
-    )
-    .await
-    .map_err(|_| "Couldn't derive an unlock key for that passkey.".to_string())?;
+    let wrapped = add_passkey_route(&existing.opener(), &fresh.prf_output)
+        .await
+        .map_err(|err| existing.rewrap_failed(err))?;
 
     encryption_add_passkey_wrap(target.to_vec(), wrapped)
         .await
