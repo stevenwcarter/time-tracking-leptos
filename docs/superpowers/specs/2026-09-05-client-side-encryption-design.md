@@ -232,6 +232,21 @@ that the recovery code is the only backup.
 6. Re-import the DEK non-extractable, store it in the keystore (§7.3), and
    run the migration (§8).
 
+**Amended during implementation.** `crypto::enable` performs step 6's
+keystore write itself, before the caller reaches step 4, so the ordering
+above is not what ships. That is deliberate: the alternative — returning the
+sealed key and trusting the caller to persist it after the server confirms —
+makes "forgot to call `keystore::put`" a live bug whose symptom is a user
+being locked out immediately after enabling, which is both worse and likelier
+than what the current order risks.
+
+What the current order risks is an orphan key: one stored for an account
+whose `encryption_enable` then failed. It is inert. `encrypted_at` is unset,
+so the next probe reports `Disabled` and nothing ever reads the record; a
+retry overwrites it, and sign-out clears it. Persisting local state for
+unconfirmed server state is normally worth avoiding, but here the local state
+does nothing without the server state.
+
 If step 4 fails, nothing has changed server-side and the ceremony is simply
 retried. If the browser is closed between 4 and 6, the account is encrypted
 with zero rows migrated, which §8 resumes.
