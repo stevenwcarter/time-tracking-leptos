@@ -222,16 +222,22 @@ async fn get_from(db: &IdbDatabase, user: &str) -> Result<Option<DataKey>, Crypt
         return Ok(None);
     }
 
+    // `DataKey::from_object` re-checks that what came back is still
+    // non-extractable. A structured clone preserves the flag, so this should
+    // never fire; its error is dropped here because the answer to the caller
+    // is the same as for any other unusable record.
     let key = Reflect::get(&record, &KEY_FIELD.into())
         .ok()
-        .and_then(|value| value.dyn_into::<Object>().ok());
+        .and_then(|value| value.dyn_into::<Object>().ok())
+        .and_then(|object| DataKey::from_object("the stored record", object).ok());
     let Some(key) = key else {
-        // A record with no usable key in it is worse than no record: it
-        // would be re-read on every load and never work. Drop it.
+        // A record with no usable key in it — absent, the wrong sort of
+        // value, or a key that reports itself extractable — is worse than no
+        // record: it would be re-read on every load and never work. Drop it.
         discard(db).await;
         return Ok(None);
     };
-    Ok(Some(DataKey::from_object(key)))
+    Ok(Some(key))
 }
 
 /// Removes the record.

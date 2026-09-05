@@ -43,9 +43,11 @@ use super::wire::{self, APP_SALT, NONCE_LEN};
 #[error("{0}")]
 pub struct CryptoError(pub String);
 
-/// A live, non-extractable AES-256-GCM key: the sealed data key everything
-/// but the two ceremonies holds. Cloneable because `CryptoKey` is a JS
-/// handle; cloning duplicates the handle, not the key material.
+/// A live AES-256-GCM key that reported itself non-extractable when this
+/// handle was built — see [`DataKey::from_object`], which is the only way to
+/// build one and refuses a key that says otherwise. Cloneable because
+/// `CryptoKey` is a JS handle; cloning duplicates the handle, not the key
+/// material.
 ///
 /// Deliberately not `Debug`: the point of the type is that its bytes cannot
 /// be read, and a derived formatter is an invitation to log it anyway.
@@ -53,13 +55,36 @@ pub struct CryptoError(pub String);
 pub struct DataKey(Object);
 
 impl DataKey {
-    /// Wraps a `CryptoKey` handle that is expected to be non-extractable.
+    /// Wraps a `CryptoKey` handle after confirming it really is
+    /// non-extractable.
+    ///
+    /// [`as_key`] proves only that the value is *an object*, which every JS
+    /// object is. The `extractable: false` argument we passed leaves no
+    /// trace in the result's Rust type, so a key that came back extractable
+    /// anyway would be a working, silently exportable data key and nothing
+    /// would fail. Reading `CryptoKey.extractable` back off the key itself
+    /// is the one mechanical check available on invariant E5 in a project
+    /// with no wasm test runner: WebCrypto cannot be exercised on the host
+    /// at all, so no test can stand in for this. A missing or non-boolean
+    /// property fails the same way a `true` does — this is not the place to
+    /// give a surprising object the benefit of the doubt.
+    ///
+    /// `operation` names where the key came from and reaches the log only;
+    /// like every error in this module it carries no key material.
     ///
     /// `pub(super)` rather than public: the handle inside a [`DataKey`] is
     /// this module's business, and [`super::keystore`] is the only outside
     /// caller — it rebuilds one from the `CryptoKey` IndexedDB gave back.
-    pub(super) fn from_object(key: Object) -> Self {
-        Self(key)
+    pub(super) fn from_object(operation: &str, key: Object) -> Result<Self, CryptoError> {
+        let extractable = Reflect::get(&key, &"extractable".into())
+            .ok()
+            .and_then(|value| value.as_bool());
+        if extractable != Some(false) {
+            return Err(CryptoError(format!(
+                "{operation} returned a data key that is not sealed"
+            )));
+        }
+        Ok(Self(key))
     }
 
     /// The underlying handle, for [`super::keystore`] to store.
@@ -284,17 +309,16 @@ pub async fn generate_dek_extractable() -> Result<RawDataKey, CryptoError> {
 /// The one way a [`DataKey`] is built from bytes. `extractable` is `false`
 /// here unconditionally — there is no variant of this call that yields a
 /// readable data key, because nothing but the enable ceremony's own
-/// short-lived handle is ever allowed to be one (invariant E5).
+/// short-lived handle is ever allowed to be one (invariant E5) — and
+/// [`DataKey::from_object`] checks that the browser agreed.
 pub async fn import_dek_non_extractable(raw: &[u8]) -> Result<DataKey, CryptoError> {
     let algorithm = js_object(&[("name", AES_GCM.into())]);
     let material = Uint8Array::from(raw);
     let usages = dek_usages();
     let args = js_array(&[&RAW.into(), &material, &algorithm, &JsValue::FALSE, &usages]);
 
-    Ok(DataKey::from_object(as_key(
-        "importKey",
-        subtle_call("importKey", &args).await?,
-    )?))
+    let key = as_key("importKey", subtle_call("importKey", &args).await?)?;
+    DataKey::from_object("importKey", key)
 }
 
 /// Derives a key-encryption key from input keying material — a passkey's PRF
@@ -407,11 +431,11 @@ async fn unwrap_key(
 ///
 /// This is the unlock path — every sign-in, on every device — and the only
 /// one anything outside the two ceremonies should need. See [`unwrap_key`]
-/// for what a wrong KEK does.
+/// for what a wrong KEK does, and [`DataKey::from_object`] for why the
+/// result is inspected rather than trusted.
 pub async fn unwrap_dek_sealed(wrapped: &[u8], kek: &Kek) -> Result<DataKey, CryptoError> {
-    Ok(DataKey::from_object(
-        unwrap_key(wrapped, kek, &JsValue::FALSE).await?,
-    ))
+    let key = unwrap_key(wrapped, kek, &JsValue::FALSE).await?;
+    DataKey::from_object("unwrapKey", key)
 }
 
 /// Unwraps the stored data key into an exportable [`RawDataKey`].
