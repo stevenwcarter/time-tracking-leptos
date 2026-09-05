@@ -4,7 +4,7 @@
 //! encryption settings, and a link somebody can be sent when a passkey
 //! misbehaves.
 
-use leptos::either::Either;
+use leptos::either::{Either, EitherOf3};
 use leptos::prelude::*;
 use leptos_meta::Title;
 use leptos_router::components::A;
@@ -67,10 +67,7 @@ fn PasskeySection(email: String) -> impl IntoView {
     // of the day view's SSR path, so it does not affect the synchronous
     // render the SSR tests rely on. Created at the top of the component,
     // never inside a closure, so SSR's render walk cannot construct it twice.
-    let rows = Resource::new(
-        || (),
-        |_| async { passkey_list().await.unwrap_or_default() },
-    );
+    let rows = Resource::new(|| (), |_| async { passkey_list().await });
     let status = RwSignal::new(String::new());
 
     let add = move |_| {
@@ -101,7 +98,10 @@ fn PasskeySection(email: String) -> impl IntoView {
     let rename = move |id: i32, name: String| {
         leptos::task::spawn_local(async move {
             match passkey_rename(id, name).await {
-                Ok(()) => rows.refetch(),
+                Ok(()) => {
+                    status.set("Passkey renamed.".to_string());
+                    rows.refetch();
+                }
                 Err(e) => status.set(passkey_error(e)),
             }
         });
@@ -122,21 +122,24 @@ fn PasskeySection(email: String) -> impl IntoView {
             // "expected marker, found <element>" hydration errors.
             <Suspense fallback=|| view! { <p class="text-sm text-gray-500">"Loading…"</p> }>
                 {Suspend::new(async move {
-                    let list = rows.await;
-                    if list.is_empty() {
-                        Either::Left(view! {
+                    match rows.await {
+                        Ok(list) if list.is_empty() => EitherOf3::A(view! {
                             <p class="text-sm text-gray-600">
                                 "No passkeys yet. Add one to sign in with Touch ID, Windows Hello, or your phone — no email round trip."
                             </p>
-                        })
-                    } else {
-                        Either::Right(view! {
+                        }),
+                        Ok(list) => EitherOf3::B(view! {
                             <ul class="divide-y divide-gray-100">
                                 {list.into_iter()
                                     .map(|row| view! { <PasskeyRow row=row on_remove=remove on_rename=rename/> })
                                     .collect_view()}
                             </ul>
-                        })
+                        }),
+                        Err(e) => EitherOf3::C(view! {
+                            <p class="text-sm text-red-600">
+                                {passkey_error(e)}
+                            </p>
+                        }),
                     }
                 })}
             </Suspense>
