@@ -65,21 +65,46 @@ directly by name in the code.
 **Build-time only:** `CARGO_LEPTOS_VERSION`, the `Dockerfile`'s pinned
 cargo-leptos release.
 
+## Deploying
+
+**Delete the existing production database before deploying this build.**
+
+This release changed a value stored in the `entry_key_wrap` table by editing
+an already-shipped migration in place instead of adding a new one, which is
+safe only if no database has run the old version. A database that survives
+will still hold the old value; the migration will not re-run, nothing will
+report an error, and the effect is that **every encrypted account stops being
+able to unlock, permanently.** The key that would decrypt those entries can
+no longer be located, so there is no repair and no support recourse.
+
+Every other assumption this build makes fails loudly and is fixed by
+re-running something. This one does not. If a database ever has to survive
+the change, it needs a real forward migration that rewrites the stored value
+— not a second in-place edit.
+
 ## Accounts
 
 Signing in is optional — the app works fully without it, exactly as it did
 before accounts existed. Signing in with an emailed magic link or a passkey
-changes where entries are stored, and nothing else about how the app is used:
+changes where entries are stored, and what that costs you is one setup step:
 
 - Entries move from `localStorage` to a per-day row in SQLite, scoped to your
   account, instead of one blob held only in this browser.
+- **Before your account can store anything, you set up encryption.** The
+  server will not hold an entry it could read, so a newly signed-in account
+  is taken to `/account` and the day and week views wait until that is done.
+  It is two steps and you only do it once — see Encrypting your entries,
+  below.
 - The first time you sign in on a device that already has local entries, a
   banner offers to import them; days that already exist on the server are
   left untouched either way, so importing twice is safe.
-- `/account` manages passkeys: add one, rename it, or remove it — and turns
-  on encryption (below).
-- Signing out returns you to the `localStorage` backend. Nothing already
-  saved on the server is deleted.
+- `/account` manages passkeys: add one, rename it, or remove it — and is
+  where encryption is set up and managed.
+- Signing out returns you to the `localStorage` backend, which needs no setup
+  and stores nothing on the server. That is also the way out if you signed in
+  somewhere you would rather not set up a key: the setup screen offers "sign
+  out and use this device only". Nothing already saved on the server is
+  deleted.
 
 See the Configuration section above for the SMTP settings that control
 magic-link email and the `WEBAUTHN_RP_*` settings that control passkeys.
@@ -110,20 +135,38 @@ not supported on this server". Sign-in emails then appear in the web UI.
 
 ## Encrypting your entries
 
-Signing in moves your entries onto the server. By default they are stored
-there in the clear, which means whoever runs the server can read them. You
-can turn that off.
+Signing in moves your entries onto the server, and **everything the server
+stores for you is encrypted.** This is not a setting and there is no
+plaintext option: an account that has not set up encryption cannot save an
+entry at all, which is why signing in for the first time takes you to
+`/account` rather than to your day.
 
-**What enabling encryption does.** Your browser generates a key, encrypts
-every entry with it, and sends the server only ciphertext. The key never
-leaves your browser — the server stores *wrapped* copies of it that it has no
-way to open. From then on the server holds the encrypted text, which
-day each entry belongs to, and roughly how long it is; it cannot read a word
-of any entry, and neither can anyone with a copy of the database, a backup,
-or a court order served on whoever hosts it.
+Signed-*out* entries are the opposite, deliberately: they are plain text in
+your browser's `localStorage`. There is nothing to encrypt them with and no
+one to hide them from — they never leave the browser and the server never
+sees them. If you would rather not set up a key at all, that mode is fully
+functional and the setup screen offers it as "sign out and use this device
+only".
 
-**How to turn it on.** `/account` offers it, by one of two routes, and which
-one you get depends on your passkeys rather than on a choice you make:
+**What encryption does.** Your browser generates a key, encrypts every entry
+with it, and sends the server only ciphertext. The key never leaves your
+browser — the server stores *wrapped* copies of it that it has no way to
+open. The server holds the encrypted text, which day each entry belongs to,
+and roughly how long it is; it cannot read a word of any entry, and neither
+can anyone with a copy of the database, a backup, or a court order served on
+whoever hosts it.
+
+**Setting it up takes two steps**, both on `/account`:
+
+1. **Add a passkey — optional.** This is about signing in, not about
+   encryption: a passkey replaces the emailed link with one prompt from
+   whatever your device already unlocks with. Any authenticator will do,
+   including one that cannot hold a key. You can skip it.
+2. **Turn on encryption.** This is the step that matters, and it works
+   whether or not you did step 1.
+
+Step 2 runs by one of two routes, and which one you get depends on your
+passkeys rather than on a choice you make:
 
 - **A passkey and an encryption key**, if you have enrolled a passkey whose
   authenticator supports the WebAuthn PRF extension — most modern platform
@@ -139,9 +182,10 @@ one you get depends on your passkeys rather than on a choice you make:
   **losing it loses your entries outright.** The panel says so in those words
   before you start.
 
-Either way, enabling re-encrypts the entries you already have, in one pass
-you can watch; if it is interrupted, `/account` tells you how many days are
-left and offers to finish. Nothing becomes unreadable in the meantime.
+Either way, there is nothing to convert afterwards. Your account had no
+server-side entries before this, because it could not save any — so the
+moment encryption is on, the day view opens and everything you write from
+then on is sealed. There is no conversion pass to watch, wait for, or resume.
 
 The second route is not a dead end. If you later enrol a passkey that *can*
 hold a key, `/account` will give it one using your encryption key, and from
@@ -190,8 +234,10 @@ says so before you start rather than springing three prompts on you one at a
 time.
 
 **Removing a passkey** deletes its ability to unlock. The app refuses to
-remove your *last* unlocking passkey while encryption is on, and points you
-at your encryption key instead, so a single click cannot destroy your data.
+remove the *last* passkey that can unlock your entries, and points you at
+your encryption key instead, so a single click cannot destroy your data. (On
+the encryption-key-only route there are none to protect, and the refusal
+starts applying the moment you give a passkey a key.)
 
 **What it does not protect against.** Encryption defends your entries at
 rest — an operator reading the database, a stolen backup, a subpoena. It does
@@ -207,28 +253,36 @@ header's signed-in/signed-out state, and the app's *unloaded* entry state; the
 browser fills in the actual saved time entry after hydration, from
 `localStorage` when signed out or from the server when signed in.
 
-Signed-out users' time-tracking data is never sent to the server: it lives
-only in `localStorage`. **Signed-in users' entries are stored server-side, and
-whether that storage is readable by the operator depends on the account.** An
-account that has enabled encryption (above) stores ciphertext under a key the
-server never holds; an account that has not — the default — stores plaintext
-that anyone with database access can read. Both shapes coexist, and so do both
-within a single account while its migration pass runs: each stored row
-carries its own version tag and is read according to that tag, which is what
-makes a half-migrated account a normal state rather than a broken one.
+Where an entry is stored decides how it is stored, and there are exactly two
+answers:
 
-The server is structured so that it never needs to parse an entry's contents
-— the week view's totals are computed in the browser, not in a server query,
-and the enable-time migration asks the browser, not the database, which rows
-still need encrypting. That structure predates the encryption and is what
-let it drop in at the storage seam without touching a single component that
-reads or writes entry text.
+- **Signed out — plaintext in `localStorage`**, never sent to the server.
+- **Signed in — ciphertext in SQLite**, sealed in the browser under a key the
+  server never holds.
+
+There is no third case. The server refuses to write an entry for an account
+that has not set up encryption, so no plaintext row can be created
+server-side by this build, and none is converted from one — an account gains
+its first server-side entry only after it has a key. Each stored row still
+carries its own version tag and is read according to that tag, which is what
+lets one code path serve both backends.
+
+The server is structured so that it never needs to parse an entry's contents:
+the week view's totals are computed in the browser, not in a server query,
+and the write refusal above reads a column on the *account* row
+(`user.encrypted_at`) rather than looking at the body to see which kind it
+is. That structure predates the encryption and is what let it drop in at the
+storage seam without touching a single component that reads or writes entry
+text.
 
 See `docs/superpowers/specs/2026-09-03-leptos-migration-design.md` for the
 hydration contract — the reason stored state is `Option<String>` rather than
 `String` — `docs/superpowers/specs/2026-09-04-accounts-and-dated-entries-design.md`
-for accounts and per-day storage, and
+for accounts and per-day storage,
 `docs/superpowers/specs/2026-09-05-client-side-encryption-design.md` for the
 key hierarchy, the ceremonies, the threat model, and the invariants a change
-in this area has to keep.
-
+in this area has to keep, and
+`docs/superpowers/specs/2026-09-06-encryption-required-design.md` for why
+encryption is a precondition rather than a feature. The last supersedes parts
+of the one before it, which are marked as superseded in place rather than
+removed.

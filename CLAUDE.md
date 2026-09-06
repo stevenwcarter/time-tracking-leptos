@@ -1,24 +1,27 @@
 # time-tracking-leptos
 
 Leptos 0.8 SSR + hydration app on Axum, built with cargo-leptos. Parses
-free-form time-tracking text into a per-project summary. Signed-out users'
-data lives only in the browser's `localStorage` and never reaches the server.
-Signed-in users' entries are stored server-side in SQLite, and **whether an
-operator can read them depends on the account**:
+free-form time-tracking text into a per-project summary. Where an entry is
+stored decides how it is stored, and the two answers are opposite on purpose:
 
-- **Encryption off** — every account by default. Bodies are stored as
-  plaintext in a `{"v":1,"alg":"none",…}` envelope. An operator with database
-  access can read them.
-- **Encryption on** — opt-in, offered to every account. Bodies are stored as
-  `{"v":2,"alg":"a256gcm",…}` ciphertext under an AES-256-GCM key the server
-  never holds and cannot derive. An operator with database access reads
-  nothing but wrapped blobs.
+- **Signed out — `localStorage`, always plaintext.** A
+  `{"v":1,"alg":"none",…}` envelope in the browser. It never reaches the
+  server, so there is nothing for server-side encryption to defend and no
+  key material to defend it with. This is a decision, not a gap (phase-2
+  spec §1.2), and it is the mode the setup gate's escape hatch falls back
+  to.
+- **Signed in — SQLite on the server, always ciphertext.** A
+  `{"v":2,"alg":"a256gcm",…}` envelope sealed under an AES-256-GCM key the
+  server never holds and cannot derive. An operator with database access
+  reads nothing but wrapped blobs.
 
-Neither statement generalizes to the other kind of account, and a single
-account can be **mid-migration** — enabling re-writes existing rows one pass
-at a time, and dispatch is per row on that row's own `v`, so a half-migrated
-account is a normal, readable state rather than a broken one. See Encryption,
-below.
+**There is no third case.** Encryption is not an account setting and cannot
+be declined: `entry_save` refuses every write from an account whose
+`user.encrypted_at` is null (invariant E9), and a signed-in account without
+it is routed to setup instead of the day and week views. No server-side
+plaintext row can be written by this build, and none is migrated — see
+Encryption, below, which also carries the one deployment assumption whose
+failure is unrecoverable.
 
 ## Commands
 
@@ -112,16 +115,23 @@ That is the other half. Writes take a `WriteKey`, not an
 `Option<&SessionKey>`, because on a write "no key" is ambiguous and one of
 its meanings is unrecoverable:
 
-- `Plaintext` — no encryption, write v1.
+- `Plaintext` — no encryption, write v1. **Only `Backend::Local` may take
+  it.** Paired with `Remote` it is refused with
+  `StorageError::EncryptionRequired`, since the server would refuse the same
+  write anyway (invariant E9) and refusing here saves the round trip.
 - `Sealed(&SessionKey)` — seal and write v2.
 - `Locked` — refuse with `StorageError::Locked`. `Unknown`, `Unreachable`
-  and `Locked` all map here. Refusing costs a retry; guessing costs a silent
-  plaintext row that no later migration pass would ever flag, because a v1
-  row is exactly what an un-migrated account legitimately holds.
+  and `Locked` all map here. Refusing costs a retry; guessing costs a
+  plaintext row in an account that must not hold one, and nothing on the
+  read side would ever flag it — dispatch is per row, so a v1 row is read as
+  plaintext without complaint wherever it turns up.
 
-`EncryptionState::write_key` is the single conversion, and `clear` takes a
-`WriteKey` too — on `Remote`, clearing a day stores an empty body rather than
-deleting the row, so it is a write wearing a different name. Reads keep
+`storage::write_target` is the single place both refusals are made, shared by
+`store` and `clear` — on `Remote`, clearing a day stores an empty body rather
+than deleting the row, so it is a write wearing a different name.
+`EncryptionState::write_key` is the single conversion from state to key, and
+`EncryptionState::writes(backend)` reads that decision back out so the entry
+area cannot offer a box the seam then refuses. Reads keep
 `Option<&SessionKey>`: a row says which version it is, so there is no
 ambiguity to resolve.
 
@@ -133,6 +143,15 @@ ambiguity to resolve.
 All but the last assert negatively, and the last two are a matched pair
 asserting the signed-out and signed-in halves against each other. Do not
 weaken any of them to make a change pass.
+
+The gate has its own matched set in the same module —
+`a_signed_in_account_without_encryption_gets_no_entry_area`,
+`the_gate_offers_a_way_back_to_local_mode`,
+`the_setup_view_hides_the_link_that_would_only_bounce_back`,
+`a_signed_out_visitor_is_not_gated` and
+`the_entry_area_is_read_only_until_a_save_would_be_stored`. They are pairs
+for the same reason: an assertion that a gated account sees the escape means
+little without its complement asserting a set-up account does not.
 
 `render_app()` (via `render_at()`), the helper behind these SSR tests, only
 provides a `RequestUrl` context and, for the signed-in case, an `AppCtx` —
@@ -176,18 +195,73 @@ silently starts serving the app's HTML instead. Pinned by `tests/routes.rs`.
 
 ## Encryption
 
-Both phases have shipped. Phase 1 put every body in a versioned envelope
-(`{"v":1,"alg":"none",…}`); phase 2 spends that by writing
-`{"v":2,"alg":"a256gcm",…}` for accounts that opt in, with **no data
-migration** — the version tag was the whole point.
+Three phases have shipped. Phase 1 put every body in a versioned envelope
+(`{"v":1,"alg":"none",…}`); phase 2 spent that by writing
+`{"v":2,"alg":"a256gcm",…}` for accounts that opted in; **phase 3 removed the
+opting.** Server-side storage is now encrypted or it does not happen.
 
-One rule holds regardless, and it is the load-bearing one: **the server must
-never parse, aggregate, search, or render an entry body.** It stores and
-returns opaque strings, capped by length and nothing else. That is why the
-week view aggregates per-project totals in the browser rather than in a
-server query, and why the enable-time migration filters `v: 1` rows
-client-side after fetching all of them — a server-side aggregation or a
-server-side version scan is exactly what encryption breaks.
+> ### Deploying this build requires an empty database
+>
+> **The production database must be deleted before this build is deployed.**
+> This is the one assumption in the branch whose failure is silent and
+> unrecoverable — everything else here fails loudly and is fixed by re-running
+> something.
+>
+> The rename changed the stored `entry_key_wrap.kind` value from `'recovery'`
+> to `'encryption_key'`, and it did so by **editing a shipped migration in
+> place** rather than adding a new one. A database that survives has already
+> run `2026-09-05-000001_entry_key`, so Diesel will not re-run it: the rows
+> keep saying `'recovery'`, `idx_entry_key_wrap_one_encryption_key`'s
+> predicate never matches them, and `WrapKind::parse` returns `None` for
+> every one. The wrap holding that account's data key becomes unfindable.
+> Nothing errors at deploy time and nothing errors at startup; the symptom is
+> every encrypted account failing to unlock, looking exactly like corruption.
+> There is no recovery, because the key that would decrypt the entries is the
+> one that can no longer be located.
+>
+> If a database ever *does* have to survive this change, the fix is a real
+> forward migration (`UPDATE entry_key_wrap SET kind = 'encryption_key' WHERE
+> kind = 'recovery'`, and the index rebuilt) — never a second in-place edit.
+
+One rule holds through all three phases, and it is the load-bearing one:
+**the server must never parse, aggregate, search, or render an entry body.**
+It stores and returns opaque strings, capped by length and nothing else.
+That is why the week view aggregates per-project totals in the browser rather
+than in a server query, and it is why enforcement in §3 of the phase-3 spec
+is a check on `user.encrypted_at` — an account column — rather than the
+obvious "reject a body that is not a v2 envelope", which would be the server
+parsing an entry (invariants E1 and E10).
+
+**Enforcement, and where it lives.** `entry_save` is the only endpoint that
+writes an entry, and it refuses unless `encrypted_at` is set, reading it in
+the same transaction as the write so a save racing `encryption_enable` sees
+one consistent account state. The client half is
+`storage::write_target`, which refuses the `(Backend::Remote,
+WriteKey::Plaintext)` pair with `StorageError::EncryptionRequired` — the
+single place both write refusals are made, shared by `store` and `clear`.
+What this does **not** buy is protection against a modified client that
+enables encryption and then posts plaintext anyway; that is the same trust
+boundary phase 2 recorded, and closing it would require reading bodies.
+Do not "fix" it.
+
+**The gate.** A signed-in account with no encryption gets
+`components::setup_gate::SetupGate` in place of the day and week views, and
+is navigated to `/account`. Both hang off `Writes::SetupRequired`, which
+needs the post-hydration probe, so neither is ever server-rendered. Setup is
+two steps: a passkey (step 1 of 2, explicitly **optional**, framed as
+skipping the email link rather than as an encryption prerequisite) and then
+encryption itself (step 2 of 2). **The escape hatch is load-bearing** —
+"Sign out and use this device only" returns the browser to `Backend::Local`,
+which is fully functional and stores nothing server-side. Without it the gate
+reads as a lock-out. `src/app.rs` asserts both that a gated account sees it
+and that a set-up account does not.
+
+**Nothing migrates, and no code exists to.** `entries_all`, `entry_save_many`
+and `MigrationPlan` are gone with the pass they served. The v1 *read* path
+stays regardless: `envelope::plan_read` is shared by both backends and
+`Backend::Local` still writes v1, so removing it would break signed-out
+storage. What went is narrower than "v1 support" — it is the write route by
+which a `Remote` save could produce a v1 row.
 
 **The key hierarchy.** A per-account AES-256-GCM data key (DEK) is generated
 in the browser and wrapped (AES-KW) under independently derived KEKs: one
@@ -201,8 +275,9 @@ is held as a **non-extractable** `CryptoKey` in IndexedDB (database
 `tt-keys`, store `keys`, id `dek`), so unlock is once per device rather than
 once per page.
 
-**Enabling has two routes** (spec §6.1), and the account's own capability
-picks one — it is not a user preference:
+**Enabling has two routes** (phase-2 spec §6.1), and the account's own
+capability picks one — it is not a user preference. *Which* route, not
+*whether*:
 
 | | Passkey + encryption key | Encryption key only |
 |---|---|---|
@@ -215,12 +290,15 @@ The second route exists because PRF support is a property of the browser and
 the authenticator, not a setting: a password-manager extension that never
 implemented the extension makes the first route permanently impossible, and
 what the old dead end ("add a passkey that can hold a key") actually produced
-was a plaintext account. **No migration was needed** —
-`entry_key_wrap.credential_id` is nullable and both unique indexes are
-partial. An encryption-key-only account stops being one as soon as a
-PRF-capable passkey is given a key from it, through `/account`'s existing
-give-a-key flow. §6.6's "don't delete the last passkey wrap" refusal is
-vacuous while there are zero of them and starts applying at the first.
+was a plaintext account. Now that a plaintext account cannot store anything,
+that dead end would be a lock-out rather than a downgrade — which is why the
+key-only route has to stay reachable, and why step 1 is optional.
+**No migration was needed** — `entry_key_wrap.credential_id` is nullable and
+both unique indexes are partial. An encryption-key-only account stops being
+one as soon as a PRF-capable passkey is given a key from it, through
+`/account`'s existing give-a-key flow. §6.6's "don't delete the last passkey
+wrap" refusal is vacuous while there are zero of them and starts applying at
+the first.
 
 **Consequences worth knowing before touching any of it:**
 
@@ -244,10 +322,17 @@ vacuous while there are zero of them and starts applying at the first.
   which is why `APP_SALT` is a constant and not per account.
 - **Not defended:** which days have entries, approximate body length, script
   running on the app's own origin, and a malicious server build (the server
-  ships the JS). Spec §2 states each as a decision.
+  ships the JS). Phase-2 spec §2 states each as a decision. Note that none of
+  these became *less* true by making encryption mandatory — the gate changes
+  who is encrypted, not what encryption defends.
 
-Full design: `docs/superpowers/specs/2026-09-05-client-side-encryption-design.md`,
-whose §11 lists the invariants (E1–E7) a change here has to keep.
+Full design: `docs/superpowers/specs/2026-09-05-client-side-encryption-design.md`
+for the key hierarchy, ceremonies and threat model — its §11 lists invariants
+E1–E8 — and
+`docs/superpowers/specs/2026-09-06-encryption-required-design.md` for the
+enforcement, the gate and the rename, whose §6 adds E9 and E10. Parts of the
+phase-2 spec are superseded by the phase-3 one and are marked so in place,
+not deleted.
 
 ## Layout
 
@@ -274,7 +359,9 @@ whose §11 lists the invariants (E1–E7) a change here has to keep.
   `projects`, `time_display`, `time_entry_area`, `header`, `account_menu`,
   `account_page`, `calendar`, `week_view`, `import_banner`, `unlock`,
   `encryption_panel`, `status` (the shared note/problem line `/account`'s
-  two halves both talk back through)
+  two halves both talk back through), `setup_gate` (what a signed-in
+  account with no encryption gets instead of its entries, and the sign-out
+  escape from it)
 - `src/clipboard.rs` — same signature on both targets, side effect gated
 
 ## Configuration
@@ -304,6 +391,11 @@ Configuration section for what each variable does. Summarized here:
   in `@layer components`. There is no `tailwind.config.js` and no npm step.
 - Storage key strings are a compatibility surface — changing one orphans
   existing users' saved data.
+- **So is `entry_key_wrap.kind`, and it was changed anyway.** `'recovery'`
+  became `'encryption_key'` by editing a shipped migration in place, which
+  is safe only against an empty database. See the Encryption section's
+  deployment box; do not take it as a precedent for editing another shipped
+  migration.
 - **The crypto constants are a compatibility surface too, and a quieter one.**
   In `src/crypto/wire.rs`:
 
@@ -336,3 +428,7 @@ Configuration section for what each variable does. Summarized here:
 - `docs/superpowers/specs/2026-09-04-accounts-and-dated-entries-design.md`
   (its §9.2 and §9.3 are superseded by the one below and marked so in place)
 - `docs/superpowers/specs/2026-09-05-client-side-encryption-design.md`
+  (its §8 migration, its opt-in framing, and the `entries_all` /
+  `entry_save_many` rows of §7.6 are superseded by the one below and marked
+  so in place — the predictions and why they changed are the useful part)
+- `docs/superpowers/specs/2026-09-06-encryption-required-design.md`

@@ -3,7 +3,14 @@
 **Status:** design, approved 2026-09-06
 **Builds on:** `2026-09-05-client-side-encryption-design.md`, which made
 encryption possible. This makes it the only way to store anything on the
-server.
+server. Parts of that document are superseded by this one and are marked so
+in place — §1.1 decision 2, §2's last bullet, §5.2's `kind` comment, §6.1's
+trigger and step 6, §7.6's last two rows, §8 entirely, §9's vocabulary, and
+four rows of §12.
+
+> **Before deploying: the database must be empty. See §1.4.** It is the one
+> assumption here whose failure is silent, unrecoverable, and not fixed by
+> re-running anything.
 
 ## 1. Goal
 
@@ -51,13 +58,58 @@ Taken with the project owner on 2026-09-06:
   and §3 explains why that is deliberate rather than a shortfall.
 - Migrating anything. There is nothing to migrate.
 
+### 1.4 The deployment requirement, and why it is the dangerous one
+
+**The production database must be deleted before this build is deployed.**
+
+Decision 1 above says the database is wiped, and treats that as a
+convenience: it is what makes removing the migration clean. It is also a
+**hard precondition**, and the two should not be confused, because one of the
+changes in this branch is only correct against an empty database and fails
+in a way nothing reports.
+
+§5.2's rename changes the stored `entry_key_wrap.kind` value from
+`'recovery'` to `'encryption_key'`, and it does so **by editing
+`migrations/2026-09-05-000001_entry_key/up.sql` in place** rather than adding
+a forward migration. Against an empty database that is exactly right — the
+migration has never run, so it runs once with the new value and nothing has
+to be rewritten. Against a database that has already run it, Diesel will not
+run it again, and three things then go wrong together:
+
+1. Existing rows keep saying `'recovery'`.
+2. `idx_entry_key_wrap_one_encryption_key`'s predicate, `WHERE kind =
+   'encryption_key'`, matches none of them — so the "one key wrap per
+   account" guarantee stops holding for exactly the accounts that have one.
+3. `WrapKind::parse("recovery")` returns `None`, and every caller treats an
+   unparseable kind as a row this build does not understand.
+
+The account's data key is wrapped under that row. Once it cannot be found,
+**the account's entries cannot be decrypted by anyone, including their
+owner** — the ciphertext is intact and the key that opens it is unreachable.
+
+**What makes this worth its own section is not the severity, it is the
+silence.** Every other assumption in this branch fails loudly and is fixed by
+re-running something: a stale client posting an entry gets a refusal it can
+show the user, an interrupted enable retries, a failed probe offers a retry.
+This one throws nothing at deploy time, nothing at startup, and nothing on
+the first request. The symptom is every encrypted account failing to unlock
+at once, which looks like corruption rather than like a migration that did
+not happen.
+
+**If a database ever does have to survive this change**, the answer is a
+real forward migration — `UPDATE entry_key_wrap SET kind = 'encryption_key'
+WHERE kind = 'recovery'`, with the partial index dropped and recreated —
+never a second in-place edit of a shipped migration. The in-place edit is
+justified here by the wipe and by nothing else, and it should not be read as
+a precedent.
+
 ## 2. What is removed
 
 | Removed | Why it can go |
 |---|---|
 | The migration pass, its `MigrationPlan`, and the per-row progress UI | Nothing starts plaintext any more |
 | The unmigrated-day counting and the resume control on `/account` | Same |
-| `entries_all` | Its only caller was the migration. Check before deleting — if the panel still needs it for something else, keep it and say what for |
+| `entries_all` | Its only caller was the migration. Check before deleting — if the panel still needs it for something else, keep it and say what for. **Checked: it did not. Deleted.** |
 | `entry_save_many` | Same: the bulk write existed to seal a backlog in one pass. `entry_save` becomes the only entry write, and so the only place §3's rule needs enforcing |
 | `WriteKey::Plaintext` reaching `Backend::Remote` | An account that could use it cannot write at all |
 
@@ -168,7 +220,8 @@ that string is not a backup; it is the entire key.
 
 ### 5.2 What changes, and what does not
 
-**Renamed:** every user-facing string; `crypto::recovery` →
+**Renamed:** every user-facing string; `crypto::recovery` (the file, to
+`src/crypto/encryption_key.rs`) →
 `crypto::encryption_key`; `unlock_with_recovery`, `recovery_wrap`,
 `WrapKind::Recovery`, `Opener::Recovery`, `reissue_recovery` and their
 neighbours; and the stored `kind` column value, which becomes
@@ -176,6 +229,12 @@ neighbours; and the stored `kind` column value, which becomes
 would normally be frozen — it changes only because the database is being
 wiped, and leaving it as `'recovery'` while everything else reads
 "encryption key" is the kind of half-rename that misleads a year later.
+
+**The column value is changed by editing the shipped migration in place, and
+that is the branch's one unrecoverable assumption — see §1.4.** It is correct
+against an empty database and silently destroys every encrypted account's
+access against a surviving one. §1.4 states the failure, why nothing reports
+it, and what a real forward migration would have to do instead.
 
 **Not renamed: the HKDF `info` strings.** `tt/entry-kek/recovery/v1` stays
 exactly as it is. They are opaque domain-separation constants that never
@@ -207,6 +266,21 @@ Carried forward from phase 2, with two added.
 - **E10. The server still never inspects a body.** §3. Enforcement reads
   `encrypted_at`, never an envelope. *Guarded by:* the absence of any
   body-parsing server code, and by E1's existing tests.
+
+**Both checked against the shipped implementation on 2026-09-06**, since a
+spec that outran its code is how an invariant quietly stops being one. E9:
+`entry_save` is the only `#[server]` function in `src/server_fns/entries.rs`
+that writes, it refuses on `store::is_encrypted` inside the same transaction
+as the write, and `tests/entry_access.rs` asserts both halves
+(`entry_save_is_refused_when_the_account_has_no_encryption` and
+`entry_save_is_accepted_once_encryption_is_enabled`). E10: the refusal reads
+an account column and the module's own header records that bodies are opaque
+in both directions; the only thing done to a body anywhere on the server is
+a length comparison. `entry_save_many` and `entries_all` are gone, so neither
+invariant has a second endpoint to hold at. An earlier draft of §3 and of E9
+named `entry_save_many` as also guarded — that was corrected before this
+spec was final, and is noted here so a reader of the branch history does not
+reintroduce it.
 
 ## 7. Failure modes
 

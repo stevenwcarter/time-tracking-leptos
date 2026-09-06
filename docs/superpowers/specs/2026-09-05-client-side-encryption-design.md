@@ -1,8 +1,42 @@
 # Client-side encryption (phase 2)
 
-**Status:** design, approved 2026-09-05
+**Status:** design, approved 2026-09-05; **partly superseded 2026-09-06**
 **Supersedes:** §9.2 and §9.3 of
 `2026-09-04-accounts-and-dated-entries-design.md` (see §1.3 below)
+**Partly superseded by:** `2026-09-06-encryption-required-design.md`
+
+> ## Superseded in part, and deliberately not deleted
+>
+> This document designed encryption as an **opt-in** feature that an account
+> could decline, sitting beside a **migration pass** that converted whatever
+> plaintext that account had already accumulated. The phase-3 branch removed
+> both: the server now refuses an entry write from any account without
+> `encrypted_at`, a signed-in account is gated on setup until it has one, and
+> nothing migrates because nothing can start plaintext.
+>
+> **What is superseded, marked in place below rather than removed:**
+>
+> | Here | Now | Superseded by |
+> |---|---|---|
+> | §1.1 decision 2 — "not mandatory", "accounts with no passkey stay plaintext" | Mandatory for server-side storage; a plaintext account cannot write at all | phase-3 §1.2, §3 |
+> | §2's last bullet — rows written before enabling | No such rows exist | phase-3 §2, §3 |
+> | §5.2's `kind` comment — `'passkey' \| 'recovery'` | `'passkey' \| 'encryption_key'` | phase-3 §5.2 |
+> | §6.1 step 6's "run the migration", and §6.1's trigger | Setup is a two-step flow the gate routes to; no migration runs | phase-3 §4 |
+> | §7.6's `entries_all` and `entry_save_many` rows | Both deleted | phase-3 §2 |
+> | §8 in its entirety | No migration exists | phase-3 §2 |
+> | "recovery code" as the name, throughout | "encryption key" | phase-3 §5 |
+> | §12's four migration-dependent rows | Three unreachable; the fourth's premise restated, its behaviour unchanged | phase-3 §7 |
+>
+> **What still stands, and is still the reference for it:** the threat model
+> (§2), the key hierarchy and primitives (§4), the envelope (§5.1), the
+> ceremonies other than enable's migration step (§6), the client components
+> (§7.1–§7.5), the formats (§9), the testing strategy and its manual smoke
+> list (§10, which the phase-3 work extended rather than replaced), and
+> invariants E1–E8 (§11). The phase-3 spec adds E9 and E10 and changes none
+> of these.
+>
+> The superseded text is kept because what was predicted, and why it changed,
+> is the useful part — the same convention §1.3 applies to the phase-1 spec.
 
 ## 1. Goal
 
@@ -34,6 +68,19 @@ Taken with the project owner on 2026-09-05:
 2. **Encryption is offered when the first PRF-capable passkey is enrolled**,
    not mandatory and not a separate setting. Accounts with no passkey stay
    plaintext and keep working. Accepting re-encrypts all existing rows.
+
+   > **Superseded 2026-09-06 by `2026-09-06-encryption-required-design.md`
+   > §1.2 and §3.** Every clause of this decision is now false. Encryption is
+   > mandatory for server-side storage; an account with no encryption cannot
+   > write an entry, so none "stays plaintext and keeps working"; and there
+   > are no existing rows to re-encrypt, because an account has no
+   > server-side entries until after it has a key. What remains true is the
+   > shape of the *offer* — see the amendment below, which the phase-3 spec
+   > kept and built the two-step setup flow on. The forcing case was the
+   > awkwardness this opt-in framing created: a migration pass that existed
+   > only to fix accounts that started plaintext, a `WriteKey::Plaintext`
+   > route correct only for accounts nobody had upgraded, and documentation
+   > that had to keep saying "encrypted *for accounts that turned it on*".
 
    **Amended for the same reason.** A PRF-capable passkey is what *offers*
    the two-wrap route; it is no longer what gates encryption existing at all.
@@ -98,6 +145,12 @@ served on the host. None of them yield entry text.
 - **Rows written before the user enabled encryption**, in the window before
   the migration pass completes. §8.
 
+  > **Superseded 2026-09-06 (phase-3 §2, §3).** There is no such window and
+  > no such row: the server refuses an entry write from an account with no
+  > `encrypted_at`, so an account's first server-side row is written after
+  > it has a key. This is the one item on the "not defended" list that the
+  > phase-3 branch removed rather than restated.
+
 ## 3. What changes
 
 Small blast radius, by design. Phase 1 put the seam in the right place.
@@ -108,7 +161,8 @@ Small blast radius, by design. Phase 1 put the seam in the right place.
 `src/server_fns/{passkey,entries}.rs`, `src/components/account_page.rs`,
 `src/app.rs` (provide `EncryptionCtx`), `Cargo.toml`.
 
-**New:** `src/crypto/mod.rs`, `src/crypto/wire.rs`, `src/crypto/recovery.rs`,
+**New:** `src/crypto/mod.rs`, `src/crypto/wire.rs`, `src/crypto/recovery.rs`
+(**renamed `src/crypto/encryption_key.rs` 2026-09-06**, phase-3 §5.2),
 `src/crypto/subtle.rs`, `src/crypto/keystore.rs`, `src/encryption_ctx.rs`,
 `src/entry_key/{mod,store}.rs`, `src/server_fns/encryption.rs`,
 `src/components/unlock.rs`, one migration. Three more were extracted during
@@ -226,9 +280,25 @@ CREATE UNIQUE INDEX idx_entry_key_wrap_cred
   ON entry_key_wrap(user_id, credential_id) WHERE credential_id IS NOT NULL;
 ```
 
+> **Amended 2026-09-06 (phase-3 §5.2).** The `kind` comment above is stale:
+> the stored value for the second route is now `'encryption_key'`, not
+> `'recovery'`, and the third index is
+> `idx_entry_key_wrap_one_encryption_key`. The change was made **by editing
+> this shipped migration in place**, which is correct only against a database
+> that has never run it — see the phase-3 spec's deployment requirement. A
+> surviving database keeps the old value, the partial index stops matching
+> it, and `WrapKind::parse` rejects it, which loses the account's key
+> silently.
+
 `user.encrypted_at` is the authoritative "encryption is on" flag. It is set
 when the wraps are first written, *before* the migration pass runs, so an
 interrupted migration leaves the account correctly marked as encrypted.
+
+> **Superseded in part 2026-09-06.** There is no migration pass, so the
+> sequencing argument above no longer has a case to make. `encrypted_at`
+> remains the authoritative flag, and is now load-bearing in a second way:
+> `entry_save` reads it to decide whether the account may write at all
+> (phase-3 invariant E9).
 
 `kdf` and `wrap_alg` are recorded per row for the same reason the envelope
 carries `alg`: so a future change is a new value rather than a guess.
@@ -250,6 +320,14 @@ only the 40-byte blob wrapped under a key derived from it.
 Triggered from `/account` immediately after a passkey is enrolled with
 `prf_capable = true`. The panel states plainly what is about to happen and
 that the recovery code is the only backup.
+
+> **Superseded 2026-09-06 (phase-3 §4.2) as to the trigger, not the
+> ceremony.** Enable is now step 2 of a two-step setup flow that a signed-in
+> account with no encryption is *routed* to, rather than something offered
+> opportunistically after an enrolment. Step 1 is a passkey, framed as
+> skipping the email link and explicitly optional; step 2 is this ceremony,
+> reachable whether or not step 1 happened. The steps and their ordering
+> below are unchanged and still the reference for them.
 
 **Amended during implementation: enabling has two routes.** The steps below
 describe the first and remain accurate for it. Which route an account gets is
@@ -322,6 +400,11 @@ place to describe the code as a passkey's backup.
 6. Re-import the DEK non-extractable, store it in the keystore (§7.3), and
    run the migration (§8). Both halves run after step 4 — see the third
    amendment below.
+
+   > **Superseded in part 2026-09-06:** the migration half is gone with §8.
+   > Step 6 is now the keystore half alone — re-import non-extractable and
+   > publish through `EncryptionCtx::unlock` — after which the day view
+   > opens on an account that has no server-side rows yet to convert.
 
 **Amended during implementation, three times.** The steps keep the numbers
 above — other documents and several doc comments cite them — but the order
@@ -514,7 +597,7 @@ Split so that as much as possible is host-testable:
 | File | Contents | Testable on host? |
 |---|---|---|
 | `wire.rs` | Envelope v2 serialization, base64, nonce length constants, `APP_SALT`, HKDF `info` strings | **Yes** — pure |
-| `recovery.rs` | Recovery-code generation from 20 random bytes, formatting, normalization, parsing | **Yes** — pure, RNG injected |
+| `recovery.rs` (now `encryption_key.rs`) | Encryption-key generation from 20 random bytes, formatting, normalization, parsing | **Yes** — pure, RNG injected |
 | `subtle.rs` | The `SubtleCrypto` calls: `generateKey`, `deriveKey`, `wrapKey`, `unwrapKey`, `encrypt`, `decrypt` | No — browser only |
 | `keystore.rs` | IndexedDB put/get/delete of the non-extractable `CryptoKey` | No — browser only |
 | `mod.rs` | `SessionKey` handle, orchestration | Partly |
@@ -665,13 +748,56 @@ Every one of these moves opaque blobs. None can derive a DEK.
 | `encryption_enable` | `(passkey: Option<PasskeyWrapDto>, recovery_wrap: Vec<u8>) -> Result<()>` | One transaction: sets `encrypted_at`, inserts one row per wrap sent. Errors if already enabled. `PasskeyWrapDto` is `{ credential_id, wrapped_key }` — one optional value rather than two optional arguments, so a wrap cannot arrive with nothing to file it under. `None` is §6.1's recovery-only route; the recovery wrap is never optional. |
 | `encryption_add_passkey_wrap` | `(credential_id: Vec<u8>, wrapped_key: Vec<u8>) -> Result<()>` | §6.5. Rejects a credential that is not the caller's, an account that is not encrypted, and a credential that already has a wrap — the last so a race between two tabs is a sentence rather than a unique-index violation surfacing as "Internal server error". |
 | `encryption_replace_recovery_wrap` | `(wrapped_key: Vec<u8>) -> Result<()>` | §6.4's re-issue. Replaces the single recovery row. Idempotent for a given wrap — resubmitting the stored one succeeds without touching it — so a client whose response was lost can safely retry (§12). |
-| `entries_all` | `() -> Result<Vec<(String, String)>>` | §8. Opaque strings. |
-| `entry_save_many` | `(entries: Vec<(String, String)>) -> Result<()>` | §8. One transaction per call. Same per-body length cap as `entry_save`, plus a cap on the batch itself — 200 rows and 1 MiB — since the per-body cap alone bounds nothing about a batch. |
+| `entries_all` | `() -> Result<Vec<(String, String)>>` | §8. Opaque strings. **Deleted 2026-09-06** — the migration was its only caller. |
+| `entry_save_many` | `(entries: Vec<(String, String)>) -> Result<()>` | §8. One transaction per call. Same per-body length cap as `entry_save`, plus a cap on the batch itself — 200 rows and 1 MiB — since the per-body cap alone bounds nothing about a batch. **Deleted 2026-09-06** — the bulk write existed to seal a backlog in one pass. |
 
 `passkey_delete` (existing) gains the §6.6 refusal and deletes the matching
 wrap in the same transaction.
 
+> **Superseded in part 2026-09-06 (phase-3 §2, §3).** The last two rows are
+> gone. `entry_save` is now the only endpoint that writes an entry, and so
+> the only place the phase-3 rule needs enforcing — it refuses unless the
+> caller's `encrypted_at` is set, reading it in the same transaction as the
+> write. `encryption_replace_recovery_wrap` was renamed
+> `encryption_replace_key_wrap` with the rest of the vocabulary (phase-3 §5),
+> and the `encryption_status` row's aside about `/account` deriving a
+> pending-migration count from `entries_all` no longer describes anything:
+> both the count and the call are gone. The remaining five functions are
+> unchanged in shape and still carry only opaque blobs.
+
 ## 8. Migrating existing rows
+
+> ## Superseded in its entirety, 2026-09-06
+>
+> **Replaced by `2026-09-06-encryption-required-design.md` §2 — which
+> replaces it with nothing.** There is no migration pass in the shipped
+> build: `entries_all`, `entry_save_many`, `MigrationPlan`, the per-row
+> progress UI, the unmigrated-day count and the resume control on `/account`
+> are all deleted. The section is kept in full because the reasoning below is
+> the record of what this design predicted and why it stopped being needed.
+>
+> **What made it removable** was not that the pass was wrong — it worked, and
+> its resumability argument was sound. It was that the *thing it converted*
+> stopped existing. Once the server refuses an entry write from an account
+> with no `encrypted_at` (phase-3 §3), an account cannot accumulate plaintext
+> rows in the first place, so there is never a backlog to seal. The owner
+> wiping the database before deploying is what closed the remaining case: no
+> rows written under the opt-in design survive to need converting.
+>
+> **What survived the removal**, and is still load-bearing:
+>
+> - **Per-row dispatch on the row's own `v`** (§5.1, invariant E3). Kept, and
+>   still the reason the v1 *read* path stays: `envelope::plan_read` is
+>   shared by both backends and `Backend::Local` still writes v1. Removing v1
+>   support outright would break signed-out storage, which is the mode the
+>   phase-3 gate's escape hatch falls back to.
+> - **The rule the pass obeyed**: version filtering happens in the browser,
+>   never in a server query (invariant E1). Phase-3 enforcement respects the
+>   same rule from the other direction — it checks an *account* column rather
+>   than looking at a body, which is the whole of phase-3 §3.
+> - **The import banner needing no change**, for the reason the last
+>   paragraph gives: imported local entries pass through `storage::store`,
+>   which encrypts them because the seam does.
 
 Two round trips, resumable, no schema change:
 
@@ -717,6 +843,17 @@ The import banner needs no change: imported local entries pass through
 `storage::store`, which encrypts them because the seam does.
 
 ## 9. Formats
+
+> **Renamed 2026-09-06 (phase-3 §5), not changed.** Everything this section
+> calls a "recovery code" is now an **encryption key**, in the user-facing
+> copy, in the module names (`crypto::recovery` → `crypto::encryption_key`),
+> and in the stored `entry_key_wrap.kind` value. The name was wrong because
+> the string was never single-use: nothing consumes, deletes, rotates or
+> invalidates the wrap, so it opens every entry on any device until it is
+> replaced. The **format below is byte-identical** — 160 bits, Crockford
+> base32, 32 characters, the same normalization table, no checksum — and so
+> is the HKDF `info` string `tt/entry-kek/recovery/v1`, which is deliberately
+> *not* renamed (invariant E6; phase-3 §5.2).
 
 ### 9.1 Recovery code
 
@@ -786,6 +923,9 @@ supposed to land, so it grew as those rulings were made:
 1. Enable on a real authenticator; confirm the recovery code screen (copy
    control, and the acknowledgement gate before the code can be dismissed).
 2. Watch the migration complete, then reload and confirm no re-prompt.
+   *(Amended 2026-09-06: there is no migration to watch — §8 is superseded.
+   What is left of this item is the second half: reload and confirm no
+   re-prompt, which is the keystore doing its job.)*
 3. Sign out and back in via magic link; unlock with the recovery code.
 4. **Take the re-issue offer** the recovery unlock makes, and confirm the
    new code is shown once. Then decline it on a second recovery unlock and
@@ -821,6 +961,32 @@ supposed to land, so it grew as those rulings were made:
     key **from the recovery code**, confirming the account stops being
     recovery-only.
 
+*Added 2026-09-06, for the phase-3 branch. This is where such items collect,
+so the setup flow and the gate land here rather than in a second list.*
+
+11. **The two-step setup flow, from a fresh account.** Sign in as an account
+    with no encryption and confirm the day view is not what you land on:
+    `/account` is, with step 1 of 2 marked **optional** and framed as
+    skipping the email link rather than as an encryption prerequisite. Then
+    walk it twice, because the two paths through it are different accounts:
+    once **taking** step 1 (enrol a passkey, then enable — confirm which of
+    §6.1's two routes you were given, and that it matches what the
+    authenticator actually reported), and once **skipping** step 1 entirely
+    (go straight to step 2 — confirm it is reachable, that it takes the
+    key-only route, and that the panel says *why* rather than showing a dead
+    control). Both must end with the day view opening and a write landing.
+12. **The gate, and its escape.** With encryption still not set up, try to
+    reach `/{date}` and `/week` directly by URL. Both must land on setup
+    rather than on an editable entry box — the failure this replaces is a box
+    that silently refuses to save. Then take **"sign out and use this device
+    only"** and confirm it does what it says: the browser returns to
+    `localStorage`, the day view works fully, and typing saves. Finally sign
+    back in and confirm the gate is still there — the escape is a way to
+    *use the app*, not a way past the gate. (The server half — `entry_save`
+    refusing an un-enabled account — is automated in
+    `tests/entry_access.rs`; what is manual here is the routing and the
+    escape.)
+
 Items 4 to 6 and 10 have no automated coverage of the ceremony at all — every
 one of them reaches WebCrypto or the authenticator, which has no host
 equivalent and no wasm runner here — and 8's and 9's automated halves stop at
@@ -828,10 +994,31 @@ the seam. What *is* automated around item 10 is the choice put in front of the
 user (the panel's SSR tests) and the server's half (`tests/encryption_access.rs`);
 the wrapping itself is on this list and nowhere else.
 
+Items 11 and 12 are here for a different reason from the rest: their
+*decisions* are host-tested — `account_page`'s and `setup_gate`'s SSR tests
+assert the step-1 framing, the gated and set-up markup, and the presence and
+absence of the escape, and `tests/entry_access.rs` asserts the refusal — but
+nothing here can drive a browser through a navigation, so the click-through
+that ties those pieces together is manual. What to watch for is the seam
+between them: markup asserted in isolation and a redirect nothing can run.
+
 ## 11. Invariants this feature depends on
 
 Written down so a later change touching one of these can find who relies on
 it — the phase-1 spec's §10 convention.
+
+> **E1–E8 all still hold, unchanged, after the phase-3 branch.** That branch
+> adds **E9** (the server refuses entry writes from an account with no
+> `encrypted_at`) and **E10** (the server still never inspects a body) in
+> `2026-09-06-encryption-required-design.md` §6, and makes **E7 easier to
+> satisfy rather than harder**: with no server-side plaintext route, the
+> `(Backend::Remote, WriteKey::Plaintext)` pairing is refused outright at
+> `storage::write_target` with `StorageError::EncryptionRequired`. The
+> `Plaintext` arm itself remains, because `Backend::Local` is plaintext by
+> design (§1.2). The only entry below whose *supporting detail* the phase-3
+> branch dated is E8's tab-stale-across-an-enable arm — an enable now happens
+> before that account has any server-side rows, so the specific sequence is
+> harder to reach; the invariant and its guards are untouched.
 
 - **E1. The server never parses an entry body.** Inherited from phase-1
   §9.1 and now load-bearing rather than aspirational: `entries_all` returns
@@ -996,18 +1183,25 @@ it — the phase-1 spec's §10 convention.
 
 ## 12. Failure modes
 
+> **Four rows below are superseded 2026-09-06 (phase-3 §7), and are marked
+> where they sit:** the two about a migration, the "enable interrupted"
+> row's second half, and the stale-tab-across-an-enable row's premise. All
+> four describe a mixed v1/v2 account, which this build cannot produce
+> server-side. The phase-3 spec's §7 is the current table for the paths it
+> covers; everything here it does not mention still stands.
+
 | Situation | Behaviour |
 |---|---|
-| Enable interrupted after wraps written | Account encrypted, 0 rows migrated. `/account` offers to finish. All rows still readable. |
+| Enable interrupted after wraps written | Account encrypted, 0 rows migrated. `/account` offers to finish. All rows still readable. **Superseded:** there are no rows to migrate and no resume control; an interrupted enable leaves an encrypted account with no entries yet, which is its ordinary starting state. |
 | `encryption_enable` committed, response lost | The recovery code is shown and confirmed *before* that call (§6.1), so the user is holding the code that went live with it. The panel reports that it could not confirm, and says how to check. Under the original order this was the worst failure in the feature: an account encrypted under a code nobody had ever seen, with a working passkey hiding it until the day that passkey was gone. It is the re-issue row below without the working old code that makes that one survivable. |
-| Migration interrupted | Mixed v1/v2. All rows readable. Resumes on demand. |
+| Migration interrupted | Mixed v1/v2. All rows readable. Resumes on demand. **Superseded:** no migration exists, so this state is unreachable. |
 | Wrong recovery code | AES-KW unwrap fails; "That recovery code didn't work." No lockout counter — the code is 160 bits. |
 | Passkey lost, code lost | Data is unreadable, permanently, by everyone. Stated in the enable dialog in those words. |
 | `encryption_status()` fails (dropped request, blip) | `Unreachable`, not `Disabled` — a failed request is not a conclusion about the account, and concluding "no encryption" would start writing v1 rows into an encrypted one. Writes are refused meanwhile. The state is terminal on its own (the probe's `Effect` reruns only on an `AuthCtx::user` change), so the prompt says the app could not determine the account's encryption state and offers `EncryptionCtx::retry()`. |
 | Re-issued recovery wrap committed, response lost | `encryption_replace_recovery_wrap` is idempotent for a given wrap, and the client retries once with the identical bytes. Without both, the server would hold a wrap derived from a code the user was never shown while the client told them their old code still works — discovered only after every passkey is gone, when the entries are already unreadable for good. |
 | Both re-issue attempts fail | The client cannot tell a request that never arrived from a reply that was lost, so it says so rather than asserting the safe outcome: `flow::REISSUE_UNCONFIRMED` tells the user not to rely on either code and to mint a new one from `/account` while a working passkey is still in hand. The same shape, and the same honesty, as `commit_enable`'s lost response above. |
-| A migration pass stops partway | Days sealed in chunks that landed stay sealed; the rest stay v1 and the next pass finds them (§8). A seal failure names the day it stopped on, since one unsealable body blocks that account's pass every time it runs and only a person editing that entry can clear it. |
-| Tab left open while encryption is enabled elsewhere | That tab still says `Disabled`. Its first read of a migrated day comes back `Locked`, which moves it to `Locked` and puts the unlock prompt up; writes are refused from that moment (E8). |
+| A migration pass stops partway | Days sealed in chunks that landed stay sealed; the rest stay v1 and the next pass finds them (§8). A seal failure names the day it stopped on, since one unsealable body blocks that account's pass every time it runs and only a person editing that entry can clear it. **Superseded:** there is no pass to stop. |
+| Tab left open while encryption is enabled elsewhere | *(Premise superseded: an enable no longer migrates anything, so the day this tab reads was written after the enable rather than converted by it. The behaviour is unchanged.)* That tab still says `Disabled`. Its first read of an encrypted day comes back `Locked`, which moves it to `Locked` and puts the unlock prompt up; writes are refused from that moment (E8). |
 | Tab left open while a second tab signs in as another account | The cookie changes under the first tab, which goes on showing the old address and holding the old key. Every read of the new account's rows fails as `Crypto`, and the first one re-probes: the probe's answer is about the *cookie's* account, does not match the address this tab is showing, and so publishes `Unreachable` — "Couldn't check this account", with a retry that will keep landing there until the tab is reloaded. Writes are refused meanwhile, and nothing of the other account's is overwritten. **Residual:** the re-probe is spent once per page load, so a tab that already spent it on a genuinely damaged row keeps writing. See E8. |
 | Keystore cleared (private window, site data cleared) | `Locked`. Unlock re-populates it. |
 | Authenticator without PRF | Cannot unlock by passkey; recovery code works. `/account` labels the row. |
