@@ -217,6 +217,76 @@ pub fn passkey_wrap_count(conn: &mut DbConn, user_id: i32) -> Result<i64> {
         .context("count passkey wraps")
 }
 
+/// Given the stored `kind` values for every `entry_key_wrap` row, decides
+/// whether startup should refuse to serve traffic, and what to tell whoever
+/// is paged.
+///
+/// Split out from [`ensure_wrap_kinds_parseable`] so this rule has a unit
+/// test that does not depend on a real database — mirrors
+/// `session::session_key_problem`.
+fn unparseable_kinds_problem(kinds: &[String]) -> Option<String> {
+    let bad = kinds
+        .iter()
+        .filter(|kind| WrapKind::parse(kind).is_none())
+        .count();
+    if bad == 0 {
+        return None;
+    }
+    let (row, have) = if bad == 1 {
+        ("row", "has")
+    } else {
+        ("rows", "have")
+    };
+    Some(format!(
+        "{bad} entry_key_wrap {row} {have} a kind this build does not recognize \
+         (expected \"passkey\" or \"encryption_key\"). That means they predate the \
+         rename from \"recovery\" to \"encryption_key\" (spec \
+         2026-09-06-encryption-required-design.md §1.4), which this build applied by \
+         editing a migration in place — safe only against a database wiped before \
+         deploy. This database was not wiped. Do not edit these rows by hand: each is \
+         the only route to its account's data key, and hand-editing risks destroying \
+         it. Restore the deployment this build expects — a freshly wiped database — \
+         instead."
+    ))
+}
+
+/// Every `entry_key_wrap` row's raw, unparsed `kind`.
+///
+/// Only for [`ensure_wrap_kinds_parseable`], which has to see the exact
+/// stored strings to tell a legacy row from a valid one. Every other reader
+/// works through [`WrapRow`], which requires a valid `kind` to exist at all.
+fn all_wrap_kinds(conn: &mut DbConn) -> Result<Vec<String>> {
+    entry_key_wrap::table
+        .select(entry_key_wrap::kind)
+        .load(conn)
+        .context("load entry_key_wrap kind values")
+}
+
+/// Fails fast, with an actionable message, when any `entry_key_wrap` row
+/// carries a `kind` this build cannot parse.
+///
+/// Mirrors `session::ensure_session_key_configured`: `main` calls this once
+/// at startup, after migrations run and before serving any traffic. A row
+/// like this is the telltale of the `'recovery'` → `'encryption_key'` rename
+/// in this branch, applied by editing a shipped migration in place (spec
+/// sections 1.4 and 5.2) — safe only against a database wiped before
+/// deploy. Against a surviving database, nothing catches this until the
+/// account's owner first tries to unlock: `WrapRecord::into_wrap_row` fails
+/// that one row, and `list_wraps` propagates the failure for the *whole*
+/// response rather than skipping just that row (unlike `choose_route`'s
+/// handling of a kind newer than this build, see [`crate::dto::WrapDto`]) —
+/// so every route to the account's data key disappears behind one "Internal
+/// server error", on whichever request happens to ask first, with no
+/// explanation reaching anyone of why. This turns that into one refusal to
+/// boot, naming the problem instead.
+pub fn ensure_wrap_kinds_parseable(conn: &mut DbConn) -> Result<(), String> {
+    let kinds = all_wrap_kinds(conn).map_err(|e| e.to_string())?;
+    match unparseable_kinds_problem(&kinds) {
+        Some(msg) => Err(msg),
+        None => Ok(()),
+    }
+}
+
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
     use super::*;
@@ -360,5 +430,79 @@ mod tests {
         insert_wrap(&mut conn, uid, WrapKind::EncryptionKey, None, &[1; 40]).expect("wrap");
         delete_user(&mut conn, uid).expect("delete user");
         assert!(list_wraps(&mut conn, uid).expect("list").is_empty());
+    }
+
+    /// Inserts a row with an arbitrary raw `kind`, bypassing [`WrapKind`] —
+    /// the shape a pre-rename database's row actually took, which
+    /// `insert_wrap` can no longer produce now that the enum has dropped
+    /// `Recovery`.
+    fn insert_raw_kind_wrap(conn: &mut DbConn, user_id: i32, kind: &str) {
+        diesel::insert_into(entry_key_wrap::table)
+            .values(NewWrap {
+                user_id,
+                kind,
+                credential_id: None,
+                wrapped_key: &[1; 40],
+                kdf: KDF_HKDF_SHA256,
+                wrap_alg: WRAP_ALG_AESKW256,
+                created_at: Utc::now().naive_utc(),
+            })
+            .execute(conn)
+            .expect("insert raw-kind wrap");
+    }
+
+    #[test]
+    fn unparseable_kinds_problem_is_none_for_no_rows() {
+        assert_eq!(unparseable_kinds_problem(&[]), None);
+    }
+
+    #[test]
+    fn unparseable_kinds_problem_is_none_when_every_row_parses() {
+        let kinds = vec!["passkey".to_string(), "encryption_key".to_string()];
+        assert_eq!(unparseable_kinds_problem(&kinds), None);
+    }
+
+    #[test]
+    fn unparseable_kinds_problem_flags_one_bad_row() {
+        let kinds = vec!["passkey".to_string(), "recovery".to_string()];
+        let msg = unparseable_kinds_problem(&kinds).expect("must refuse to boot");
+        assert!(msg.contains('1'), "message must name the count: {msg:?}");
+        assert!(msg.contains("row "), "singular row: {msg:?}");
+        assert!(msg.to_lowercase().contains("wiped"), "{msg:?}");
+        assert!(msg.to_lowercase().contains("hand"), "{msg:?}");
+    }
+
+    /// Several bad rows must be named as plural, not just counted.
+    #[test]
+    fn unparseable_kinds_problem_flags_several_bad_rows() {
+        let kinds = vec![
+            "recovery".to_string(),
+            "recovery".to_string(),
+            "bogus".to_string(),
+        ];
+        let msg = unparseable_kinds_problem(&kinds).expect("must refuse to boot");
+        assert!(msg.contains('3'), "message must name the count: {msg:?}");
+        assert!(msg.contains("rows "), "plural rows: {msg:?}");
+    }
+
+    /// The end-to-end shape of the startup gate: a database carrying a
+    /// pre-rename row must refuse to boot rather than silently proceed with
+    /// an account that has no working route to its data key.
+    #[test]
+    fn ensure_wrap_kinds_parseable_refuses_to_boot_on_a_legacy_kind() {
+        let (mut conn, uid) = seed();
+        insert_wrap(&mut conn, uid, WrapKind::Passkey, Some(b"cred-1"), &[7; 40]).expect("valid");
+        insert_raw_kind_wrap(&mut conn, uid, "recovery");
+        assert!(ensure_wrap_kinds_parseable(&mut conn).is_err());
+    }
+
+    /// The database this build expects — freshly migrated, nothing written
+    /// yet — must boot cleanly, and so must one where every row parses.
+    #[test]
+    fn ensure_wrap_kinds_parseable_is_ok_on_a_clean_database() {
+        let (mut conn, uid) = seed();
+        assert!(ensure_wrap_kinds_parseable(&mut conn).is_ok());
+        insert_wrap(&mut conn, uid, WrapKind::EncryptionKey, None, &[1; 40]).expect("wrap");
+        assert!(ensure_wrap_kinds_parseable(&mut conn).is_ok());
     }
 }

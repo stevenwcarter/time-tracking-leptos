@@ -35,7 +35,7 @@ use tower::ServiceExt;
 use crate::app::{App, shell};
 use crate::context::AppCtx;
 use crate::dto::{EncryptionStatus, PasskeyListItem, WrapDto};
-use crate::{auth, db, email, session};
+use crate::{auth, db, email, entry_key, session};
 
 /// Root-level static files that must be routed explicitly.
 ///
@@ -103,6 +103,21 @@ fn ensure_env_defaults() {
 pub async fn router() -> Router {
     let pool = db::build_pool().expect("build database pool");
     db::run_migrations(&pool).expect("run migrations");
+
+    // Fail fast, after migrations but before serving any traffic: a
+    // database that survived the `'recovery'` → `'encryption_key'` rename
+    // (spec section 1.4) leaves some `entry_key_wrap` rows with a `kind`
+    // this build cannot parse. Nothing catches that until the first request
+    // that reads them, and then only as an unexplained "Internal server
+    // error" — see `entry_key::store::ensure_wrap_kinds_parseable`.
+    {
+        let mut conn = pool.get().expect("checkout database connection");
+        if let Err(msg) = entry_key::store::ensure_wrap_kinds_parseable(&mut conn) {
+            tracing::error!("{msg}");
+            std::process::exit(1);
+        }
+    }
+
     let ctx = AppCtx::new(pool, email::Mailer::from_env());
 
     router_with_ctx(ctx)

@@ -103,6 +103,16 @@ never a second in-place edit of a shipped migration. The in-place edit is
 justified here by the wipe and by nothing else, and it should not be read as
 a precedent.
 
+**This is no longer only documented — it is enforced at boot.**
+`entry_key::store::ensure_wrap_kinds_parseable`, called from
+`test_support::router` (what `main` calls) right after migrations run and
+before any traffic is served, counts `entry_key_wrap` rows whose `kind`
+[`WrapKind::parse`] rejects and refuses to start if any exist, naming the
+count and the rename in its error. A wiped database still boots silently —
+the check costs one cheap `COUNT` and finds nothing. A database that
+survived the in-place edit above now fails loudly, at the earliest possible
+point, instead of the way described above.
+
 ## 2. What is removed
 
 | Removed | Why it can go |
@@ -234,7 +244,10 @@ wiped, and leaving it as `'recovery'` while everything else reads
 that is the branch's one unrecoverable assumption — see §1.4.** It is correct
 against an empty database and silently destroys every encrypted account's
 access against a surviving one. §1.4 states the failure, why nothing reports
-it, and what a real forward migration would have to do instead.
+it, and what a real forward migration would have to do instead. **That
+silence is no longer the whole story: §1.4 also covers the startup check
+that now refuses to boot against a surviving database, rather than leaving
+the assumption enforced only by this prose.**
 
 **Not renamed: the HKDF `info` strings.** `tt/entry-kek/recovery/v1` stays
 exactly as it is. They are opaque domain-separation constants that never
