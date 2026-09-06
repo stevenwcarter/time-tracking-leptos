@@ -135,12 +135,17 @@ pub enum Backend {
 /// [`crate::encryption_ctx::EncryptionState::write_key`] is the one place
 /// that decides which of these a session is in; [`write_target`] is the one
 /// place that decides what each means for the backend in hand.
-pub enum WriteKey<'a> {
+///
+/// Generic over the key, defaulted to [`SessionKey`], so [`write_target`]'s
+/// sealed arms have a host representative: `SessionKey` is uninhabited off
+/// the browser, so `Sealed` is otherwise unconstructible anywhere a test
+/// runs. Every caller writes `WriteKey<'_>` and gets the default.
+pub enum WriteKey<'a, K = SessionKey> {
     /// No encryption in play. Write v1 — which, since the server stopped
     /// accepting unencrypted entries, only [`Backend::Local`] can take.
     Plaintext,
     /// The account is encrypted and this session can seal. Write v2.
-    Sealed(&'a SessionKey),
+    Sealed(&'a K),
     /// The account is encrypted and this session cannot seal — locked, or
     /// not yet known to be either. Refuse.
     Locked,
@@ -342,7 +347,8 @@ pub async fn load(
 ///
 /// The backend and `session` together pick the envelope version and decide
 /// whether there is a write at all — see [`write_target`], which is where
-/// both refusals live. [`WriteKey::Sealed`] seals and writes v2 (see
+/// both refusals live, and `WriteTarget::sealing`, which is where the
+/// version itself is chosen. [`WriteKey::Sealed`] seals and writes v2 (see
 /// [`envelope::wrap`]); [`WriteKey::Plaintext`] writes v1, which only
 /// [`Backend::Local`] may take. Readers never consult that choice.
 ///
@@ -409,8 +415,11 @@ pub fn store(
 /// after [`write_target`] is unable to express the pair at all.
 ///
 /// Owned rather than borrowed because [`store`] hands its future to
-/// `spawn_local`, which needs `'static`.
-enum WriteTarget {
+/// `spawn_local`, which needs `'static`. Generic over the key, defaulted to
+/// [`SessionKey`], for the reason `decide_row` is generic over its own: the
+/// sealed arm has no host representative otherwise, and the decision it
+/// carries would then be asserted nowhere.
+enum WriteTarget<K = SessionKey> {
     /// `localStorage`, always v1. Plaintext by design: the store belongs to
     /// the device rather than to an account, and this is the mode the
     /// signed-out visitor — and anyone who takes the "use this device only"
@@ -418,13 +427,22 @@ enum WriteTarget {
     Local,
     /// The server, sealed under this session's key. There is deliberately
     /// no unsealed arm.
-    Remote(SessionKey),
+    Remote(K),
 }
 
-impl WriteTarget {
-    /// The key [`envelope::wrap`] should seal under, if any.
-    #[cfg(feature = "hydrate")]
-    fn sealing(&self) -> Option<&SessionKey> {
+impl<K> WriteTarget<K> {
+    /// The key [`envelope::wrap`] should seal under, if any — the whole of
+    /// what makes a remote write v2 rather than v1.
+    ///
+    /// Compiled and asserted on the host rather than left to the browser
+    /// build, because this is the one write decision whose failure has no
+    /// downstream witness. The server refuses an unencrypted *account*
+    /// (invariant E9) but can never refuse a plaintext *body*, since
+    /// invariant E1 forbids it from looking at one — so a `Remote` arm
+    /// returning `None` here would post plaintext into an encrypted account
+    /// with every other guard in the system still passing.
+    #[cfg(any(feature = "hydrate", test))]
+    fn sealing(&self) -> Option<&K> {
         match self {
             WriteTarget::Local => None,
             WriteTarget::Remote(session) => Some(session),
@@ -446,18 +464,18 @@ impl WriteTarget {
 /// branches, so they hold on every target and cost no backend call — a
 /// refused write is not a write that failed partway, it is one that never
 /// started.
-fn write_target(
+fn write_target<K: Clone>(
     backend: Backend,
     key: StorageKey,
-    session: WriteKey<'_>,
-) -> Result<WriteTarget, StorageError> {
+    session: WriteKey<'_, K>,
+) -> Result<WriteTarget<K>, StorageError> {
     let sealing = match session {
         WriteKey::Plaintext => None,
-        // `Option::cloned`, not a direct `session.clone()`: on a target
-        // where `SessionKey` is uninhabited this arm cannot be reached, and
-        // cloning the key itself would say so as an `unreachable_code`
-        // warning. Going through the `Option` keeps the expression's type
-        // inhabited and the arm silent.
+        // `Option::cloned`, not a direct `session.clone()`: with the default
+        // `SessionKey`, on a target where it is uninhabited this arm cannot
+        // be reached, and cloning the key itself would say so as an
+        // `unreachable_code` warning. Going through the `Option` keeps the
+        // expression's type inhabited and the arm silent.
         WriteKey::Sealed(session) => Some(session).cloned(),
         WriteKey::Locked => return Err(StorageError::Locked { key: key.as_key() }),
     };
@@ -717,14 +735,16 @@ mod tests {
         chrono::NaiveDate::from_ymd_opt(y, m, day).expect("valid date")
     }
 
-    /// Stands in for the session key. `decide_row` is generic over the key
-    /// and never looks inside one, so a byte does the job here.
+    /// Stands in for the session key. `decide_row` and `write_target` are
+    /// generic over the key and never look inside one, so a byte does the
+    /// job here.
     ///
     /// It is a readable placeholder, not a discriminator: only one key is
     /// ever in scope, and a function generic over `K` with a single `&K` to
     /// hand has nothing else it could return, so `*k == SESSION` cannot fail
     /// against a type-correct implementation. What the sealed-row assertions
-    /// below actually pin is the *ciphertext* travelling with the decision.
+    /// below actually pin is the *ciphertext* travelling with the decision;
+    /// what the write assertions pin is `Some` against `None`.
     const SESSION: u8 = 42;
 
     /// A v2 row. `tag` distinguishes one row's ciphertext from another's, so
@@ -912,6 +932,44 @@ mod tests {
         );
     }
 
+    /// The other half of that seam, and the half nothing used to assert: a
+    /// remote write does not merely *reach* the server, it reaches it
+    /// sealed. `store` picks the envelope from `sealing()`, so this pins
+    /// the choice that makes an account's rows v2.
+    ///
+    /// The `Some`/`None` distinction is the whole of what it discriminates,
+    /// and that is the distinction that matters: the server cannot catch a
+    /// plaintext body, because invariant E1 forbids it from looking at one,
+    /// so a `Remote` arm quietly answering `None` would be caught nowhere
+    /// else in the system.
+    ///
+    /// Reachable at all only because `WriteTarget` is generic over the key:
+    /// `SessionKey` is uninhabited here, so `(Remote, Sealed)` has no host
+    /// representative of its own.
+    #[test]
+    fn a_remote_write_is_sealed_under_the_key_it_was_given() {
+        let key = StorageKey::TimeEntry(d(2026, 9, 4));
+        let target = write_target(Backend::Remote, key, WriteKey::Sealed(&SESSION))
+            .expect("a session that can seal may write to the server");
+        assert!(matches!(target, WriteTarget::Remote(k) if k == SESSION));
+        assert_eq!(
+            target.sealing(),
+            Some(&SESSION),
+            "a body bound for the server must be sealed, not merely addressed there"
+        );
+    }
+
+    /// The same decision in the direction that would cost data the other
+    /// way: `localStorage` is read by signed-out sessions holding no key,
+    /// so a row sealed there is a row nothing can open again.
+    #[test]
+    fn a_local_write_stays_unsealed_even_with_a_key_in_hand() {
+        let key = StorageKey::TimeEntry(d(2026, 9, 4));
+        let target = write_target(Backend::Local, key, WriteKey::Sealed(&SESSION))
+            .expect("`localStorage` takes a write from any session that is not locked");
+        assert_eq!(target.sealing(), None);
+    }
+
     /// Same invariant as `ssr_backends_return_none`, for the range read the
     /// week view uses: no backend may return content during SSR.
     #[test]
@@ -966,9 +1024,12 @@ mod tests {
 
     /// Spec E3, in the direction that costs data if it is lost: holding a
     /// key must not make the reader assume every row was sealed under it.
-    /// Nothing writes a v1 row into an encrypted account any more — the
-    /// server refuses one outright (invariant E9) — but a row that predates
-    /// that rule still has to render rather than fail as a bad decrypt.
+    ///
+    /// Not a before-and-after that will age out, either. One reader serves
+    /// `localStorage`, which is v1 by design, and the account's rows, which
+    /// are v2; and whether a key is in hand follows the encryption state
+    /// rather than the backend, so a sign-in moving the device between the
+    /// two can pair either shape with either answer.
     #[test]
     fn a_plaintext_row_still_reads_as_plaintext_when_a_key_is_present() {
         let key = StorageKey::TimeEntry(d(2026, 9, 4));
