@@ -5,9 +5,10 @@
 //! [`crate::crypto::wire`]). Which of the two [`wrap`] produces is decided by
 //! whether the session holds a key; which of the two a *reader* gets is never
 //! asked here at all — [`plan_read`] dispatches on the row's own `v` (spec
-//! E3). The version tag is what lets both shapes coexist in one account with
-//! no migration and no guessing: a reader always knows what it is holding
-//! from the row alone.
+//! E3). The version tag is what lets both shapes coexist on one device with
+//! no guessing: `localStorage` is v1 by design and an account's rows are v2,
+//! and the same device moves between the two on every sign-in, so a reader
+//! always knows what it is holding from the row alone.
 //!
 //! This sits *above* [`super::codec`], which handles the gloo-compatible
 //! JSON-string encoding on the `localStorage` side. Two layers, two jobs:

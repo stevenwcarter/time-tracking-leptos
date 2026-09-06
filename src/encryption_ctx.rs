@@ -612,10 +612,11 @@ impl EncryptionCtx {
     /// elsewhere — a second tab, another device — goes on reporting
     /// [`EncryptionState::Disabled`] indefinitely. `Disabled` is
     /// [`crate::storage::WriteKey::Plaintext`] and mounts an editable entry
-    /// area, so every day sealed since reads back as
+    /// area, so every day sealed elsewhere since then reads back as
     /// [`crate::storage::StorageError::Locked`] and, if the seam collapsed
-    /// that to "nothing saved", would be shown as an empty box the next
-    /// keystroke overwrites for good.
+    /// that to "nothing saved", would be shown as an empty box over content
+    /// the user can neither see nor replace — the save that box invites is
+    /// refused too.
     ///
     /// Which states that contradicts, and what the probe parks at meanwhile,
     /// is [`contradicted_by`]'s decision; every other state is left alone,

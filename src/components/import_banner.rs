@@ -206,12 +206,15 @@ pub fn ImportBanner() -> impl IntoView {
                     // leaves the user their data.
                     //
                     // The write side lands in the signed-in account, so an
-                    // encrypted one gets v2 rows. A session that cannot seal
-                    // refuses every write instead, which reads out as
-                    // "Imported 0 of N days." and leaves this device
-                    // unsettled — so the offer comes back after an unlock
-                    // rather than the days being silently stored in the
-                    // clear.
+                    // encrypted one gets v2 rows. Two states refuse every
+                    // write instead: a session that cannot seal yet, and an
+                    // account with no encryption at all, which the server
+                    // would refuse anyway (invariant E9). Either reads out
+                    // as "Imported 0 of N days.", and since `mark_done` runs
+                    // only on a full success, either leaves this device
+                    // unsettled — so the offer comes back once the account
+                    // is set up or the session unlocked, rather than the
+                    // days being silently stored in the clear.
                     if store(
                         Backend::Remote,
                         StorageKey::TimeEntry(date),

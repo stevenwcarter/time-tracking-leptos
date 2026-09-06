@@ -58,6 +58,7 @@ Taken with the project owner on 2026-09-06:
 | The migration pass, its `MigrationPlan`, and the per-row progress UI | Nothing starts plaintext any more |
 | The unmigrated-day counting and the resume control on `/account` | Same |
 | `entries_all` | Its only caller was the migration. Check before deleting — if the panel still needs it for something else, keep it and say what for |
+| `entry_save_many` | Same: the bulk write existed to seal a backlog in one pass. `entry_save` becomes the only entry write, and so the only place §3's rule needs enforcing |
 | `WriteKey::Plaintext` reaching `Backend::Remote` | An account that could use it cannot write at all |
 
 **The v1 *read* path stays, and an earlier draft of this section was wrong to
@@ -83,9 +84,11 @@ SQL. A server that inspects an envelope to check its version is parsing the
 body, and once that is acceptable the next feature that wants to peek has a
 precedent.
 
-So enforcement is: **`entry_save` and `entry_save_many` refuse when the
-account's `encrypted_at` is null.** That is a property of the account row,
-checkable without looking at anything the user wrote.
+So enforcement is: **`entry_save` refuses when the account's `encrypted_at`
+is null.** That is a property of the account row, checkable without looking
+at anything the user wrote. It is the only endpoint that needs the rule
+because it is the only one that writes an entry: `entry_save_many` existed
+for the migration pass §2 removes, and goes with it.
 
 What this buys: a client that is correctly implemented cannot store
 plaintext. What it does not buy: protection against a *modified* client that
@@ -196,10 +199,11 @@ Carried forward from phase 2, with two added.
   satisfy, not harder: with no server-side plaintext route, `WriteKey` loses
   its `Plaintext` arm for `Remote` entirely.
 - **E9. The server refuses entry writes from an account with no
-  `encrypted_at`.** *Guarded by:* integration tests posting `entry_save` and
-  `entry_save_many` as an un-enabled account and asserting refusal. This is
-  the whole enforcement mechanism; if it regresses, plaintext storage becomes
-  possible again with nothing else to catch it.
+  `encrypted_at`.** *Guarded by:* integration tests posting `entry_save` —
+  now the only endpoint that writes an entry — as an un-enabled account and
+  asserting refusal. This is the whole enforcement mechanism; if it
+  regresses, plaintext storage becomes possible again with nothing else to
+  catch it.
 - **E10. The server still never inspects a body.** §3. Enforcement reads
   `encrypted_at`, never an envelope. *Guarded by:* the absence of any
   body-parsing server code, and by E1's existing tests.

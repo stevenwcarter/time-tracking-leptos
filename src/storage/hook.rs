@@ -458,12 +458,19 @@ mod tests {
     /// (the other is the test below).
     ///
     /// A sealed row means the day *has* content. Collapsing it to an empty
-    /// string renders "No projects found" over real ciphertext, and — on a
-    /// session that still believes the account is unencrypted, which is what
-    /// a tab left open across an enable elsewhere believes — hands the user
-    /// an editable box whose first keystroke replaces that ciphertext with a
-    /// plaintext row. Nothing about the row itself would flag it: v1 is
-    /// exactly the shape a device with no account legitimately writes.
+    /// string renders "No projects found" over real ciphertext — which a
+    /// session that still believes the account is unencrypted will do, and
+    /// that is exactly what a tab left open across an enable elsewhere
+    /// believes.
+    ///
+    /// The overwrite that used to follow — the first keystroke replacing
+    /// that ciphertext with a v1 row — is now refused, but at `write_target`
+    /// alone. The server cannot be the one to catch it here: the account
+    /// *is* encrypted in this scenario, so `entry_save`'s account check
+    /// (invariant E9) passes, and invariant E1 forbids it from noticing what
+    /// the body actually is. What remains is the lie rather than the loss:
+    /// the day reads as empty, and the retyping that invites is refused by a
+    /// save whose reason the user has been given no way to see.
     ///
     /// Asserted against the empty value specifically, not merely "not the
     /// text", because empty is the answer that does the damage.
