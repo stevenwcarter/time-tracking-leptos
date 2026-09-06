@@ -729,6 +729,7 @@ pub async fn bodies_in_range(
 mod tests {
     use super::*;
     use crate::crypto::wire;
+    use crate::encryption_ctx::{EncryptionState, Writes};
     use crate::test_util::block_on;
 
     fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
@@ -968,6 +969,56 @@ mod tests {
         let target = write_target(Backend::Local, key, WriteKey::Sealed(&SESSION))
             .expect("`localStorage` takes a write from any session that is not locked");
         assert_eq!(target.sealing(), None);
+    }
+
+    /// The property this whole feature turns on, driven from *both* sides
+    /// rather than asserted about one of them.
+    ///
+    /// [`crate::encryption_ctx::EncryptionState::writes`] is what the day and
+    /// week views render themselves from; [`write_target`] is what a save
+    /// actually meets. If those two ever disagreed, the entry area would
+    /// invite a keystroke the save then refused — the exact silence `Writes`
+    /// exists to end — and nothing downstream would notice, because a refused
+    /// write is not one that failed partway, it is one that never started.
+    ///
+    /// Until this test the agreement was held by two hand-written `match`es
+    /// in two modules and by prose: the sibling assertion in `encryption_ctx`
+    /// names the property but calls only `writes`, so `write_target` could be
+    /// given an arm accepting what the gate refuses and every test in the
+    /// crate would still pass. This is the cross-check, and it fails on drift
+    /// in either direction.
+    ///
+    /// `EncryptionState::Unlocked` is absent because it carries a
+    /// `SessionKey`, uninhabited off the browser — and it is the one arm the
+    /// two share by construction anyway, since `writes` reads `write_key` and
+    /// `write_target` consumes what `write_key` returns.
+    #[test]
+    fn the_gate_and_the_seam_agree_on_every_state_a_host_can_build() {
+        // Carried as names because `EncryptionState` is deliberately not
+        // `Debug`: on the browser it holds key material.
+        let states = [
+            ("Unknown", EncryptionState::Unknown),
+            ("Unreachable", EncryptionState::Unreachable),
+            ("Locked", EncryptionState::Locked),
+            ("Disabled", EncryptionState::Disabled),
+        ];
+        let key = StorageKey::TimeEntry(d(2026, 9, 4));
+
+        for backend in [Backend::Local, Backend::Remote] {
+            for (name, state) in &states {
+                // The one question both sides can be asked: does a save
+                // made right now land?
+                let seam = write_target(backend, key, state.write_key()).is_ok();
+                let gate = state.writes(backend) == Writes::Accepted;
+                assert_eq!(
+                    seam,
+                    gate,
+                    "{name} on {backend:?}: the view says a save {}, the seam {}",
+                    if gate { "lands" } else { "does not land" },
+                    if seam { "takes it" } else { "refuses it" },
+                );
+            }
+        }
     }
 
     /// Same invariant as `ssr_backends_return_none`, for the range read the
