@@ -11,6 +11,39 @@ use leptos::prelude::*;
 
 use crate::dto::{PasskeyWrapDto, WrapDto};
 
+/// Refuses a wrapped data key that is not the length AES-KW always produces.
+///
+/// The bytes stay opaque — this is a length comparison on *key material*, not
+/// a look inside an entry body, so invariants E1 and E10 are untouched
+/// (section 3's boundary is about bodies). What it buys is the one shape of
+/// self-inflicted damage this module can otherwise commit: a client bug that
+/// posts an empty or truncated wrap writes a row that nothing can ever open,
+/// and on `encryption_enable` that same call sets `encrypted_at` — which,
+/// since entries are stored only for encrypted accounts (invariant E9), is
+/// now the account's *permission to write*. The account would then be free to
+/// store rows behind a key it can never recover.
+///
+/// [`wire::WRAPPED_KEY_LEN`](crate::crypto::wire::WRAPPED_KEY_LEN) is exact
+/// rather than a minimum: `wrapping_a_256_bit_key_is_exactly_wrapped_key_len_bytes_and_round_trips`
+/// pins that AES-KW over a 256-bit data key produces precisely that many
+/// bytes, and this crate wraps nothing else.
+///
+/// The message opens with "We couldn't" so `webauthn_browser::friendly_error`
+/// passes it through rather than collapsing it to the generic passkey line.
+#[cfg(feature = "ssr")]
+fn check_wrap_len(wrapped: &[u8]) -> Result<(), ServerFnError> {
+    use crate::crypto::wire::WRAPPED_KEY_LEN;
+
+    if wrapped.len() == WRAPPED_KEY_LEN {
+        Ok(())
+    } else {
+        Err(super::server_err(
+            "We couldn't store that key: it is not the right size. Reload this page and \
+             try again.",
+        ))
+    }
+}
+
 /// Whether the signed-in account is encrypted, and which account that is.
 ///
 /// The address is part of the answer rather than assumed by the caller: the
@@ -95,6 +128,10 @@ pub async fn encryption_enable(
     use crate::entry_key::store;
 
     let (ctx, me) = super::require_user()?;
+    check_wrap_len(&encryption_key_wrap)?;
+    if let Some(passkey) = &passkey {
+        check_wrap_len(&passkey.wrapped_key)?;
+    }
     let mut conn = ctx
         .conn()
         .map_err(super::log_and_fail("conn", "Internal server error"))?;
@@ -165,6 +202,7 @@ pub async fn encryption_add_passkey_wrap(
     use crate::passkey::store as passkey_store;
 
     let (ctx, me) = super::require_user()?;
+    check_wrap_len(&wrapped_key)?;
     let mut conn = ctx
         .conn()
         .map_err(super::log_and_fail("conn", "Internal server error"))?;
@@ -226,6 +264,11 @@ pub async fn encryption_replace_key_wrap(wrapped_key: Vec<u8>) -> Result<(), Ser
     use crate::entry_key::store;
 
     let (ctx, me) = super::require_user()?;
+    // Checked here too, and this is the site where a short wrap costs the
+    // most: a replace deletes the account's only encryption-key route before
+    // inserting the new one, so an unopenable replacement is not a stranded
+    // row but a lost key.
+    check_wrap_len(&wrapped_key)?;
     let mut conn = ctx
         .conn()
         .map_err(super::log_and_fail("conn", "Internal server error"))?;

@@ -501,3 +501,66 @@ async fn every_encryption_endpoint_requires_a_session() {
         .await
         .expect("a signed-in caller must reach encryption_enable");
 }
+
+/// AES-KW over a 256-bit data key produces exactly `wire::WRAPPED_KEY_LEN`
+/// bytes, so anything else is a client bug — and the cheapest route this
+/// module has to an account that can store rows it will never read.
+/// `encryption_enable` is where it costs the most: the same call sets
+/// `encrypted_at`, which since this branch is the account's permission to
+/// write entries at all (invariant E9), so an unopenable wrap would buy the
+/// account a lifetime of writes behind a key nothing recovers, with every
+/// other guard in the system still passing.
+///
+/// Both sides of the boundary, and the account's state either way: a check
+/// that refused everything would satisfy the first half alone.
+#[tokio::test]
+async fn a_wrap_of_the_wrong_length_is_refused_and_leaves_the_account_unencrypted() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    // One byte either side of the boundary. Zero is not in this list: a
+    // `Vec<u8>` with no elements has no `key[i]=` pairs, so `serde_qs` sees
+    // the field as absent and the request is refused before the handler
+    // runs — pinned separately below, since it is a different layer saying
+    // no and this check must not be credited with it.
+    for wrap in [vec![2; 39], vec![2; 41]] {
+        let len = wrap.len();
+        let err = alice
+            .encryption_enable_key_only(&wrap)
+            .await
+            .expect_err("a wrap that cannot hold a wrapped key must be refused");
+        assert!(
+            err.contains("not the right size"),
+            "the refusal must name the wrap's length rather than read as a server \
+             fault ({len} bytes), got: {err}"
+        );
+    }
+
+    let err = alice
+        .encryption_enable_key_only(&[])
+        .await
+        .expect_err("an empty wrap must not reach the handler at all");
+    assert!(
+        err.contains("encryption_key_wrap"),
+        "argument decoding is what refuses an empty wrap, and it names the field \
+         it could not find: {err}"
+    );
+
+    assert!(
+        !alice.encryption_status().await.expect("status").enabled,
+        "a refused enable must not have marked the account encrypted"
+    );
+    assert!(
+        alice.encryption_wraps().await.expect("wraps").is_empty(),
+        "nor stored the wrap it refused"
+    );
+
+    alice
+        .encryption_enable_key_only(&[2; 40])
+        .await
+        .expect("a wrap of exactly WRAPPED_KEY_LEN bytes is what the browser sends");
+    assert!(
+        alice.encryption_status().await.expect("status").enabled,
+        "so the refusals above are about the length, not about the route"
+    );
+}
