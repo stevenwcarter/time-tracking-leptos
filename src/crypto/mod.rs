@@ -606,6 +606,11 @@ mod tests {
     /// user pressed "Sign out" and finished after it — a whole WebAuthn
     /// prompt and network round trip later — writing the key back onto a
     /// device that had just been told to forget it.
+    ///
+    /// What it does *not* guard, said plainly: that each ceremony captures
+    /// its `Forgets` at its own true first step rather than somewhere later
+    /// inside `crypto`. The capture point is a property of five call sites,
+    /// and this drives the type, not them. Reading them is the guard.
     #[test]
     fn a_forget_outranks_a_ceremony_that_started_before_it() {
         let started = Forgets::now();

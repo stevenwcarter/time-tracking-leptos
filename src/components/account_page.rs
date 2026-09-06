@@ -381,6 +381,9 @@ fn PasskeyRow(
 /// not-PRF-capable, and the encryption panel would conclude none of them can
 /// derive a key.
 ///
+// Known wart, left rather than moved: the paragraphs above were written for
+// `run_registration`, below, and this module sits between the two halves of
+// its doc comment.
 #[cfg(test)]
 mod tests {
     use super::*;

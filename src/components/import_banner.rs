@@ -246,6 +246,11 @@ pub fn ImportBanner() -> impl IntoView {
                             if pending.len() == 1 { "day" } else { "days" },
                         )}
                     </p>
+                    // Live even under `Writes::Refused`, unlike the entry
+                    // area below it. The click is not lost — every write is
+                    // refused, `import_outcome` reports "Imported 0 of N
+                    // days", and the offer comes back after an unlock —
+                    // so what it costs is a wasted gesture, not data.
                     <button
                         type="button"
                         class="text-sm bg-blue-600 text-white rounded px-3 py-1.5 font-medium hover:bg-blue-700"

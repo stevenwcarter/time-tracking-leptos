@@ -703,11 +703,34 @@ decision above it extracted and tested. This is the same technique phase 1
 used for `prf_enabled_from_json` and `local::resolve_load`.
 
 **Manual smoke test**, required before release, because none of the above
-covers the click-through: enable on a real authenticator, confirm the
-recovery code screen, watch the migration complete, reload and confirm no
-re-prompt, sign out and back in via magic link, unlock with the recovery
-code, add a second passkey, remove the first, and confirm the last-passkey
-refusal fires.
+covers the click-through.
+
+The list is where a flow accepted during implementation as "untestable" is
+supposed to land, so it grew as those rulings were made:
+
+1. Enable on a real authenticator; confirm the recovery code screen (copy
+   control, and the acknowledgement gate before the code can be dismissed).
+2. Watch the migration complete, then reload and confirm no re-prompt.
+3. Sign out and back in via magic link; unlock with the recovery code.
+4. **Take the re-issue offer** the recovery unlock makes, and confirm the
+   new code is shown once. Then decline it on a second recovery unlock and
+   confirm the old code still works.
+5. **Re-issue from `/account`** by both routes: with a passkey, and with the
+   current recovery code. The second is the only one that works on an
+   account recovered from a lost passkey, which is the account most likely
+   to want a new code.
+6. **Add a passkey to the encrypted account**, and count the prompts: it is
+   three, always (§6.5), and the panel says so before it starts. Then add
+   one again using the **recovery code** as the opener and confirm it is
+   two.
+7. Remove the first passkey and confirm the last-passkey refusal fires.
+8. **Stale tab.** Open a day view in a second tab *before* enabling
+   encryption, enable in the first, let the migration finish, then return to
+   the second tab and open a migrated day. It must show the unlock prompt —
+   not an empty, editable entry box (invariant E8).
+
+Items 4 to 6 have no automated coverage at all and 8's automated half stops
+at the seam, so this list is their only guard.
 
 ## 11. Invariants this feature depends on
 
