@@ -8,9 +8,22 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-RUN rustup toolchain install nightly --component rust-src \
- && rustup default nightly \
- && rustup target add wasm32-unknown-unknown
+# `rust-toolchain.toml` drives the install, and it happens in one layer.
+#
+# Installing a hand-written subset here instead lets the manifest reconcile the
+# difference later, during `cargo leptos build` — and reconciling syncs the
+# channel, which replaces `rust-std` for wasm32 by renaming a directory created
+# in an *earlier* image layer. overlayfs without `redirect_dir` refuses that
+# with `Invalid cross-device link (os error 18)`. It builds on `overlay2` and
+# fails on the `overlayfs` driver, which is a difference between machines
+# rather than between Dockerfiles.
+#
+# Copying the manifest on its own also keeps this layer cached against the
+# toolchain pin rather than against the source, so editing code does not
+# re-download a toolchain.
+WORKDIR /build
+COPY rust-toolchain.toml ./
+RUN rustup show
 
 # Pinned: an unpinned install silently changes the build on every cargo-leptos
 # release.
@@ -21,7 +34,6 @@ RUN curl -L \
  && chmod +x /usr/local/cargo/bin/cargo-leptos \
  && cargo leptos --version
 
-WORKDIR /build
 COPY . .
 
 # --precompress ships .gz/.br siblings next to the wasm/js/css bundle;
