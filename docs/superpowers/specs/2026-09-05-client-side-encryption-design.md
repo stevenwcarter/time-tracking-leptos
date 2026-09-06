@@ -724,13 +724,21 @@ supposed to land, so it grew as those rulings were made:
    one again using the **recovery code** as the opener and confirm it is
    two.
 7. Remove the first passkey and confirm the last-passkey refusal fires.
-8. **Stale tab.** Open a day view in a second tab *before* enabling
-   encryption, enable in the first, let the migration finish, then return to
-   the second tab and open a migrated day. It must show the unlock prompt —
-   not an empty, editable entry box (invariant E8).
+8. **Stale tab, across an enable.** Open a day view in a second tab *before*
+   enabling encryption, enable in the first, let the migration finish, then
+   return to the second tab and open a migrated day. It must show the unlock
+   prompt — not an empty, editable entry box (invariant E8).
+9. **Stale tab, across a sign-in as somebody else.** Sign in as A in two
+   tabs, unlock both, then sign out and in as B in the first tab only.
+   Return to the second tab, still showing A, and open a day B has entries
+   for. It must end at "Couldn't check this account" with the box gone — not
+   at an empty, editable box, which is B's day about to be sealed under A's
+   key. This is E8's second arm and the only automated coverage stops at the
+   seam. Then check the residual the same latch creates: the second tab gets
+   **one** re-probe per page load, so a reload is what recovers it.
 
-Items 4 to 6 have no automated coverage at all and 8's automated half stops
-at the seam, so this list is their only guard.
+Items 4 to 6 have no automated coverage at all and 8's and 9's automated
+halves stop at the seam, so this list is their only guard.
 
 ## 11. Invariants this feature depends on
 
@@ -866,6 +874,38 @@ it — the phase-1 spec's §10 convention.
   mismatch publishes `Unreachable` — which refuses writes — rather than a
   conclusion about an account this tab is not showing.
 
+  **The row a stale tab meets depends on which way it went stale, and only
+  one of the two is `Locked`.** A tab stale across an *enable* holds no key,
+  so the seam reports `StorageError::Locked` — the proof above. A tab stale
+  across a *sign-in* holds a key for the account that has left, so the same
+  row fails one layer later, in `open_row`, as `StorageError::Crypto`: a
+  "damaged row" error, indistinguishable at the seam from a genuinely
+  damaged one. That tab is `Unlocked` throughout, which is `Writes::Accepted`
+  and an editable box, so collapsing `Crypto` into an empty day is the same
+  destruction wearing a different error.
+
+  *Also guarded by:* `hook::loaded_value` refusing to collapse `Crypto`
+  either (`a_row_that_will_not_open_is_never_shown_as_nothing_saved`),
+  `open_rows` carrying the same fact out of a range read as
+  `RangeRead::unopenable`, and `EncryptionCtx::unopenable_row_seen`
+  re-probing from `Unlocked` — parked at `Unknown`, since unlike a sealed row
+  this one has proved nothing about the account
+  (`a_row_that_will_not_open_contradicts_only_a_session_holding_a_key`).
+
+  **That re-probe is latched to once per page load, and the latch is the
+  residual.** `Crypto` genuinely does mean "damaged row" most of the time,
+  and a probe answering for the same account republishes `Unlocked` — a new
+  `KeyIdentity`, which re-runs the load, which fails the same way. Once per
+  page load ends that by construction
+  (`the_re_probe_an_ambiguous_row_asks_for_is_spent_once`) and is enough,
+  because staleness is a property of the page load. What it does not cover is
+  a page load that spends its probe on a genuinely damaged row *first* and is
+  then handed another account by a second tab: nothing looks again. Writes
+  are still accepted in that window, so this is the one arm of E8 that can
+  still lose data. Closing it fully needs an event, not a read — a
+  `visibilitychange` or `storage` listener that re-probes when the tab is
+  returned to — which is a feature this phase deliberately did not build.
+
 ## 12. Failure modes
 
 | Situation | Behaviour |
@@ -879,6 +919,8 @@ it — the phase-1 spec's §10 convention.
 | Re-issued recovery wrap committed, response lost | `encryption_replace_recovery_wrap` is idempotent for a given wrap, and the client retries once with the identical bytes. Without both, the server would hold a wrap derived from a code the user was never shown while the client told them their old code still works — discovered only after every passkey is gone, when the entries are already unreadable for good. |
 | Both re-issue attempts fail | The client cannot tell a request that never arrived from a reply that was lost, so it says so rather than asserting the safe outcome: `flow::REISSUE_UNCONFIRMED` tells the user not to rely on either code and to mint a new one from `/account` while a working passkey is still in hand. The same shape, and the same honesty, as `commit_enable`'s lost response above. |
 | A migration pass stops partway | Days sealed in chunks that landed stay sealed; the rest stay v1 and the next pass finds them (§8). A seal failure names the day it stopped on, since one unsealable body blocks that account's pass every time it runs and only a person editing that entry can clear it. |
+| Tab left open while encryption is enabled elsewhere | That tab still says `Disabled`. Its first read of a migrated day comes back `Locked`, which moves it to `Locked` and puts the unlock prompt up; writes are refused from that moment (E8). |
+| Tab left open while a second tab signs in as another account | The cookie changes under the first tab, which goes on showing the old address and holding the old key. Every read of the new account's rows fails as `Crypto`, and the first one re-probes: the probe's answer is about the *cookie's* account, does not match the address this tab is showing, and so publishes `Unreachable` — "Couldn't check this account", with a retry that will keep landing there until the tab is reloaded. Writes are refused meanwhile, and nothing of the other account's is overwritten. **Residual:** the re-probe is spent once per page load, so a tab that already spent it on a genuinely damaged row keeps writing. See E8. |
 | Keystore cleared (private window, site data cleared) | `Locked`. Unlock re-populates it. |
 | Authenticator without PRF | Cannot unlock by passkey; recovery code works. `/account` labels the row. |
 | v2 row reaching a pre-phase-2 client | `UnsupportedVersion(2)` — a loud error, never rendered as text. Already tested. |
