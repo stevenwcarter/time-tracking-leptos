@@ -137,8 +137,16 @@ async fn save_many_writes_every_entry_in_one_call() {
     );
 }
 
-/// Partial application would leave the migration in a state neither the
-/// client nor the server can describe. All or nothing.
+/// One *call* applies wholly or not at all. Half a batch would leave the
+/// server holding rows the client has no way to enumerate — it sent a list
+/// and got back an error, with nothing saying where in the list it stopped.
+///
+/// Scoped to the call, deliberately, and not to the pass: since spec §8's
+/// amendment the migration is chunked, so earlier chunks that landed stay
+/// landed and a failed pass no longer claims otherwise. That costs the pass
+/// nothing (dispatch is per-row, invariant E3) and costs this property
+/// nothing either — it is the same guarantee `entry_save_many`'s own doc
+/// makes, at the same width.
 #[tokio::test]
 async fn save_many_is_atomic_when_one_entry_is_rejected() {
     let app = TestApp::new().await;
@@ -180,9 +188,19 @@ async fn save_many_enforces_the_per_body_length_cap() {
 
 /// The per-body cap does not bound a batch: 256 KiB times "as many rows as
 /// the client sent" is not a limit, and the whole batch is applied inside one
-/// SQLite write transaction. Nothing upstream bounds it either — the
-/// server-fn route takes `Request<Body>`, so axum's `DefaultBodyLimit` is not
-/// in the path.
+/// SQLite write transaction.
+///
+/// Something upstream *does* bound the bytes — a 10 MiB batch comes back as
+/// a deserialization length error before this handler runs — so the byte cap
+/// here is about refusing in this endpoint's own words, at a threshold it
+/// chose, rather than about being the only thing standing between a caller
+/// and the database. The **row count** is the half nothing else bounds: tens
+/// of thousands of one-byte rows fit inside any byte limit and still hold one
+/// write transaction open for as long as they take to apply.
+///
+/// The 1.25 MiB half below therefore doubles as a guard on that framework
+/// limit: if it ever fell below what the client chunks at, this test fails in
+/// CI rather than the migration failing in production.
 ///
 /// Refused before the transaction opens, so an oversized request never takes
 /// the write lock: the assertion that nothing landed is what would catch that

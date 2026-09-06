@@ -310,8 +310,10 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
                                 <h2 class="text-lg font-semibold text-gray-800 mb-1">"Get a new recovery code?"</h2>
                                 <p class="text-sm text-gray-600 mb-4">
                                     "You just typed the code you have, so treat it as less private than it was. \
-                                     A new one replaces it — the old code stops working once this finishes — or \
-                                     you can keep the one you have."
+                                     A new one replaces it — the old code stops working once the new one is \
+                                     stored — or you can keep the one you have. If we can't confirm the swap \
+                                     either way, neither code can be relied on, and the message above this \
+                                     will say what to do."
                                 </p>
                                 <button
                                     type="button"

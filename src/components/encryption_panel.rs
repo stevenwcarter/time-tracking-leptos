@@ -1579,7 +1579,8 @@ fn GiveKeyCard(
 const REISSUE_WORDS: OpenerWords = OpenerWords {
     intro: "A new code has to be wrapped around the key your entries are encrypted with, so \
             something that can already open them has to do it. Your current code keeps working \
-            until the new one is stored.",
+            until the new one is stored — and if we can't confirm that it was, we'll say so \
+            rather than let you rely on either.",
     passkey: "Use a passkey",
     passkey_hint: "One prompt, for a passkey that can already open your entries.",
     recovery_label: "Or use the code you have now",
@@ -2010,9 +2011,6 @@ mod tests {
         assert_eq!(plan.pending, vec![pending("2026-09-03", "real")]);
     }
 
-    /// Resumability at the boundary: an account with nothing left to do
-    /// reports nothing to do, so the panel stops offering a pass that would
-    /// re-write every row for no reason.
     /// The message a blocked account lives with. One body this build cannot
     /// seal stops the pass every time it runs — for good, since nothing
     /// retries differently — and the only remedy is a person opening that
@@ -2067,6 +2065,9 @@ mod tests {
         );
     }
 
+    /// Resumability at the boundary: an account with nothing left to do
+    /// reports nothing to do, so the panel stops offering a pass that would
+    /// re-write every row for no reason.
     #[test]
     fn an_account_with_no_plaintext_rows_needs_no_work() {
         assert_eq!(MigrationPlan::of(Vec::new()), MigrationPlan::default());

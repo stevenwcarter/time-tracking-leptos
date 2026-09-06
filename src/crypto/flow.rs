@@ -354,7 +354,11 @@ pub fn server_message(err: ServerFnError) -> String {
 /// So it says it cannot tell, and says what to do about it. Both the unlock
 /// prompt and the `/account` panel show this, and both are beside a control
 /// offering to keep the current code; the sentence has to survive being read
-/// next to that.
+/// next to that. Which means the copy it lands on has to admit the
+/// possibility rather than promise the old code still works — `unlock`'s
+/// `Mode::OfferReissue` body and `encryption_panel`'s `REISSUE_WORDS.intro`
+/// are worded to leave room for this, and changing either back to a flat
+/// promise puts them in contradiction again.
 #[cfg(feature = "hydrate")]
 pub const REISSUE_UNCONFIRMED: &str = "We couldn't confirm the new recovery code was stored, and can't tell whether it \
      replaced the old one — so don't rely on either. While you still have a passkey \
