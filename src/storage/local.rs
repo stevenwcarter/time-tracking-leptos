@@ -7,8 +7,7 @@
 
 use chrono::NaiveDate;
 
-use super::{LEGACY_KEY, StorageError, codec, envelope};
-use crate::date::parse_iso;
+use super::{LEGACY_KEY, StorageError, StorageKey, codec, envelope};
 
 /// Which key a day's value was found under.
 ///
@@ -91,11 +90,10 @@ pub fn should_clear_legacy(written: NaiveDate, today: NaiveDate) -> bool {
 /// — and anything that is not ours: a browser profile holds keys from every
 /// app on the origin.
 pub fn dates_from_keys(keys: &[String], from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
-    let prefix = format!("{LEGACY_KEY}:");
     let mut out: Vec<NaiveDate> = keys
         .iter()
-        .filter_map(|k| k.strip_prefix(&prefix))
-        .filter_map(parse_iso)
+        .filter_map(|k| StorageKey::parse(k))
+        .map(StorageKey::date)
         .filter(|d| *d >= from && *d <= to)
         .collect();
     out.sort_unstable();

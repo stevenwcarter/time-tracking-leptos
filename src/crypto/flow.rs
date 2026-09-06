@@ -294,31 +294,74 @@ pub async fn add_passkey_key(user: &str, target: &[u8], source: KeySource) -> Re
         .await
         .map_err(|err| existing.rewrap_failed(err))?;
 
+    // `server_message`, not `server_unreachable`: this endpoint refuses for
+    // reasons the user can act on — that credential already has a key, the
+    // account is not encrypted — and reporting either as "check your
+    // connection" sends them to fix a network that is working.
     encryption_add_passkey_wrap(target.to_vec(), wrapped)
         .await
-        .map_err(server_unreachable)
+        .map_err(server_message)
 }
 
 /// A network or server failure unrelated to WebAuthn itself.
 ///
-/// The server functions this covers already report their own errors as the
-/// generic "Internal server error" `log_and_fail` produces — the specific
-/// cause is logged server-side, not sent here — so there is nothing to
-/// forward and a connection hint is the more useful thing to say.
-#[cfg(feature = "hydrate")]
+/// `test` as well as `hydrate`: the migration pass's `pass_failed` reaches
+/// for this, and it is host-tested.
+#[cfg(any(feature = "hydrate", test))]
 pub const SERVER_UNREACHABLE: &str =
     "Couldn't reach the server. Check your connection and try again.";
 
+/// For a call whose failures are never worth repeating.
+///
+/// The server functions this covers answer every failure with the generic
+/// "Internal server error" `log_and_fail` produces — the specific cause is
+/// logged server-side, not sent here — so there is nothing to forward and a
+/// connection hint is the more useful thing to say.
+///
+/// A call that *can* refuse for a reason the user could act on wants
+/// [`server_message`] instead. `encryption_add_passkey_wrap` is the one that
+/// changed sides.
 #[cfg(feature = "hydrate")]
 pub fn server_unreachable(_: ServerFnError) -> String {
     SERVER_UNREACHABLE.to_string()
 }
 
+/// For a call that can refuse with a sentence worth showing.
+///
+/// A `ServerFnError::ServerError` is a refusal the server chose to explain,
+/// and `server_fns::server_err` guarantees it carries no internal detail, so
+/// it is repeated verbatim. Everything else is a call that never got an
+/// answer, where [`SERVER_UNREACHABLE`] is the more useful thing to say. See
+/// [`crate::webauthn_browser::server_refusal`] for what tells them apart.
+#[cfg(feature = "hydrate")]
+pub fn server_message(err: ServerFnError) -> String {
+    let raw = err.to_string();
+    crate::webauthn_browser::server_refusal(&raw)
+        .map(str::to_string)
+        .unwrap_or_else(|| SERVER_UNREACHABLE.to_string())
+}
+
+/// What a caller must say when a re-issue may or may not have committed.
+///
+/// The shape `commit_enable` already handles honestly, and the only other
+/// place in this feature where the client cannot tell a request that never
+/// arrived from a reply that was lost. Saying "couldn't reach the server"
+/// there asserts the safe outcome — and the unsafe one ends in a recovery
+/// code that opens nothing, discovered on the day every passkey is gone.
+///
+/// So it says it cannot tell, and says what to do about it. Both the unlock
+/// prompt and the `/account` panel show this, and both are beside a control
+/// offering to keep the current code; the sentence has to survive being read
+/// next to that.
+#[cfg(feature = "hydrate")]
+pub const REISSUE_UNCONFIRMED: &str =
+    "We couldn't confirm the new recovery code was stored, and can't tell whether it      replaced the old one — so don't rely on either. While you still have a passkey that      works, go to your account page and generate a new recovery code.";
+
 /// Stores a re-issued recovery wrap, retrying once with the identical bytes.
 ///
 /// The failure this exists for is a *lost response*, not a lost request. If
-/// the replace commits and the reply never arrives, the client reports
-/// "couldn't reach the server" and leaves the user believing their old code
+/// the replace commits and the reply never arrives, the client would report
+/// "couldn't reach the server" and leave the user believing their old code
 /// still works — while the server now holds a wrap derived from a code they
 /// were never shown. They find out when they have lost every passkey and
 /// reach for the recovery code, at which point the entries are unreadable
@@ -329,19 +372,21 @@ pub fn server_unreachable(_: ServerFnError) -> String {
 /// its own doc), which is what makes a retry safe: the second call either
 /// finds the work already done or finishes it, and either way the account
 /// ends up holding the code the user is about to be shown.
+///
+/// Two attempts that both fail leave the ambiguity unresolved, so the
+/// failure says so — [`REISSUE_UNCONFIRMED`], not the connection hint.
 #[cfg(feature = "hydrate")]
 async fn store_recovery_wrap(wrapped_key: Vec<u8>) -> Result<(), String> {
     use crate::server_fns::encryption::encryption_replace_recovery_wrap;
 
-    match encryption_replace_recovery_wrap(wrapped_key.clone()).await {
-        Ok(()) => Ok(()),
-        Err(first) => {
-            error!("storing the re-issued recovery wrap failed, retrying once: {first}");
-            encryption_replace_recovery_wrap(wrapped_key)
-                .await
-                .map_err(server_unreachable)
+    if let Err(first) = encryption_replace_recovery_wrap(wrapped_key.clone()).await {
+        error!("storing the re-issued recovery wrap failed, retrying once: {first}");
+        if let Err(second) = encryption_replace_recovery_wrap(wrapped_key).await {
+            error!("the retry failed too; the account's recovery wrap is unknown: {second}");
+            return Err(REISSUE_UNCONFIRMED.to_string());
         }
     }
+    Ok(())
 }
 
 /// Spec section 6.4's offer: wraps the data key under a fresh code and

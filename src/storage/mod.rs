@@ -64,7 +64,7 @@ use leptos::logging::error;
 use crate::crypto::SessionKey;
 #[cfg(any(feature = "hydrate", test))]
 use crate::crypto::wire::Sealed;
-use crate::date::to_iso;
+use crate::date::{parse_iso, to_iso};
 
 /// The key every pre-dated entry was stored under.
 ///
@@ -96,6 +96,20 @@ impl StorageKey {
         match self {
             StorageKey::TimeEntry(date) => date,
         }
+    }
+
+    /// The inverse of [`as_key`](Self::as_key), or `None` for a string that
+    /// does not name a stored day.
+    ///
+    /// Needed because [`StorageError`] carries the key as the string the
+    /// backend saw, so a report built from one can only name the day it
+    /// belongs to by parsing it back. The migration pass is the caller that
+    /// cares: a body it cannot seal blocks that account's pass for good, and
+    /// "this browser couldn't encrypt your entries" points the user at their
+    /// browser instead of at the entry they could go and edit.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let date = raw.strip_prefix(LEGACY_KEY)?.strip_prefix(':')?;
+        parse_iso(date).map(StorageKey::TimeEntry)
     }
 }
 
@@ -738,6 +752,36 @@ mod tests {
     #[test]
     fn legacy_key_matches_the_dioxus_key() {
         assert_eq!(LEGACY_KEY, "time_entry");
+    }
+
+    /// The round trip the migration's failure report depends on: a
+    /// `StorageError` carries the key as a string, and naming the day it
+    /// belongs to means reading it back.
+    #[test]
+    fn a_dated_key_parses_back_to_its_day() {
+        let key = StorageKey::TimeEntry(d(2026, 9, 4));
+        assert_eq!(StorageKey::parse(&key.as_key()), Some(key));
+    }
+
+    /// Anything that is not a dated key reads as no day at all, rather than
+    /// as some day the caller would then name in a message.
+    #[test]
+    fn a_string_that_is_not_a_dated_key_names_no_day() {
+        for raw in [
+            "",
+            LEGACY_KEY,
+            "time_entry:",
+            "time_entry:not-a-date",
+            "time_entry:2026-02-30",
+            "other:2026-09-04",
+            "2026-09-04",
+        ] {
+            assert_eq!(
+                StorageKey::parse(raw),
+                None,
+                "{raw:?} must not parse as a stored day"
+            );
+        }
     }
 
     /// The dated key format is equally a compatibility surface from the

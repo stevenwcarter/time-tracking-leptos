@@ -43,11 +43,17 @@ use leptos::either::{Either, EitherOf3, EitherOf6};
 #[cfg(any(feature = "hydrate", test))]
 use crate::crypto::choose_route;
 #[cfg(any(feature = "hydrate", test))]
-use crate::date::parse_iso;
+use crate::crypto::flow;
+#[cfg(any(feature = "hydrate", test))]
+use crate::date::{parse_iso, to_iso};
 #[cfg(any(feature = "hydrate", test))]
 use crate::dto::{PasskeyListItem, WrapDto};
 #[cfg(any(feature = "hydrate", test))]
 use crate::storage::envelope::{ReadPlan, plan_read};
+#[cfg(any(feature = "hydrate", test))]
+use crate::storage::{StorageError, StorageKey};
+#[cfg(any(feature = "hydrate", test))]
+use crate::webauthn_browser::server_refusal;
 
 #[cfg(feature = "hydrate")]
 use leptos::task::spawn_local;
@@ -537,6 +543,57 @@ impl Screen {
 /// "1 day" / "2 days", so counts read as English.
 fn days(n: usize) -> String {
     format!("{n} {}", if n == 1 { "day" } else { "days" })
+}
+
+/// What a failed migration pass leaves the user holding.
+///
+/// Out here rather than inside the `hydrate`-only `ceremony` module below
+/// precisely so it has a test: what it decides is the only thing a user gets
+/// to act on when a pass stops, and each of its three answers sends them
+/// somewhere different.
+///
+/// A seal failure names its day. One body this build cannot seal blocks the
+/// rest of the account's pass every time it is run, forever, and the only
+/// remedy is a person opening that day and editing what is in it — so a
+/// message that says "this browser couldn't encrypt your entries" points at
+/// the browser, which is not where the problem is. The date is recoverable
+/// because `store_many` keys the error by [`StorageKey::as_key`], and
+/// [`StorageKey::parse`] reads it back.
+///
+/// A refusal the server explained is repeated verbatim: `server_err`
+/// guarantees it carries no internal detail, and "that's too many entries in
+/// one request" is not a connection problem. Only a call that never got an
+/// answer earns the connection hint — see
+/// [`webauthn_browser::server_refusal`](crate::webauthn_browser::server_refusal).
+///
+/// Every message says what the pass left behind, because chunking means the
+/// answer is no longer "nothing": days sealed before the failure stay
+/// sealed.
+#[cfg(any(feature = "hydrate", test))]
+fn pass_failed(err: StorageError) -> String {
+    match err {
+        StorageError::Crypto { key, .. } => match StorageKey::parse(&key) {
+            Some(key) => format!(
+                "This browser couldn't encrypt the entry for {}, so the pass stopped there. \
+                 Days encrypted before it stayed encrypted. Open that day, check what's in \
+                 it, and try again.",
+                to_iso(key.date()),
+            ),
+            // Only reachable if the seam ever keys a `Crypto` error by
+            // something other than a storage key. Says less rather than
+            // guessing at a day.
+            None => "This browser couldn't encrypt one of your entries, so the pass stopped \
+                     there. Days encrypted before it stayed encrypted."
+                .to_string(),
+        },
+        StorageError::Server(message) => match server_refusal(&message) {
+            Some(refusal) => format!(
+                "{refusal}. Days encrypted before that stayed encrypted; try again to finish."
+            ),
+            None => flow::SERVER_UNREACHABLE.to_string(),
+        },
+        _ => flow::SERVER_UNREACHABLE.to_string(),
+    }
 }
 
 #[component]
@@ -1477,13 +1534,13 @@ fn RouteRow(
 /// Browser-only, like the rest of spec section 6.
 #[cfg(feature = "hydrate")]
 mod ceremony {
-    use super::{MigrationPlan, Overview, classify};
+    use super::{MigrationPlan, Overview, classify, pass_failed};
     use crate::crypto::flow::{self, PrfAssertion};
     use crate::crypto::{Enabled, Forgets, Opener, SessionKey, choose_route, enable};
     use crate::server_fns::encryption::{encryption_enable, encryption_wraps};
     use crate::server_fns::entries::entries_all;
     use crate::server_fns::passkey::passkey_list;
-    use crate::storage::{Progress, StorageError, WriteKey, store_many};
+    use crate::storage::{Progress, WriteKey, store_many};
 
     /// What one refresh of the panel's overview should go and ask for.
     ///
@@ -1651,22 +1708,6 @@ mod ceremony {
         /// to tell anyone, and a later run will find the same rows and say
         /// the same thing to nobody.
         pub unreadable: Vec<String>,
-    }
-
-    /// What a failed pass leaves the user holding.
-    ///
-    /// One transaction, so every failure has the same headline — nothing was
-    /// saved and nothing was changed — and only the cause differs. The day
-    /// is no longer named: a seal failure is a property of this browser
-    /// rather than of any one entry, and naming a day would suggest there is
-    /// something in it to go and fix.
-    fn pass_failed(err: StorageError) -> String {
-        match err {
-            StorageError::Crypto { .. } => "This browser couldn't encrypt your entries, so \
-                                            nothing was saved and nothing was changed."
-                .to_string(),
-            _ => flow::SERVER_UNREACHABLE.to_string(),
-        }
     }
 
     /// Re-encrypts every row still stored as v1 (spec section 8), calling
@@ -1862,6 +1903,60 @@ mod tests {
     /// Resumability at the boundary: an account with nothing left to do
     /// reports nothing to do, so the panel stops offering a pass that would
     /// re-write every row for no reason.
+    /// The message a blocked account lives with. One body this build cannot
+    /// seal stops the pass every time it runs — for good, since nothing
+    /// retries differently — and the only remedy is a person opening that
+    /// day. Naming it is the difference between an action and a shrug.
+    #[test]
+    fn a_seal_failure_names_the_day_it_stopped_on() {
+        let message = pass_failed(StorageError::Crypto {
+            key: StorageKey::TimeEntry(parse_iso("2026-09-04").expect("valid date")).as_key(),
+            detail: "OperationError".to_string(),
+        });
+        assert!(
+            message.contains("2026-09-04"),
+            "the day is the only thing the user can act on: {message}"
+        );
+        assert!(
+            !message.contains("nothing was changed"),
+            "a chunked pass may already have sealed earlier days: {message}"
+        );
+    }
+
+    /// A refusal the server explained is not a connection problem, and
+    /// telling the user to check their network hides the sentence the server
+    /// was trying to give them — "that's too many entries in one request" is
+    /// not something a reconnect fixes.
+    #[test]
+    fn a_refusal_the_server_explained_is_repeated() {
+        let refused: ServerFnError =
+            ServerFnError::ServerError("That's too many entries in one request".to_string());
+        let message = pass_failed(StorageError::Server(refused.to_string()));
+        assert!(
+            message.contains("too many entries"),
+            "the server's own words must survive: {message}"
+        );
+        assert!(
+            !message.contains("Check your connection"),
+            "an answered request is not a connection failure: {message}"
+        );
+    }
+
+    /// The complement, and the reason the two are told apart at all: a call
+    /// that never landed has no sentence to repeat, so the connection hint
+    /// is the useful thing left to say.
+    #[test]
+    fn a_call_that_never_landed_gets_the_connection_hint() {
+        let dropped = pass_failed(StorageError::Server(
+            "error reaching server to call server function: offline".to_string(),
+        ));
+        assert_eq!(dropped, crate::crypto::flow::SERVER_UNREACHABLE);
+        assert_eq!(
+            pass_failed(StorageError::Unavailable),
+            crate::crypto::flow::SERVER_UNREACHABLE
+        );
+    }
+
     #[test]
     fn an_account_with_no_plaintext_rows_needs_no_work() {
         assert_eq!(MigrationPlan::of(Vec::new()), MigrationPlan::default());
