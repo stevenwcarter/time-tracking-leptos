@@ -672,10 +672,15 @@ pub fn EncryptionPanel(
                 let done = match outcome {
                     Ok(done) => done,
                     Err(message) => {
-                        // The batch is one transaction, so a failure changed
-                        // nothing and the counts already on screen are still
-                        // right. Nothing to refresh.
+                        // A pass is a sequence of chunks, not one
+                        // transaction, so a failure may have left some days
+                        // sealed and others not — and the counts on screen
+                        // were computed before any of it. `reload` is what
+                        // re-surveys them, and it is safe here because the
+                        // pass is over: `migrating` is already back to false,
+                        // so the effect it wakes does look at the rows.
                         status.set(Some(Status::Problem(message)));
+                        reload.update(|n| *n += 1);
                         return;
                     }
                 };
@@ -1664,20 +1669,21 @@ mod ceremony {
         }
     }
 
-    /// Re-encrypts every row still stored as v1, in one transaction (spec
-    /// section 8), calling `progress` as it reaches each row.
+    /// Re-encrypts every row still stored as v1 (spec section 8), calling
+    /// `progress` as it reaches each row.
     ///
     /// Through the storage seam's [`store_many`], not around it: `WriteKey`
     /// is what stops a session that cannot seal writing plaintext into an
     /// encrypted account, and a pass with a write path of its own would be
     /// the one place that guard did not apply (invariant E7).
     ///
-    /// Resumable by construction: a run that never reaches the write changes
-    /// nothing, and a run that does leaves fewer v1 rows for the next one to
-    /// find. A v2 row is never re-sent — re-sealing one means decrypting it
-    /// first, work with nothing to gain and data to lose. Rows this build
-    /// cannot read at all are not sent either, for the same reason, and come
-    /// back named in the outcome.
+    /// Resumable by construction, and by per-row dispatch rather than by
+    /// atomicity: `store_many` sends the pass in chunks, so a run that stops
+    /// partway leaves the chunks that landed sealed and fewer v1 rows for
+    /// the next run to find. A v2 row is never re-sent — re-sealing one
+    /// means decrypting it first, work with nothing to gain and data to
+    /// lose. Rows this build cannot read at all are not sent either, for the
+    /// same reason, and come back named in the outcome.
     pub async fn migrate(
         key: &SessionKey,
         progress: impl Fn(Progress),

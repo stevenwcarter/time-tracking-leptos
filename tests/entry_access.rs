@@ -177,3 +177,50 @@ async fn save_many_enforces_the_per_body_length_cap() {
     assert!(result.is_err());
     assert!(alice.entries_all().await.expect("all").is_empty());
 }
+
+/// The per-body cap does not bound a batch: 256 KiB times "as many rows as
+/// the client sent" is not a limit, and the whole batch is applied inside one
+/// SQLite write transaction. Nothing upstream bounds it either — the
+/// server-fn route takes `Request<Body>`, so axum's `DefaultBodyLimit` is not
+/// in the path.
+///
+/// Refused before the transaction opens, so an oversized request never takes
+/// the write lock: the assertion that nothing landed is what would catch that
+/// ordering being lost.
+#[tokio::test]
+async fn save_many_caps_the_batch_as_well_as_each_body() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    // One past `entries::MAX_BATCH_ROWS` (200), mirrored as a literal for
+    // the reason the per-body test gives.
+    let dates: Vec<String> = (0..201).map(|n| format!("2026-01-01T{n}")).collect();
+    let too_many: Vec<(&str, &str)> = dates.iter().map(|d| (d.as_str(), "x")).collect();
+    let refused = alice
+        .save_entries_many(&too_many)
+        .await
+        .expect_err("a batch over the row cap must be refused");
+    assert!(
+        refused.contains("too many entries"),
+        "the refusal must name the row count, not the date it never parsed: {refused}"
+    );
+
+    // Under the row cap, over the byte cap: 5 bodies of 256 KiB is 1.25 MiB,
+    // past `MAX_BATCH_BYTES` (1 MiB), with every individual body legal.
+    let body = "x".repeat(256 * 1024);
+    let dates: Vec<String> = (1..=5).map(|n| format!("2026-03-{n:02}")).collect();
+    let too_large: Vec<(&str, &str)> = dates.iter().map(|d| (d.as_str(), body.as_str())).collect();
+    let refused = alice
+        .save_entries_many(&too_large)
+        .await
+        .expect_err("a batch over the byte cap must be refused");
+    assert!(
+        refused.contains("too large"),
+        "the refusal must name the batch's size: {refused}"
+    );
+
+    assert!(
+        alice.entries_all().await.expect("all").is_empty(),
+        "a refused batch must write nothing at all"
+    );
+}

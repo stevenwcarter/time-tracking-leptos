@@ -18,6 +18,31 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 #[cfg(feature = "ssr")]
 const MAX_RANGE_DAYS: i64 = 366;
 
+/// The most rows one bulk write may carry, and the most bytes across all of
+/// them.
+///
+/// The per-body cap alone does not bound a batch: 256 KiB times "however
+/// many rows the client sent" is not a limit, and every row is written
+/// inside one SQLite transaction on a single-process WAL database with a
+/// 5 s `busy_timeout`. The row count is the half nothing else bounds —
+/// tens of thousands of small rows fit inside any byte limit.
+///
+/// The byte cap is deliberately *below* the request-size limit the
+/// server-fn layer already imposes (a couple of MiB, at which a batch is
+/// rejected as `Deserialization: length limit exceeded`). That limit is
+/// somebody else's implementation detail and its message tells a user
+/// nothing, so this endpoint states its own bound and refuses in its own
+/// words before reaching it.
+///
+/// Both sit above what `storage::store_many` sends (100 rows, 512 KiB), so
+/// a migration that chunks the way this crate's own client does never meets
+/// either. What they refuse is a caller that does not.
+#[cfg(feature = "ssr")]
+const MAX_BATCH_ROWS: usize = 200;
+
+#[cfg(feature = "ssr")]
+const MAX_BATCH_BYTES: usize = 1024 * 1024;
+
 #[cfg(feature = "ssr")]
 fn parse_date(raw: &str) -> Result<chrono::NaiveDate, ServerFnError> {
     crate::date::parse_iso(raw).ok_or_else(|| super::server_err("Invalid date"))
@@ -171,10 +196,18 @@ impl From<diesel::result::Error> for SaveManyError {
 /// `entry_save`'s own length cap to each body; a bulk endpoint that skipped
 /// it would be a way around the limit.
 ///
+/// The batch as a whole is capped too, on both row count and total bytes,
+/// and *before* the transaction opens rather than inside it: refusing an
+/// oversized request should not first take the database's write lock. See
+/// [`MAX_BATCH_ROWS`].
+///
 /// Each entry is validated and written in the same pass through the loop,
 /// rather than validated up front and written in a second pass: only that
 /// ordering lets an entry rejected partway through undo the entries already
 /// written ahead of it in the same call, via the transaction's rollback.
+/// That rollback scopes one *call*; a migration pass is several of them, and
+/// spec section 8's per-row dispatch is what makes a pass that stops
+/// between calls resumable rather than half-broken.
 #[server(endpoint = "entries/save_many")]
 pub async fn entry_save_many(entries: Vec<(String, String)>) -> Result<(), ServerFnError> {
     use diesel::prelude::*;
@@ -183,6 +216,14 @@ pub async fn entry_save_many(entries: Vec<(String, String)>) -> Result<(), Serve
     use crate::entries::repo;
 
     let (ctx, me) = super::require_user()?;
+
+    if entries.len() > MAX_BATCH_ROWS {
+        return Err(super::server_err("That's too many entries in one request"));
+    }
+    if entries.iter().map(|(_, body)| body.len()).sum::<usize>() > MAX_BATCH_BYTES {
+        return Err(super::server_err("That batch of entries is too large to save"));
+    }
+
     let mut conn = ctx
         .conn()
         .map_err(super::log_and_fail("conn", "Internal server error"))?;

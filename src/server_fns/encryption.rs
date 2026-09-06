@@ -116,9 +116,21 @@ pub async fn encryption_enable(
 /// Adds a route to the account's data key for a newly enrolled passkey
 /// (spec section 6.5).
 ///
-/// Verifies `credential_id` is the caller's own before inserting anything —
-/// a wrap filed under someone else's credential id could never be opened by
-/// its supposed owner and would only leak that the id exists.
+/// Three refusals, each for a state the insert would otherwise reach:
+///
+/// - `credential_id` is not the caller's. A wrap filed under someone else's
+///   credential id could never be opened by its supposed owner and would
+///   only leak that the id exists. "Not found" and "belongs to someone else"
+///   get the same message, same as the passkey sign-in ceremony's
+///   account-existence guard.
+/// - The account is not encrypted. There is no data key for the wrap to be a
+///   route *to*, so the row would be a stranded blob that the next
+///   `encryption_enable` would then sit beside.
+/// - That credential already has a wrap. The client checks this too
+///   (`add_passkey_key`'s `choose_route` pre-check), so only a race between
+///   two tabs reaches it — but without the check that race surfaces as
+///   `idx_entry_key_wrap_cred` tripping, and a unique-index violation
+///   reaches the user as "Internal server error".
 #[server(endpoint = "encryption/add_passkey_wrap")]
 pub async fn encryption_add_passkey_wrap(
     credential_id: Vec<u8>,
@@ -139,12 +151,25 @@ pub async fn encryption_add_passkey_wrap(
             "Internal server error",
         ))?
         .map(|row| row.user_id);
-    // "Not found" and "belongs to someone else" get the same message, same
-    // as the passkey sign-in ceremony's account-existence guard — neither
-    // case should tell the caller which one it hit.
     if owner != Some(me.id) {
         return Err(super::server_err(
             "That passkey does not belong to your account.",
+        ));
+    }
+
+    if !key_store::is_encrypted(&mut conn, me.id)
+        .map_err(super::log_and_fail("is_encrypted", "Internal server error"))?
+    {
+        return Err(super::server_err(
+            "This account isn't encrypted, so there's no key to give that passkey.",
+        ));
+    }
+
+    if key_store::has_wrap_for_credential(&mut conn, me.id, &credential_id).map_err(
+        super::log_and_fail("has wrap for credential", "Internal server error"),
+    )? {
+        return Err(super::server_err(
+            "That passkey can already open your entries.",
         ));
     }
 

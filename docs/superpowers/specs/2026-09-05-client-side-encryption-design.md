@@ -575,13 +575,13 @@ Every one of these moves opaque blobs. None can derive a DEK.
 
 | Function | Signature | Notes |
 |---|---|---|
-| `encryption_status` | `() -> Result<EncryptionStatus>` | `{ enabled: bool }`. Cheap; called on every post-hydration probe. `/account` derives its pending-migration count from its own `entries_all` call rather than a server-computed hint. |
+| `encryption_status` | `() -> Result<EncryptionStatus>` | `{ account: String, enabled: bool }`. Cheap; called on every post-hydration probe. The address is returned so the probe can check that the session cookie still names the account the tab is showing (E8). `/account` derives its pending-migration count from its own `entries_all` call rather than a server-computed hint. |
 | `encryption_wraps` | `() -> Result<Vec<WrapRow>>` | The signed-in user's wraps: `kind`, `credential_id`, `wrapped_key`, `kdf`, `wrap_alg`. |
 | `encryption_enable` | `(passkey_wrap: Vec<u8>, credential_id: Vec<u8>, recovery_wrap: Vec<u8>) -> Result<()>` | One transaction: sets `encrypted_at`, inserts both rows. Errors if already enabled. |
-| `encryption_add_passkey_wrap` | `(credential_id: Vec<u8>, wrapped_key: Vec<u8>) -> Result<()>` | §6.5. Rejects a credential that is not the caller's. |
+| `encryption_add_passkey_wrap` | `(credential_id: Vec<u8>, wrapped_key: Vec<u8>) -> Result<()>` | §6.5. Rejects a credential that is not the caller's, an account that is not encrypted, and a credential that already has a wrap — the last so a race between two tabs is a sentence rather than a unique-index violation surfacing as "Internal server error". |
 | `encryption_replace_recovery_wrap` | `(wrapped_key: Vec<u8>) -> Result<()>` | §6.4's re-issue. Replaces the single recovery row. Idempotent for a given wrap — resubmitting the stored one succeeds without touching it — so a client whose response was lost can safely retry (§12). |
 | `entries_all` | `() -> Result<Vec<(String, String)>>` | §8. Opaque strings. |
-| `entry_save_many` | `(entries: Vec<(String, String)>) -> Result<()>` | §8. One transaction. Same per-body length cap as `entry_save`. |
+| `entry_save_many` | `(entries: Vec<(String, String)>) -> Result<()>` | §8. One transaction per call. Same per-body length cap as `entry_save`, plus a cap on the batch itself — 200 rows and 1 MiB — since the per-body cap alone bounds nothing about a batch. |
 
 `passkey_delete` (existing) gains the §6.6 refusal and deletes the matching
 wrap in the same transaction.
@@ -592,11 +592,22 @@ Two round trips, resumable, no schema change:
 
 1. `entries_all()` — every `(date, stored_string)` for the user, one call.
 2. Client filters for rows whose envelope is `v: 1`, decrypts nothing,
-   encrypts each body, and calls `entry_save_many(Vec<(date, body)>)` — one
-   call, one transaction.
+   encrypts each body, and calls `entry_save_many(Vec<(date, body)>)` in
+   chunks of at most 100 rows or 512 KiB.
 
-Resumability falls out of §5.1: dispatch is per-row, so re-running the pass
-simply finds fewer v1 rows. A v2 row is skipped outright rather than
+**Amended during implementation: the write is chunked, not one call.** The
+original "one call, one transaction" put an unbounded number of rows inside
+a single SQLite write transaction on a single-process WAL database, with
+nothing bounding the count — and `entry_save_many` now caps a batch at 200
+rows and 1 MiB, so an unchunked pass over a large account could not complete
+at all.
+
+Chunking costs the pass nothing, because resumability never rested on that
+transaction. Resumability falls out of §5.1: dispatch is per-row, so
+re-running the pass simply finds fewer v1 rows. What the chunking does cost
+is the *report*: a failed pass can no longer say "nothing was changed", and
+`/account` re-surveys the account rather than trusting the counts it drew
+before the pass started. A v2 row is skipped outright rather than
 re-sealed — re-sealing means decrypting first, which is work with nothing to
 gain and data to lose. If the migration is interrupted, `/account` shows
 "N days still unencrypted" and offers to finish.

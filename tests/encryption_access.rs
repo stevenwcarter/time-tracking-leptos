@@ -205,6 +205,78 @@ async fn add_passkey_wrap_refuses_a_credential_belonging_to_another_user() {
     assert!(mallory.encryption_wraps().await.expect("wraps").is_empty());
 }
 
+/// A wrap is a route *to* a data key, so filing one for an account that has
+/// none leaves a stranded blob sitting where the next `encryption_enable`
+/// will write beside it. The client never asks for this, which is why the
+/// refusal is worth having: nothing else would notice.
+#[tokio::test]
+async fn add_passkey_wrap_refuses_an_account_that_is_not_encrypted() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    let mut conn = app.pool.get().expect("checkout");
+    let uid = auth::user::find_or_create(&mut conn, "alice@example.com")
+        .expect("user")
+        .id;
+    let key = enrol_credential("alice@example.com");
+    let cred_id = key.cred_id().to_vec();
+    passkey::store::insert(&mut conn, uid, &key, true).expect("insert passkey");
+    drop(conn);
+
+    let err = alice
+        .encryption_add_passkey_wrap(&cred_id, &[9; 40])
+        .await
+        .expect_err("must refuse to wrap a key for an unencrypted account");
+    assert!(
+        err.contains("isn't encrypted"),
+        "the refusal must name the account's state, got: {err}"
+    );
+    assert!(alice.encryption_wraps().await.expect("wraps").is_empty());
+}
+
+/// The second wrap for one credential is ambiguous, not additive, and
+/// `idx_entry_key_wrap_cred` says so — but a unique-index violation reaches
+/// the caller as "Internal server error", which tells somebody whose passkey
+/// is already keyed to go and report a bug. Only a race between two tabs
+/// gets here (the client pre-checks), so the message is the whole value.
+#[tokio::test]
+async fn add_passkey_wrap_refuses_a_credential_that_already_has_one() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    let mut conn = app.pool.get().expect("checkout");
+    let uid = auth::user::find_or_create(&mut conn, "alice@example.com")
+        .expect("user")
+        .id;
+    let key = enrol_credential("alice@example.com");
+    let cred_id = key.cred_id().to_vec();
+    passkey::store::insert(&mut conn, uid, &key, true).expect("insert passkey");
+    drop(conn);
+
+    alice
+        .encryption_enable(&[1; 40], &cred_id, &[2; 40])
+        .await
+        .expect("enable");
+
+    let err = alice
+        .encryption_add_passkey_wrap(&cred_id, &[9; 40])
+        .await
+        .expect_err("must refuse a second wrap for the same credential");
+    assert!(
+        err.contains("can already open"),
+        "the refusal must say the passkey is already keyed, got: {err}"
+    );
+    assert!(
+        !err.contains("Internal server error"),
+        "a unique-index violation must not reach the user as an internal error: {err}"
+    );
+    assert_eq!(
+        alice.encryption_wraps().await.expect("wraps").len(),
+        2,
+        "the refused insert must have written nothing"
+    );
+}
+
 /// An unauthenticated caller must reach none of this.
 #[tokio::test]
 async fn every_encryption_endpoint_requires_a_session() {

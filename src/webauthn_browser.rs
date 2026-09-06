@@ -21,6 +21,26 @@
 /// this prefix.
 const SERVER_FN_ERROR_PREFIX: &str = "error running server function: ";
 
+/// The message a server function *chose* to refuse with, or `None` when the
+/// call did not get an answer it could explain.
+///
+/// [`SERVER_FN_ERROR_PREFIX`] is what tells the two apart: `ServerFnError`'s
+/// `Display` puts it in front of a `ServerError` — the only variant this
+/// crate's server fns construct, and one `server_fns::server_err` guarantees
+/// carries no internal detail — and something else in front of every
+/// transport failure. So a stripped prefix means "the server said no, and
+/// said why", which is worth repeating verbatim, while an unstripped one
+/// means the request never landed, where a connection hint is the more
+/// useful thing to say.
+///
+/// Shared by [`friendly_error`] and by the callers that have no WebAuthn
+/// step to phrase a failure for (`crypto::flow::server_message`, the
+/// migration pass's `pass_failed`), so the one piece of knowledge about
+/// `ServerFnError`'s wire shape lives in one place.
+pub fn server_refusal(raw: &str) -> Option<&str> {
+    raw.strip_prefix(SERVER_FN_ERROR_PREFIX)
+}
+
 /// Maps a raw WebAuthn or server error to something a person can act on.
 ///
 /// Deliberately narrow: server-fn messages are already user-facing and pass
@@ -41,10 +61,7 @@ const SERVER_FN_ERROR_PREFIX: &str = "error running server function: ";
 /// collapses to the generic text below instead of failing loudly. Known
 /// trade-off, not something to solve here.
 pub fn friendly_error(raw: String) -> String {
-    let raw = raw
-        .strip_prefix(SERVER_FN_ERROR_PREFIX)
-        .map(str::to_string)
-        .unwrap_or(raw);
+    let raw = server_refusal(&raw).map(str::to_string).unwrap_or(raw);
     let lower = raw.to_lowercase();
     if lower.contains("cancel") || lower.contains("notallowederror") {
         "Sign-in was cancelled.".to_string()
@@ -371,7 +388,7 @@ pub use browser::{WebauthnUserError, authenticate_with_prf, register};
 mod tests {
     use leptos::prelude::ServerFnError;
 
-    use super::{friendly_error, prf_enabled_from_json};
+    use super::{friendly_error, prf_enabled_from_json, server_refusal};
 
     /// What every real call site actually hands `friendly_error`: a
     /// `ServerFnError`'s own `Display`, wrapper prefix included — not the
@@ -388,6 +405,26 @@ mod tests {
     fn server_fn_message(msg: &str) -> String {
         let err: ServerFnError = ServerFnError::ServerError(msg.to_string());
         err.to_string()
+    }
+
+    /// The distinction three separate callers now rest on: a refusal the
+    /// server chose to explain against a request that never reached it.
+    /// Reporting the first as "check your connection" sends the user to fix
+    /// their network over a message the server was trying to give them, and
+    /// reporting the second verbatim shows them a transport error.
+    #[test]
+    fn a_refusal_is_told_apart_from_a_call_that_never_landed() {
+        assert_eq!(
+            server_refusal(&server_fn_message("That passkey can already open your entries.")),
+            Some("That passkey can already open your entries.")
+        );
+        // What `ServerFnError`'s other variants stringify to. No prefix, so
+        // no refusal to repeat.
+        assert_eq!(
+            server_refusal("error reaching server to call server function: offline"),
+            None
+        );
+        assert_eq!(server_refusal(""), None);
     }
 
     #[test]

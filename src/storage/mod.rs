@@ -54,6 +54,8 @@ pub mod local;
 pub mod remote;
 
 use std::future::Future;
+#[cfg(feature = "hydrate")]
+use std::mem;
 
 use chrono::NaiveDate;
 #[cfg(any(feature = "hydrate", test))]
@@ -401,8 +403,29 @@ pub fn store(
     }
 }
 
-/// Seals a whole account's worth of days and writes them in one call — the
-/// encryption migration pass of spec section 8.
+/// How much one bulk write carries: at most this many rows, and at most this
+/// many bytes of sealed body across them.
+///
+/// The pass is chunked rather than posted whole because the whole is
+/// unbounded — an account's entire history in one request holds one SQLite
+/// write transaction open for as long as it takes to apply, and the same
+/// reasoning that gives `entry_save` a per-body cap applies to the count.
+/// Per-row dispatch (spec E3) is what makes chunking cost nothing: each
+/// chunk is correct on its own, and a pass that stops between chunks leaves
+/// fewer v1 rows for the next one to find, which is exactly the
+/// resumability spec section 8 already relies on.
+///
+/// Both bounds sit under `entry_save_many`'s own caps — and a chunk can
+/// exceed [`BATCH_BYTES`] only by the one oversized row it flushes for, so
+/// the widest chunk this can send is still well under them.
+#[cfg(feature = "hydrate")]
+const BATCH_ROWS: usize = 100;
+
+#[cfg(feature = "hydrate")]
+const BATCH_BYTES: usize = 512 * 1024;
+
+/// Seals a whole account's worth of days and writes them — the encryption
+/// migration pass of spec section 8.
 ///
 /// Here rather than in the panel that runs it, because of what [`WriteKey`]
 /// guards. A pass that sealed its own bodies and posted them itself would be
@@ -411,6 +434,11 @@ pub fn store(
 /// nothing downstream to notice (invariant E7). Going through
 /// [`sealing_key`] means that decision is made once, for the batch, before
 /// any row is touched.
+///
+/// Sent in chunks rather than as one request; see [`BATCH_ROWS`] for why,
+/// and for why that costs the pass nothing. What it *does* cost is the claim
+/// that a failed pass changed nothing: rows in chunks that already landed
+/// stay sealed, and a caller reporting the failure has to say so.
 ///
 /// No `Backend`, deliberately. A signed-out device stores in `localStorage`,
 /// which is never encrypted (spec section 1.2), so there is no migration for
@@ -433,7 +461,8 @@ pub async fn store_many(
 
     #[cfg(feature = "hydrate")]
     {
-        let mut sealed = Vec::with_capacity(total);
+        let mut batch: Vec<(NaiveDate, String)> = Vec::new();
+        let mut bytes = 0;
         for (index, (date, body)) in rows.into_iter().enumerate() {
             progress(Progress {
                 day: index + 1,
@@ -446,9 +475,18 @@ pub async fn store_many(
                     key: key.as_key(),
                     detail: err.to_string(),
                 })?;
-            sealed.push((date, wrapped));
+            // Flushed before this row joins, not after, so a single body
+            // larger than the byte bound still travels — alone, in its own
+            // chunk — rather than being refused by a rule about batches.
+            if !batch.is_empty() && (batch.len() >= BATCH_ROWS || bytes + wrapped.len() > BATCH_BYTES)
+            {
+                remote::store_many(mem::take(&mut batch)).await?;
+                bytes = 0;
+            }
+            bytes += wrapped.len();
+            batch.push((date, wrapped));
         }
-        remote::store_many(sealed).await
+        remote::store_many(batch).await
     }
     #[cfg(not(feature = "hydrate"))]
     {

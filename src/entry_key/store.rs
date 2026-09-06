@@ -127,6 +127,26 @@ pub fn list_wraps(conn: &mut DbConn, user_id: i32) -> Result<Vec<WrapRow>> {
     rows.into_iter().map(WrapRecord::into_wrap_row).collect()
 }
 
+/// Whether this credential already has a route to the account's data key.
+///
+/// Asked before an insert, so a second attempt is refused with a sentence
+/// rather than by `idx_entry_key_wrap_cred` — a unique-index violation
+/// reaches the caller as "Internal server error", which tells somebody
+/// whose passkey is already keyed to go and report a bug.
+pub fn has_wrap_for_credential(
+    conn: &mut DbConn,
+    user_id: i32,
+    credential_id: &[u8],
+) -> Result<bool> {
+    let count: i64 = entry_key_wrap::table
+        .filter(entry_key_wrap::user_id.eq(user_id))
+        .filter(entry_key_wrap::credential_id.eq(credential_id))
+        .count()
+        .get_result(conn)
+        .context("count wraps for credential")?;
+    Ok(count > 0)
+}
+
 /// Removes the wrap for one credential, if any. Used when a passkey is
 /// deleted, so it stops being an unlock route.
 pub fn delete_wrap_for_credential(
