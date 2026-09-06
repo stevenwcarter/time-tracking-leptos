@@ -325,11 +325,15 @@ enum EnableRoute {
 }
 
 impl EnableRoute {
+    /// Read off [`KeyOnlyReason::of`] rather than asking
+    /// `has_capable_passkey` a second time, so the route and the sentence
+    /// explaining it cannot come apart: an account on the key-only route
+    /// always has a reason to show for it, and one on the ordinary route
+    /// never shows a reason it has not earned.
     fn of(overview: &Overview) -> Self {
-        if overview.has_capable_passkey() {
-            EnableRoute::PasskeyAndEncryptionKey
-        } else {
-            EnableRoute::EncryptionKeyOnly
+        match KeyOnlyReason::of(overview) {
+            Some(_) => EnableRoute::EncryptionKeyOnly,
+            None => EnableRoute::PasskeyAndEncryptionKey,
         }
     }
 
@@ -341,17 +345,101 @@ impl EnableRoute {
     }
 }
 
+/// Why the passkey route was not offered, for an account being sent down the
+/// encryption-key-only one (spec section 4.2).
+///
+/// Two answers rather than one sentence with a hole in it, because they
+/// describe different situations and the words that fit one misdescribe the
+/// other. An account with no passkey has nothing wrong with it: step one is
+/// for signing in, it is declinable, and encryption never needed it. An
+/// account whose passkeys all reported no PRF support has hardware that will
+/// never take the two-wrap route. Telling the first user their
+/// authenticators are incapable names a fault they have not got; telling the
+/// second they have not added a passkey contradicts the list they are
+/// looking at.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum KeyOnlyReason {
+    /// No passkey is enrolled at all — step one was declined, or has not
+    /// been reached yet.
+    NoPasskey,
+    /// Passkeys are enrolled and not one of them can hold an unlock key,
+    /// carried by the names this page shows them under.
+    ///
+    /// Those names are the only self-identification an authenticator gets
+    /// here: one the user typed, or — where nothing identified itself — the
+    /// date-derived default `passkey_list` fills in. Either way the sentence
+    /// points at a row in step one rather than at an abstraction. Never
+    /// empty; [`KeyOnlyReason::of`] answers `NoPasskey` for that.
+    NoCapablePasskey(Vec<String>),
+}
+
+impl KeyOnlyReason {
+    /// `None` on the two-wrap route, where no explanation is owed.
+    fn of(overview: &Overview) -> Option<Self> {
+        if overview.has_capable_passkey() {
+            return None;
+        }
+        Some(if overview.routes.is_empty() {
+            KeyOnlyReason::NoPasskey
+        } else {
+            KeyOnlyReason::NoCapablePasskey(
+                overview
+                    .routes
+                    .iter()
+                    .map(|route| route.name.clone())
+                    .collect(),
+            )
+        })
+    }
+
+    fn sentence(&self) -> String {
+        match self {
+            KeyOnlyReason::NoPasskey => "No passkey is enrolled on this account, so there is \
+                 nothing here that could hold a second copy of your key. That's a choice rather \
+                 than a problem — a passkey is for signing in, and encryption doesn't need one. \
+                 The encryption key you save below will open your entries."
+                .to_string(),
+            KeyOnlyReason::NoCapablePasskey(names) => {
+                let listed = quoted_list(names);
+                let (verb, whose) = if names.len() == 1 {
+                    ("signs", "its authenticator")
+                } else {
+                    ("sign", "their authenticators")
+                };
+                format!(
+                    "{listed} {verb} you in, but {whose} cannot hold an unlock key: the \
+                     WebAuthn extension one would be derived from isn't implemented there, \
+                     and no setting turns that on. Nothing has gone wrong — the passkey route \
+                     simply doesn't exist for this account, so the encryption key you save \
+                     below is what will open your entries."
+                )
+            }
+        }
+    }
+}
+
+/// Names, quoted and joined the way a sentence needs them: `“A”`, `“A” and
+/// “B”`, `“A”, “B” and “C”`.
+fn quoted_list(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("“{name}”")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// The words one [`EnableRoute`] wears.
 ///
-/// Every sentence that differs between the routes lives here, for the reason
-/// [`OpenerWords`] gives one screen further on: a card built from the other
-/// route's words would still render, and the sentence it got wrong is the
-/// one telling the user how much room for error they have.
+/// Every *static* sentence that differs between the routes lives here, for
+/// the reason [`OpenerWords`] gives one screen further on: a card built from
+/// the other route's words would still render, and the sentence it got wrong
+/// is the one telling the user how much room for error they have. The one
+/// sentence that is not static — why the key-only route is the one on offer
+/// — hangs off [`KeyOnlyReason`] instead, because it names the account's own
+/// passkeys.
 #[derive(Clone, Copy)]
 struct EnableWords {
-    /// Why this route and not the ordinary one. `None` where no explanation
-    /// is owed.
-    why: Option<&'static str>,
     /// The red block's first line.
     warning_heading: &'static str,
     /// The red block itself: what is lost, and what nobody can do about it.
@@ -369,7 +457,6 @@ struct EnableWords {
 }
 
 const PASSKEY_AND_ENCRYPTION_KEY_WORDS: EnableWords = EnableWords {
-    why: None,
     warning_heading: "There is no reset.",
     warning: "If you lose every passkey and your encryption key, your entries are gone forever \
               — for you and for whoever runs this server. Nobody can unlock them, because \
@@ -392,19 +479,20 @@ const PASSKEY_AND_ENCRYPTION_KEY_WORDS: EnableWords = EnableWords {
 
 /// Deliberately not a softened copy of the words above. The two-wrap warning
 /// describes a loss that takes two mistakes; this one takes one.
+///
+/// Nor a partly *shared* copy: the two warnings have no sentence in common,
+/// pinned by `the_two_warnings_share_no_sentence` below. A sentence that
+/// reads correctly under both routes is how the two blocks drift back into
+/// one block with a variable in it, and the account with one wrap then gets
+/// told what the account with two wraps is told.
 const ENCRYPTION_KEY_ONLY_WORDS: EnableWords = EnableWords {
-    why: Some(
-        "None of your passkeys can hold an unlock key — their authenticators don't support the \
-         extension it is derived from, and that isn't something a setting turns on. You can \
-         still encrypt your entries: the encryption key you save will be what opens them.",
-    ),
     warning_heading: "Your encryption key will be the only key.",
     warning: "No passkey on this account can hold a copy of it, so there is no second way in \
               and nothing to fall back on. It never expires and is never used up — it opens \
-              every entry in this account, on any browser, until you replace it — and if you \
-              lose it your entries are gone forever, for you and for whoever runs this server. \
-              Nobody can unlock them, because nobody else ever has the key. This is not a \
-              password that can be reissued.",
+              every entry in this account, on any browser, until you replace it. Lose it and \
+              your entries are gone forever: unreadable by you, and by whoever runs this \
+              server, who has never held anything that could open them and has nothing to \
+              reissue in their place.",
     first_step: "Your browser generates the key. There is no passkey prompt on this route — \
                  which is exactly why the key you save has to carry the whole account.",
     key_step: "You're shown the encryption key, once, before encryption is switched on. Store \
@@ -1077,20 +1165,37 @@ fn EnableSection(
             .unwrap_or(EnableRoute::PasskeyAndEncryptionKey)
             .words()
     };
+    // Why the key-only route is the one on offer, owed only on that route
+    // and only once the list has landed. `Pending` renders nothing at all:
+    // an explanation for a route the account may not even be taking would
+    // flash a false alarm on every visit.
+    let reason = move || overview.get().loaded().as_ref().and_then(KeyOnlyReason::of);
 
     view! {
         <div>
+            // "Step 2 of 2" with nothing passed in, because this section is
+            // reached only from `Phase::Off`, and a signed-in account with
+            // encryption off is by definition `Writes::SetupRequired` (spec
+            // section 4.1) — the state the gate sends people here for.
+            // Anything already encrypted renders `ManageSection` instead.
+            <p class="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-1">
+                "Step 2 of 2"
+            </p>
             <h2 class="text-lg font-semibold text-gray-800 mb-1">"Encrypt your entries"</h2>
+            // Not "your entries are stored as plain text", which stopped
+            // being true when the server started refusing unencrypted
+            // writes (invariant E9): nothing of this account's is stored at
+            // all until the ceremony below finishes.
             <p class="text-sm text-gray-600 mb-4">
-                "Right now this account's entries are stored on the server as plain text: \
-                 anyone who can read the database — including whoever runs this server — can \
-                 read them. Turning encryption on locks them to a key that only your browser \
-                 ever holds."
+                "Encryption is what lets this account hold anything at all: the server stores \
+                 entries only for accounts that have a key, and it never sees the key itself. \
+                 Your browser encrypts each entry before it leaves this device, so what the \
+                 server keeps is unreadable to it — and to whoever runs it."
             </p>
 
-            {move || words().why.map(|why| view! {
+            {move || reason().map(|reason| view! {
                 <p class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-3 mb-4">
-                    {why}
+                    {reason.sentence()}
                 </p>
             })}
 
@@ -1850,6 +1955,87 @@ mod tests {
         assert_ne!(only.button, both.button);
     }
 
+    /// Sentences, trimmed and case-folded, for comparing two blocks of copy
+    /// that must not overlap.
+    fn sentences(text: &str) -> Vec<String> {
+        text.split_terminator('.')
+            .map(|line| line.trim().to_lowercase())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// Stronger than the `assert_ne!`s above, and it has to be. Differing
+    /// *somewhere* is satisfied by two blocks that agree for three sentences
+    /// and part company in the fourth — and a sentence that reads correctly
+    /// under both routes is exactly the one a later editor hoists into a
+    /// shared constant, then the one after it, until the two warnings are
+    /// one warning with a variable in it. At that point the account whose
+    /// encryption key is its only key is being told what the account with a
+    /// passkey behind it is told: that losing the key takes a second mistake
+    /// to become fatal. It does not.
+    ///
+    /// So: no sentence is true of both routes, and none is shared.
+    #[test]
+    fn the_two_warnings_share_no_sentence() {
+        let block =
+            |words: EnableWords| sentences(&format!("{} {}", words.warning_heading, words.warning));
+        let key_only = block(EnableRoute::EncryptionKeyOnly.words());
+        let two_wrap = block(EnableRoute::PasskeyAndEncryptionKey.words());
+
+        assert!(!key_only.is_empty() && !two_wrap.is_empty());
+        for line in &key_only {
+            assert!(
+                !two_wrap.contains(line),
+                "both warnings say “{line}”, so one route is wearing the other's words"
+            );
+        }
+    }
+
+    /// The two reasons an account lands on the key-only route, which are not
+    /// the same news. `NoPasskey` is a user who declined step one, or has
+    /// not done it yet: nothing is wrong, and encryption never needed a
+    /// passkey. `NoCapablePasskey` is hardware that cannot take the other
+    /// route, and it names the credentials so the sentence points at rows
+    /// the user can see rather than at "your passkeys" in the abstract.
+    #[test]
+    fn the_key_only_reason_distinguishes_no_passkey_from_no_capable_passkey() {
+        assert_eq!(
+            KeyOnlyReason::of(&Overview::default()),
+            Some(KeyOnlyReason::NoPasskey),
+            "an account that declined step one is on the key-only route, and knows why"
+        );
+
+        let incapable = Overview {
+            routes: vec![
+                classify(passkey("Bitwarden", b"cred-c", false), &[]),
+                classify(passkey("Old token", b"cred-d", false), &[]),
+            ],
+            ..Overview::default()
+        };
+        assert_eq!(
+            KeyOnlyReason::of(&incapable),
+            Some(KeyOnlyReason::NoCapablePasskey(vec![
+                "Bitwarden".to_string(),
+                "Old token".to_string(),
+            ]))
+        );
+        let sentence = KeyOnlyReason::of(&incapable).expect("a reason").sentence();
+        assert!(
+            sentence.contains("“Bitwarden” and “Old token” sign you in"),
+            "both names, and a plural verb to match: {sentence}"
+        );
+
+        let capable = Overview {
+            routes: vec![classify(passkey("Phone", b"cred-b", true), &[])],
+            ..Overview::default()
+        };
+        assert_eq!(
+            KeyOnlyReason::of(&capable),
+            None,
+            "the ordinary route owes no explanation, and one offered anyway reads as a fault"
+        );
+    }
+
     /// The precedence the whole feature hangs on. A key on screen has to
     /// outrank the account's state, and neither key-bearing mode lines up
     /// with a phase that would render it: `NewKey` is shown while the account
@@ -2367,6 +2553,12 @@ mod tests {
     /// [`the_key_only_route_states_that_the_key_is_the_only_one`], because
     /// that test pins the constants and this one pins that the section
     /// actually renders *these* constants for *this* account.
+    ///
+    /// Spec section 4.2 also owes this user the reason the passkey route was
+    /// not offered, naming the authenticator where it identified itself —
+    /// so the name the passkey carries has to reach the page, and the
+    /// capable account must not be handed an explanation for a route it is
+    /// not on.
     #[cfg(feature = "ssr")]
     #[test]
     fn an_account_with_no_capable_passkey_is_offered_the_key_only_route() {
@@ -2376,6 +2568,14 @@ mod tests {
                 ..Overview::default()
             }),
             true,
+        );
+        assert!(
+            html.contains("Old token"),
+            "the passkey that cannot take the other route must be named: {html}"
+        );
+        assert!(
+            html.contains("signs you in, but its authenticator"),
+            "and the reason stated, without impugning what the passkey does do: {html}"
         );
         assert!(
             !html.contains(r#"<button type="button" disabled"#),
@@ -2409,6 +2609,40 @@ mod tests {
         assert!(
             capable.contains("There is no reset."),
             "and must keep the two-wrap warning: {capable}"
+        );
+        assert!(
+            !capable.contains("signs you in, but its authenticator"),
+            "nor be told why a route it is being offered was withheld: {capable}"
+        );
+    }
+
+    /// Spec section 4.2's other way onto the key-only route: step one is
+    /// optional, and declining it must not read as the failure the sentence
+    /// above describes. An account with no passkey has nothing incapable
+    /// about it — there is simply nothing enrolled to hold a second copy of
+    /// the key — and a user told their authenticators do not support the
+    /// extension would go looking for a fault in hardware that was never
+    /// asked to do anything.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn an_account_that_declined_step_one_is_told_that_is_why() {
+        let html = render_enable(Fetched::Loaded(Overview::default()), true);
+        assert!(
+            html.contains("No passkey is enrolled on this account"),
+            "the reason must be the true one: {html}"
+        );
+        assert!(
+            !html.contains("signs you in, but"),
+            "and not the incapable-authenticator one, which names a fault this account has \
+             not got: {html}"
+        );
+        assert!(
+            html.contains("Turn on encryption with an encryption key only"),
+            "declining a passkey must still leave a way to encrypt: {html}"
+        );
+        assert!(
+            !html.contains(r#"<button type="button" disabled"#),
+            "and that way must be open, not a dead control: {html}"
         );
     }
 

@@ -54,6 +54,11 @@ pub fn AccountPage() -> impl IntoView {
     // and both read it: the passkey list bumps it after an add or a remove,
     // and the encryption panel bumps it after keying a credential.
     let reload = RwSignal::new(0u32);
+    // One derivation of "the gate sent this user here", read by the banner
+    // and by the step framing under it. Both have to agree with the gate
+    // itself, and asking `EncryptionCtx` twice — once per reader — is how
+    // they would come to disagree.
+    let setup = Memo::new(move |_| encryption.writes(backend.get()) == Writes::SetupRequired);
 
     view! {
         <Title text="Account — Time Tracker"/>
@@ -80,9 +85,8 @@ pub fn AccountPage() -> impl IntoView {
                         // the same call the day and week views gate on, so
                         // the banner cannot appear on a page they let
                         // through, or stay away from one they do not.
-                        {move || (encryption.writes(backend.get()) == Writes::SetupRequired)
-                            .then(|| view! { <SetupBanner/> })}
-                        <PasskeySection email=email reload=reload/>
+                        {move || setup.get().then(|| view! { <SetupBanner/> })}
+                        <PasskeySection email=email setup=setup reload=reload/>
                         <EncryptionPanel reload=reload/>
                     }),
                 }}
@@ -92,7 +96,15 @@ pub fn AccountPage() -> impl IntoView {
 }
 
 #[component]
-fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
+fn PasskeySection(
+    email: String,
+    /// Whether this page is the setup flow the gate routed to, in which case
+    /// the section is step one of it. Passed in rather than derived here, so
+    /// the banner above and the heading below cannot disagree about which
+    /// page this is.
+    setup: Memo<bool>,
+    reload: RwSignal<u32>,
+) -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
     let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     // `Resource` here is safe: this route is client-navigated and never part
@@ -218,8 +230,7 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
     view! {
         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
             <A href="/" attr:class="text-sm text-blue-600 no-underline">"‹ Back to today"</A>
-            <h1 class="text-xl font-semibold text-gray-800 mt-3 mb-1">"Passkeys"</h1>
-            <p class="text-sm text-gray-500 mb-5">{email}</p>
+            <PasskeyIntro email=email setup=setup/>
 
             // Bare `Suspend::new(...)`, not wrapped in an outer `move ||`:
             // `<Suspense>`'s `children` prop is already a re-callable
@@ -327,6 +338,50 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
     }
 }
 
+/// What the passkey section calls itself, which depends on why the user is
+/// looking at it.
+///
+/// On the settings page it is "Passkeys". In the setup flow it is step one
+/// of two, and the framing is the point of the step (spec section 4.2):
+/// it says what a passkey does *for the user* — one prompt instead of an
+/// emailed link — and not that encryption needs one, because encryption does
+/// not. A passkey works with any authenticator, including one that can never
+/// hold an unlock key; calling this "step one of encryption" would tell the
+/// owner of such an authenticator their passkey had failed when it did
+/// exactly the job it was added for. "Optional" is said out loud for the
+/// same reason: step two is reachable either way, and this must not read as
+/// a wall to somebody who cannot or will not enrol one.
+///
+/// A component rather than a branch inside [`PasskeySection`] so a test can
+/// reach it — the section around it fetches through a `Resource`, which the
+/// host cannot render.
+#[component]
+fn PasskeyIntro(email: String, setup: Memo<bool>) -> impl IntoView {
+    move || {
+        if setup.get() {
+            Either::Left(view! {
+                <p class="text-xs font-semibold uppercase tracking-wide text-gray-500 mt-3">
+                    "Step 1 of 2 · optional"
+                </p>
+                <h1 class="text-xl font-semibold text-gray-800 mb-1">
+                    "Add a passkey, and skip the email link"
+                </h1>
+                <p class="text-sm text-gray-500 mb-2">{email.clone()}</p>
+                <p class="text-sm text-gray-600 mb-5">
+                    "Signing in emails you a link every time. A passkey replaces that with one \
+                     prompt from whatever this device already unlocks with — worth having for \
+                     that alone. It is optional: step 2 turns on encryption either way."
+                </p>
+            })
+        } else {
+            Either::Right(view! {
+                <h1 class="text-xl font-semibold text-gray-800 mt-3 mb-1">"Passkeys"</h1>
+                <p class="text-sm text-gray-500 mb-5">{email.clone()}</p>
+            })
+        }
+    }
+}
+
 #[component]
 fn PasskeyRow(
     row: PasskeyListItem,
@@ -419,6 +474,66 @@ mod tests {
             refused.message().contains("last passkey"),
             "the server's own words must survive: {}",
             refused.message()
+        );
+    }
+
+    #[cfg(feature = "ssr")]
+    fn render_intro(setup: bool) -> String {
+        let runtime = Owner::new();
+        let html = runtime.with(move || {
+            view! {
+                <PasskeyIntro
+                    email="alice@example.com".to_string()
+                    setup=Memo::new(move |_| setup)
+                />
+            }
+            .to_html()
+        });
+        runtime.cleanup();
+        html
+    }
+
+    /// Spec section 4.2's framing, which is the whole of step one. The
+    /// passkey is pressed for what it does for the user — no emailed link
+    /// every time — and never as the thing encryption is waiting on. It is
+    /// not: the encryption-key route exists precisely for the account that
+    /// has no passkey, or none that can hold a key, and a step one that read
+    /// as a prerequisite would tell that user their authenticator had failed
+    /// them when it signed them in perfectly well.
+    ///
+    /// So "optional" is asserted, and the prerequisite phrasings are
+    /// asserted absent. The settings visit, which is not a step in anything,
+    /// gets none of it.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn step_one_offers_a_passkey_for_signing_in_not_as_a_prerequisite() {
+        let setup = render_intro(true);
+        assert!(
+            setup.contains("Step 1 of 2 · optional"),
+            "the step must say it is declinable where the user reads its number: {setup}"
+        );
+        assert!(
+            setup.contains("skip the email link") && setup.contains("emails you a link"),
+            "and offer the reason to want one, which is the sign-in round trip: {setup}"
+        );
+        for prerequisite in [
+            "before you can",
+            "first you need",
+            "encryption needs",
+            "required",
+        ] {
+            assert!(
+                !setup.contains(prerequisite),
+                "step one read as a prerequisite for step two (“{prerequisite}”): {setup}"
+            );
+        }
+
+        let settings = render_intro(false);
+        assert!(settings.contains("Passkeys"));
+        assert!(
+            !settings.contains("Step 1 of 2"),
+            "a visit that was not routed here by the gate is not step one of anything: \
+             {settings}"
         );
     }
 }
