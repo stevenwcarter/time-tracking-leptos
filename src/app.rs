@@ -507,11 +507,27 @@ mod tests {
             !gated.contains("Back to today"),
             "a link that only bounces back to this same page reads as a broken exit"
         );
+        // On the destination and not only on that one link's words. There
+        // were two links to `/` on this page — `PasskeySection`'s and the
+        // header's "Time Tracker" — and a text match saw only the first.
+        // `href="/account"` does not match this: the quote is part of it.
+        assert!(
+            !gated.contains(r#"href="/""#),
+            "every link to `/` bounces a gated account back here, whatever it says: {gated}"
+        );
+        assert!(
+            gated.contains("Time Tracker"),
+            "the header still names the app; it is the navigation that goes, not the name"
+        );
 
         let set_up = render_account_page(EncryptionState::Locked);
         assert!(
             set_up.contains("Back to today"),
             "an account past the gate has a real destination at `/`, and the link back to it"
+        );
+        assert!(
+            set_up.contains(r#"href="/""#),
+            "and the header's title links there again: {set_up}"
         );
     }
 
