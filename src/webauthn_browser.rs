@@ -415,7 +415,9 @@ mod tests {
     #[test]
     fn a_refusal_is_told_apart_from_a_call_that_never_landed() {
         assert_eq!(
-            server_refusal(&server_fn_message("That passkey can already open your entries.")),
+            server_refusal(&server_fn_message(
+                "That passkey can already open your entries."
+            )),
             Some("That passkey can already open your entries.")
         );
         // What `ServerFnError`'s other variants stringify to. No prefix, so

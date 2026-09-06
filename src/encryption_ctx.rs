@@ -762,9 +762,7 @@ async fn probe(user: &str) -> EncryptionState {
             // The retry it offers will keep landing here for as long as the
             // cookie disagrees, which is the honest outcome: a tab whose
             // session has been replaced needs a reload, not a spinner.
-            error!(
-                "this tab's session now belongs to another account; refusing to answer for it"
-            );
+            error!("this tab's session now belongs to another account; refusing to answer for it");
             return EncryptionState::Unreachable;
         }
         Ok(status) => status,

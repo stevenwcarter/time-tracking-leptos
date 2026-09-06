@@ -492,7 +492,8 @@ pub async fn store_many(
             // Flushed before this row joins, not after, so a single body
             // larger than the byte bound still travels — alone, in its own
             // chunk — rather than being refused by a rule about batches.
-            if !batch.is_empty() && (batch.len() >= BATCH_ROWS || bytes + wrapped.len() > BATCH_BYTES)
+            if !batch.is_empty()
+                && (batch.len() >= BATCH_ROWS || bytes + wrapped.len() > BATCH_BYTES)
             {
                 remote::store_many(mem::take(&mut batch)).await?;
                 bytes = 0;
@@ -1072,7 +1073,11 @@ mod tests {
             (d(2026, 9, 3), envelope::wrap_v1("b")),
         ];
         let decided = decide_rows(rows, Some(&SESSION));
-        assert_eq!(decided.rows.len(), 3, "every row must survive the first pass");
+        assert_eq!(
+            decided.rows.len(),
+            3,
+            "every row must survive the first pass"
+        );
         assert!(
             !decided.sealed,
             "a session holding a key met no sealed row, whatever the opener then did"

@@ -249,9 +249,11 @@ fn must_be_target(answered: &[u8], target: &[u8]) -> Result<(), String> {
     if answered == target {
         return Ok(());
     }
-    Err("That wasn't the passkey this step is for. Start again and choose it when your \
+    Err(
+        "That wasn't the passkey this step is for. Start again and choose it when your \
          browser asks for it."
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// Gives `target` its own route to the account's data key (spec 6.5).
@@ -354,8 +356,9 @@ pub fn server_message(err: ServerFnError) -> String {
 /// offering to keep the current code; the sentence has to survive being read
 /// next to that.
 #[cfg(feature = "hydrate")]
-pub const REISSUE_UNCONFIRMED: &str =
-    "We couldn't confirm the new recovery code was stored, and can't tell whether it      replaced the old one — so don't rely on either. While you still have a passkey that      works, go to your account page and generate a new recovery code.";
+pub const REISSUE_UNCONFIRMED: &str = "We couldn't confirm the new recovery code was stored, and can't tell whether it \
+     replaced the old one — so don't rely on either. While you still have a passkey \
+     that works, go to your account page and generate a new recovery code.";
 
 /// Stores a re-issued recovery wrap, retrying once with the identical bytes.
 ///

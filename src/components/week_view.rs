@@ -421,7 +421,10 @@ mod tests {
     fn a_failed_range_read_becomes_empty() {
         let read = loaded_rows(Err(StorageError::Unavailable));
         assert_eq!(read.rows, Vec::new());
-        assert!(!read.sealed, "a failed read learned nothing about the account");
+        assert!(
+            !read.sealed,
+            "a failed read learned nothing about the account"
+        );
     }
 }
 

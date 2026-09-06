@@ -221,7 +221,9 @@ pub async fn entry_save_many(entries: Vec<(String, String)>) -> Result<(), Serve
         return Err(super::server_err("That's too many entries in one request"));
     }
     if entries.iter().map(|(_, body)| body.len()).sum::<usize>() > MAX_BATCH_BYTES {
-        return Err(super::server_err("That batch of entries is too large to save"));
+        return Err(super::server_err(
+            "That batch of entries is too large to save",
+        ));
     }
 
     let mut conn = ctx
