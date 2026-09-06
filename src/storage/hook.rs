@@ -285,9 +285,11 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
                 Loaded::Value(value) => set_value.set(Some(value)),
                 // Left unloaded — blank, not "nothing saved" — and reported
                 // to the context, which is the only thing that can correct
-                // a session state the row has just contradicted. Once it
-                // does, the gate above swaps this day for the unlock
-                // prompt, and an unlock re-runs this load with a key.
+                // a session state the row has just contradicted. The report
+                // is dormant today: the one state a sealed row contradicts
+                // is gated before this resolves, and `sealed_row_seen`'s doc
+                // explains why it is kept anyway. Leaving the day blank is
+                // this arm's live half and stands on its own.
                 Loaded::Sealed => encryption.sealed_row_seen(),
                 // The same report, and then the difference: a row that
                 // would not open is only *possible* evidence, so when the

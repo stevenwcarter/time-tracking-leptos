@@ -181,11 +181,10 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
             }
             totals.set(Some(computed));
             // Short is not the same as empty, and only the seam knows which
-            // this was. A session that believes the account is unencrypted
-            // would otherwise render a week of sealed days as "Nothing
-            // logged this week." and go on offering an editable day view
-            // behind it; reporting the sealed row is what moves the state
-            // and puts the unlock prompt up instead.
+            // this was. Reported for the reason `sealed_row_seen` gives —
+            // and, as that doc records, dormant while the gate intercepts
+            // the one state a sealed row contradicts, since this effect
+            // returns above without reading at all when it does.
             if read.sealed {
                 encryption.sealed_row_seen();
             }

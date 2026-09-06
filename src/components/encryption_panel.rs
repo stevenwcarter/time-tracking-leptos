@@ -50,6 +50,8 @@ use leptos::either::{Either, EitherOf3, EitherOf7};
 use crate::crypto::choose_route;
 #[cfg(any(feature = "hydrate", test))]
 use crate::dto::{PasskeyListItem, WrapDto};
+#[cfg(any(feature = "hydrate", test))]
+use crate::webauthn_browser;
 
 #[cfg(feature = "hydrate")]
 use leptos::task::spawn_local;
@@ -1636,6 +1638,46 @@ fn RouteRow(
     }
 }
 
+/// What [`ceremony::commit_enable`] reports when the enable call fails, which
+/// is not one message but two — and giving the wrong one costs the user their
+/// real key.
+///
+/// [`crate::webauthn_browser::server_refusal`] is what tells them apart. A
+/// stripped prefix means the server answered and said why, and every refusal
+/// this endpoint can produce leaves the account exactly as it was: the guard
+/// on `encrypted_at` and both wrap inserts share one transaction, so a
+/// refusal is always a rollback. The key just saved therefore belongs to
+/// nothing. That case is reachable — a tab whose `EncryptionState` went stale
+/// while encryption was turned on elsewhere is refused with "Encryption is
+/// already enabled for this account.", and telling *that* user to keep the
+/// key they just saved would invite them to discard the one that opens their
+/// entries.
+///
+/// An unstripped prefix means the request never got an answer, which is the
+/// case the key screen is deliberately ordered before this call for: the
+/// commit may well have landed, so the key may be the account's live one and
+/// must be kept until the panel says otherwise.
+///
+/// Gated to compile under `test` as well as `hydrate` because the choice is
+/// the half an edit can quietly get wrong, and the ceremony around it needs a
+/// browser.
+#[cfg(any(feature = "hydrate", test))]
+fn enable_failed(raw: String) -> String {
+    match webauthn_browser::server_refusal(&raw) {
+        Some(said) => format!(
+            "{said} Nothing was changed, so the key you just saved is not this account's \
+             key — reload this page to see where the account actually stands."
+        ),
+        None => format!(
+            "{} We couldn't confirm encryption was turned on. Reload this page and \
+             read this panel: if it says encryption is on, the key you just saved is \
+             the right one — keep it. If it still offers to turn encryption on, \
+             nothing was changed and you can try again.",
+            webauthn_browser::friendly_error(raw)
+        ),
+    }
+}
+
 /// The panel's ceremonies: the ones only this panel runs. The steps shared
 /// with `UnlockPrompt` live in [`crate::crypto::flow`].
 ///
@@ -1791,6 +1833,10 @@ mod ceremony {
     /// they saved a key for an account that is not encrypted, and the next
     /// attempt mints another. The caller cannot tell those apart from here,
     /// so the message says how to find out and what each answer means.
+    ///
+    /// That is the *lost* response only. A refusal the server actually sent
+    /// means the transaction rolled back and needs the opposite advice;
+    /// [`super::enable_failed`] is where the two are told apart.
     pub async fn commit_enable(pending: PendingEnable) -> Result<SessionKey, String> {
         let PendingEnable {
             session_key,
@@ -1801,15 +1847,7 @@ mod ceremony {
 
         encryption_enable(passkey, encryption_key_wrap)
             .await
-            .map_err(|err| {
-                format!(
-                    "{} We couldn't confirm encryption was turned on. Reload this page and \
-                     read this panel: if it says encryption is on, the key you just saved is \
-                     the right one — keep it. If it still offers to turn encryption on, \
-                     nothing was changed and you can try again.",
-                    crate::webauthn_browser::friendly_error(err.to_string())
-                )
-            })?;
+            .map_err(|err| super::enable_failed(err.to_string()))?;
 
         Ok(session_key)
     }
@@ -2045,8 +2083,13 @@ mod tests {
     /// or more is where an off-by-one in the join would actually show up — a
     /// trailing comma, a missing "and", or a dropped final name — and no
     /// existing case reaches it.
+    ///
+    /// Named for what it pins, which is the *absence* of an Oxford comma:
+    /// `quoted_list` emits `“A”, “B” and “C”` and says so in its own doc. A
+    /// name claiming the opposite would invite a later reader to "fix" the
+    /// function and break the test that supposedly asked for it.
     #[test]
-    fn quoted_list_uses_an_oxford_comma_for_three_or_more_names() {
+    fn quoted_list_joins_three_or_more_names_without_a_trailing_comma() {
         let three = Overview {
             routes: vec![
                 classify(passkey("Bitwarden", b"cred-c", false), &[]),
@@ -2912,5 +2955,93 @@ mod tests {
                 assert!(!html.contains(leaked), "migration copy leaked: `{leaked}`");
             }
         }
+    }
+
+    /// The other half of `account_page`'s
+    /// `step_one_offers_a_passkey_for_signing_in_not_as_a_prerequisite`,
+    /// which pins step one in both directions while step two was asserted
+    /// nowhere.
+    ///
+    /// The numbering is a promise that this ends, made to somebody the gate
+    /// moved here — and it is true only where the gate sent them.
+    /// `EnableSection` renders it unconditionally on the argument that
+    /// `Phase::Off` implies `Writes::SetupRequired` for a signed-in account;
+    /// `ManageSection` is a settings visit and is not step anything, which is
+    /// the direction that would break if that argument ever stopped holding.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn step_two_is_numbered_only_where_the_gate_sent_the_user() {
+        let setup = render_enable(Fetched::Loaded(Overview::default()), true);
+        assert!(
+            setup.contains("Step 2 of 2"),
+            "the enable pitch is reached only from the gate, and says where in it \
+             the user is: {setup}"
+        );
+        assert!(
+            setup.contains("Encrypt your entries"),
+            "the number must sit over the step it numbers: {setup}"
+        );
+
+        let settings = render_manage(true, Overview::default());
+        assert!(
+            settings.contains("What can unlock your entries"),
+            "the manage view must have rendered at all: {settings}"
+        );
+        assert!(
+            !settings.contains("Step 2 of 2"),
+            "an account already encrypted is not partway through anything: {settings}"
+        );
+    }
+
+    /// What every real call site hands `enable_failed`: `ServerFnError`'s
+    /// `Display` wraps a `ServerError` in this prefix, and only a message
+    /// wearing it came from the server rather than from the transport. The
+    /// literal is `webauthn_browser`'s private `SERVER_FN_ERROR_PREFIX`,
+    /// repeated here for the same reason its own tests repeat it.
+    fn server_said(message: &str) -> String {
+        format!("error running server function: {message}")
+    }
+
+    /// The case the gate can walk a stale tab into, and the one where the
+    /// old single message gave advice that could lose the user their real
+    /// key: the account was already encrypted, the transaction rolled back,
+    /// and the key just minted opens nothing. Saying "keep it" there invites
+    /// them to discard the key that does.
+    #[test]
+    fn a_refusal_the_server_sent_says_the_saved_key_is_not_the_accounts() {
+        let said = "Encryption is already enabled for this account.";
+        let message = enable_failed(server_said(said));
+
+        assert!(
+            message.starts_with(said),
+            "the server explained itself and that sentence is the useful one: {message}"
+        );
+        assert!(
+            !message.contains("keep it"),
+            "nothing was changed, so the key just saved is not this account's: {message}"
+        );
+        assert!(
+            !message.contains("We couldn't confirm"),
+            "the server answered — there is nothing unconfirmed about it: {message}"
+        );
+    }
+
+    /// The other half, and the reason the key screen comes before the commit
+    /// at all: with no answer the write may have landed, so the key the user
+    /// just saved may be the account's live one and must be held on to until
+    /// the reloaded panel says which it is.
+    #[test]
+    fn a_call_that_never_landed_still_says_to_keep_the_key() {
+        let message =
+            enable_failed("error reaching server to call server function: offline".into());
+
+        assert!(
+            message.contains("We couldn't confirm encryption was turned on"),
+            "a lost response is exactly the case that cannot be confirmed: {message}"
+        );
+        assert!(
+            message.contains("keep it"),
+            "the commit may have landed, so the saved key may be the live one: {message}"
+        );
     }
 }

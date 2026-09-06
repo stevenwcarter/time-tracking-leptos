@@ -396,6 +396,9 @@ impl UnreadableRow {
 /// that would not open has proved nothing — it may simply be damaged — so
 /// its probe parks at [`EncryptionState::Unknown`], which refuses writes
 /// without asserting anything about the account.
+///
+/// The `Sealed` half is a decision nothing currently asks for: see
+/// [`EncryptionCtx::sealed_row_seen`] for why the gate leaves it dormant.
 #[cfg(any(feature = "hydrate", test))]
 fn contradicted_by(row: UnreadableRow, state: &EncryptionState) -> Option<EncryptionState> {
     match row {
@@ -647,17 +650,30 @@ impl EncryptionCtx {
     /// Records that the storage seam met a row this session holds no key
     /// for, and re-probes if that contradicts what the state says.
     ///
-    /// This is the branch that keeps a long-lived tab honest. The state is
-    /// computed once per page load and re-probed only when `AuthCtx::user`
-    /// changes, so a tab left open while encryption is switched on
-    /// elsewhere — a second tab, another device — goes on reporting
-    /// [`EncryptionState::Disabled`] indefinitely. `Disabled` is
-    /// [`crate::storage::WriteKey::Plaintext`] and mounts an editable entry
-    /// area, so every day sealed elsewhere since then reads back as
-    /// [`crate::storage::StorageError::Locked`] and, if the seam collapsed
-    /// that to "nothing saved", would be shown as an empty box over content
-    /// the user can neither see nor replace — the save that box invites is
-    /// refused too.
+    /// This was built for the long-lived tab. The state is computed once per
+    /// page load and re-probed only when `AuthCtx::user` changes, so a tab
+    /// left open while encryption is switched on elsewhere — a second tab,
+    /// another device — goes on reporting [`EncryptionState::Disabled`]
+    /// indefinitely, and every day sealed since then reads back as
+    /// [`crate::storage::StorageError::Locked`].
+    ///
+    /// **Spec section 4.1's gate took that case over, and no live path
+    /// reaches this any more.** [`contradicted_by`] says a sealed row
+    /// contradicts exactly one state, `Disabled`, and `Disabled` on
+    /// [`crate::storage::Backend::Remote`] is now [`Writes::SetupRequired`]:
+    /// `week_view`'s range effect returns before its read, and the day view's
+    /// read still starts but `SetupGate` navigates away and disposes the
+    /// `Generation` it holds, so the result is discarded before this arm.
+    /// `Backend::Local` cannot produce a sealed row at all —
+    /// `storage::write_target` has no arm that seals to it. What corrects a
+    /// stale tab instead is `SetupGate`'s own `retry`, which re-probes on
+    /// arrival rather than trusting the state that sent it there.
+    ///
+    /// Kept rather than removed, and honestly: the report costs one call at
+    /// the seam, the decision behind it is host-tested, and it is the net
+    /// already in place if the gate's shape changes — a new backend, or a
+    /// state that stops being `SetupRequired`. It is a dormant guard, not a
+    /// working mechanism, and should not be cited as one.
     ///
     /// Which states that contradicts, and what the probe parks at meanwhile,
     /// is [`contradicted_by`]'s decision; every other state is left alone,
@@ -1110,20 +1126,21 @@ mod tests {
         ));
     }
 
-    /// What the entry area renders from has to be the same answer the seam
-    /// acts on. If these two ever disagreed the textarea would invite a
-    /// keystroke the save then refused — which is precisely the silence
-    /// `Writes` exists to end.
-    ///
     /// A session that cannot seal is refused on *either* backend, which is
-    /// the ordering `write_target` also uses: it returns `Locked` before it
-    /// so much as looks at where the write was going.
+    /// the ordering `crate::storage::write_target` also uses: it returns
+    /// `Locked` before it so much as looks at where the write was going.
+    ///
+    /// This asserts about `writes` alone and claims no more than that. The
+    /// agreement between what the view offers and what the seam accepts is
+    /// pinned by `storage`'s
+    /// `the_gate_and_the_seam_agree_on_every_state_a_host_can_build`, which
+    /// is the only test that calls both.
     ///
     /// `Unlocked` is absent because it needs a `SessionKey`, uninhabited on
     /// the host; its arm is the one `write_key` and `writes` share by
     /// construction, since the second reads the first.
     #[test]
-    fn what_the_view_shows_matches_what_a_write_would_do() {
+    fn a_session_that_cannot_seal_is_refused_on_either_backend() {
         for backend in [Backend::Local, Backend::Remote] {
             for state in [
                 EncryptionState::Unknown,

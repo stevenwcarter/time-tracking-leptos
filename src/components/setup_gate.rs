@@ -51,8 +51,30 @@ pub fn SetupGate() -> impl IntoView {
         use leptos_router::NavigateOptions;
         use leptos_router::hooks::use_navigate;
 
+        let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
         let navigate = use_navigate();
         Effect::new(move |_| {
+            // Re-probe before acting on the state that mounted this, rather
+            // than treating it as current. A tab left open while encryption
+            // was switched on elsewhere still reports
+            // `EncryptionState::Disabled`, which on `Backend::Remote` is
+            // exactly `Writes::SetupRequired` — so without this the gate
+            // marches an already-encrypted account into the enable pitch,
+            // where "Nothing you type is saved to your account yet" and
+            // "Step 2 of 2" are both false of it, and a ceremony carried
+            // through ends in `ceremony::enable_failed` explaining a refusal
+            // over a key that opens nothing.
+            //
+            // One `encryption_status` round trip settles it: the probe parks
+            // the state at `Unknown` — `Phase::Checking`, which claims
+            // nothing — and a stale `Disabled` comes back `Locked`, which is
+            // not gated, so the tab un-gates itself. An account that really
+            // has no encryption comes back `Disabled` and lands on the same
+            // setup page one round trip later.
+            //
+            // Reads untracked (`retry` uses `get_untracked`), so this effect
+            // still has no dependencies and runs once per mount.
+            encryption.retry();
             navigate(
                 "/account",
                 NavigateOptions {
