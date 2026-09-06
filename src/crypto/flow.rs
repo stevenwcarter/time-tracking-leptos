@@ -207,8 +207,8 @@ async fn open_existing_route(
         KeySource::Passkey => {
             let existing = assert_with_prf(user).await.map_err(assertion_message)?;
             let route = choose_route(wraps, Some(&existing.credential_id)).ok_or_else(|| {
-                "That passkey can't open your entries either, so it has no key to pass on. \
-                 Choose one that already can."
+                "That passkey can't open your entries, so it has no key to hand on. Choose \
+                 one that already can."
                     .to_string()
             })?;
             Ok(OpenedRoute::Passkey {
@@ -396,6 +396,29 @@ async fn store_recovery_wrap(wrapped_key: Vec<u8>) -> Result<(), String> {
 /// get the raw key back out, since a [`super::SessionKey`] cannot yield it
 /// (invariant E5). The old code keeps working until the server has replaced
 /// the row, so a failure here costs the user nothing.
+/// Spec section 6.4's re-issue, run from `/account`, opened with whichever
+/// secret `source` names.
+///
+/// The recovery route is not a convenience. An account whose passkeys are
+/// all keyless — which is exactly where a user lands after recovering with
+/// their code — has no passkey opener, so the passkey-only version of this
+/// spent an authenticator prompt to reach "that passkey can't open this
+/// account's entries" and left the code they had just typed somewhere
+/// careless as the account's only backup, with no way to replace it.
+///
+/// The wraps are fetched before the authenticator is touched, the order
+/// every other ceremony here uses: a server that cannot answer sinks the
+/// attempt whatever the authenticator says, and asking for a gesture first
+/// spends a real one on a failure already decided.
+#[cfg(feature = "hydrate")]
+pub async fn reissue_with(user: &str, source: KeySource) -> Result<String, String> {
+    use crate::server_fns::encryption::encryption_wraps;
+
+    let wraps = encryption_wraps().await.map_err(server_unreachable)?;
+    let existing = open_existing_route(user, source, &wraps).await?;
+    reissue(&existing.opener()).await
+}
+
 #[cfg(feature = "hydrate")]
 pub async fn reissue(existing: &Opener<'_>) -> Result<String, String> {
     let (new_code, new_wrap) = reissue_recovery(existing).await.map_err(|_| {

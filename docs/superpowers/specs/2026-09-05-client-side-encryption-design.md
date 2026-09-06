@@ -353,6 +353,16 @@ The user is then offered a freshly generated recovery code, since the old one
 has now been typed and possibly copied somewhere careless. Declining is
 allowed; the old code keeps working.
 
+**Amended during implementation: the re-issue on `/account` offers both
+routes, not just a passkey.** Minting a code means wrapping the raw data key
+under it, which needs a route to that key — and a recovery unlock leaves the
+account in the one state where no *passkey* is such a route. So the account
+most likely to want a new code was the one that could not have one: the
+control spent an authenticator prompt to arrive at "that passkey can't open
+this account's entries", and `ManageSection`'s "No recovery code is on file …
+Generate one now" pointed straight at it. The panel now shows the same
+opener choice §6.5's give-a-key card does.
+
 ### 6.5 Adding a passkey to an encrypted account
 
 Enrolment proceeds as today, then: assert with PRF eval against the *new*
