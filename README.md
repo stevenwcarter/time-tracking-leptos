@@ -125,49 +125,57 @@ or a court order served on whoever hosts it.
 **How to turn it on.** `/account` offers it, by one of two routes, and which
 one you get depends on your passkeys rather than on a choice you make:
 
-- **A passkey and a recovery code**, if you have enrolled a passkey whose
+- **A passkey and an encryption key**, if you have enrolled a passkey whose
   authenticator supports the WebAuthn PRF extension — most modern platform
   authenticators and security keys do. The passkey unlocks your entries in
-  the same gesture as signing in, and the code is a backup behind it.
-- **A recovery code alone**, if none of them do. Some password-manager
-  browser extensions have not implemented the extension the key is derived
-  from, and that is not something a setting can turn on. This route still
-  encrypts your entries; you unlock by typing the code once per browser,
-  after which that browser remembers it like any other. The difference is
-  what the code is worth: there is no passkey behind it, so **losing it loses
-  your entries outright.** The panel says so in those words before you start.
+  the same gesture as signing in, and the encryption key is the second way
+  in behind it.
+- **An encryption key alone**, if none of them do. Some password-manager
+  browser extensions have not implemented the extension the unlock key is
+  derived from, and that is not something a setting can turn on. This route
+  still encrypts your entries; you unlock by typing the encryption key once
+  per browser, after which that browser remembers it like any other. The
+  difference is what that key is worth: there is no passkey behind it, so
+  **losing it loses your entries outright.** The panel says so in those words
+  before you start.
 
 Either way, enabling re-encrypts the entries you already have, in one pass
 you can watch; if it is interrupted, `/account` tells you how many days are
 left and offers to finish. Nothing becomes unreadable in the meantime.
 
 The second route is not a dead end. If you later enrol a passkey that *can*
-hold a key, `/account` will give it one using your recovery code, and from
+hold a key, `/account` will give it one using your encryption key, and from
 then on that passkey unlocks your entries too.
 
-**Your recovery code is shown once, and it is the only backup.** Enabling
-generates a 32-character code and shows it to you on a screen you have to
-confirm before it closes. It is never shown again. Write it down or put it in
-a password manager *before* clicking through — the code is what gets you back
-in on a browser your passkey cannot reach, or after your passkey is gone.
+**Your encryption key is shown once.** Enabling generates a 32-character key
+and shows it to you on a screen you have to confirm before it closes. It is
+never shown again. Write it down or put it in a password manager *before*
+clicking through — it is what gets you back in on a browser your passkey
+cannot reach, or after your passkey is gone.
 
-> **If you lose every passkey and the recovery code — or just the code, if
-> that is the only key your account has — your entries are gone,
+It is a key, not a recovery code, and the difference matters when you decide
+where to keep it. Nothing uses it up: it does not expire, it is not spent by
+being typed, and the same string opens every entry in your account, on any
+browser, as many times as you like — until you replace it. Treat it the way
+you would treat the entries themselves.
+
+> **If you lose every passkey and the encryption key — or just the key, if
+> that is the only one your account has — your entries are gone,
 > permanently.** Not locked, not recoverable by support, not restorable from
 > a backup — the ciphertext is still there and no key on earth opens it. That
 > is exactly what "the server cannot read your entries" costs, and it is not
 > a limitation anyone can lift for you afterwards.
 
-You can ask `/account` for a fresh recovery code at any time, which replaces
-the old one. You are offered one automatically after unlocking with a code,
-since typing it in may have left it somewhere careless.
+You can ask `/account` for a fresh encryption key at any time, which replaces
+the old one. You are offered one automatically after unlocking with the key
+you have, since typing it in may have left it somewhere careless.
 
 **Unlocking.** Each browser unlocks once and then remembers — the key is
 stored in that browser in a form scripts cannot read out, so reloads and
 restarts do not re-prompt. Signing in *with a passkey* unlocks in the same
 gesture, with no extra prompt. Signing in with a magic link does not, so the
-day view asks you to unlock, either with a passkey or with your recovery
-code. "Lock now" on `/account` forgets the key for that browser, and so does
+day view asks you to unlock, either with a passkey or with your encryption
+key. "Lock now" on `/account` forgets the key for that browser, and so does
 signing out. Clearing site data or using a private window means unlocking
 again.
 
@@ -175,7 +183,7 @@ again.
 authenticator asks three times in a row: once to create the new passkey, once
 against a passkey you already have — to recover the key so it can be wrapped
 for the new one — and once against the new passkey. You can substitute your
-recovery code for that middle prompt, but there is no way to do it in fewer
+encryption key for that middle prompt, but there is no way to do it in fewer
 than three steps: the key is deliberately held in a form nothing can copy
 out, the app included, so it has to be re-derived at that moment. `/account`
 says so before you start rather than springing three prompts on you one at a
@@ -183,7 +191,7 @@ time.
 
 **Removing a passkey** deletes its ability to unlock. The app refuses to
 remove your *last* unlocking passkey while encryption is on, and points you
-at your recovery code instead, so a single click cannot destroy your data.
+at your encryption key instead, so a single click cannot destroy your data.
 
 **What it does not protect against.** Encryption defends your entries at
 rest — an operator reading the database, a stolen backup, a subpoena. It does

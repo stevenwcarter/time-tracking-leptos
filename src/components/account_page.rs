@@ -153,7 +153,7 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
                 }
                 // Includes spec section 6.6's refusal to remove the last
                 // passkey that can unlock an encrypted account. That message
-                // names the recovery code and the alternative, so it is
+                // names the encryption key and the alternative, so it is
                 // shown as it stands rather than collapsed into a generic
                 // failure — `webauthn_browser::friendly_error` passes it
                 // through by prefix — and as a `Problem`, because a refusal
@@ -297,8 +297,8 @@ fn PasskeySection(email: String, reload: RwSignal<u32>) -> impl IntoView {
             })}
 
             // Deliberately secondary to the passkey actions above: a
-            // recovery control for a lost device, not something to reach for
-            // by habit.
+            // control for a lost device, not something to reach for by
+            // habit.
             <div class="mt-8 pt-4 border-t border-gray-100">
                 <button
                     type="button"
@@ -390,7 +390,7 @@ mod tests {
 
     /// Spec section 6.6's refusal arrives through here — the server declines
     /// to remove the last passkey that can unlock an encrypted account, and
-    /// the message names the recovery code and the alternative. It has to
+    /// the message names the encryption key and the alternative. It has to
     /// land as a problem: this is the one message on the page that stops the
     /// user doing something, and in the same grey as "Passkey renamed." it
     /// is one they scroll past and then retry.
@@ -460,9 +460,9 @@ async fn finish_added_passkey(user: &str, encrypted: bool, credential: Option<Ve
     };
     // A passkey opener, because this path has just been through one
     // authenticator prompt and can reasonably ask for another. When there is
-    // no passkey that can unlock — an account recovered with its code — this
-    // fails and says so, and the panel below offers the recovery route that
-    // does work (see `flow::add_passkey_key`).
+    // no passkey that can unlock — an account reopened with its encryption
+    // key — this fails and says so, and the panel below offers the
+    // encryption-key route that does work (see `flow::add_passkey_key`).
     match crate::crypto::flow::add_passkey_key(user, &credential, KeySource::Passkey).await {
         Ok(()) => Status::Note("Passkey added, and it can open your entries.".to_string()),
         // A problem, not a note: the passkey signs the user in but does not

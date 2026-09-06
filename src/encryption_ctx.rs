@@ -977,7 +977,7 @@ async fn probe(user: &str) -> EncryptionState {
             Err(err) => {
                 // A keystore that could not be opened is `Locked`, exactly
                 // like an empty one: the user still has their passkey and
-                // their recovery code, and an unlock prompt is what gets
+                // their encryption key, and an unlock prompt is what gets
                 // them back in (`crypto::keystore`'s point 2).
                 error!("could not read this device's key store: {err}");
                 EncryptionState::Locked

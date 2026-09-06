@@ -16,12 +16,12 @@ const SEALED_BODY: &str = r#"{"v":2,"alg":"a256gcm","n":"bm9uY2U","ct":"Y2lwaGVy
 /// Entry writes require it (invariant E9), so a test that is about
 /// something else — cross-account scoping, session revocation — has to get
 /// past that precondition before it can reach what it is actually about.
-/// The recovery-only route is the shorter of the two and needs no enrolled
-/// credential; the wrap bytes are arbitrary, since nothing server-side ever
-/// opens one.
+/// The encryption-key-only route is the shorter of the two and needs no
+/// enrolled credential; the wrap bytes are arbitrary, since nothing
+/// server-side ever opens one.
 async fn enable_encryption(client: &SessionClient) {
     client
-        .encryption_enable_recovery_only(&[7; 40])
+        .encryption_enable_key_only(&[7; 40])
         .await
         .expect("enable encryption");
 }

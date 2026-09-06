@@ -2,7 +2,7 @@
 //!
 //! Credentials hang off `user_id`, not a free-text email column as in
 //! photo365: a foreign key makes the user row the single identity anchor,
-//! which matters once phase 2 attaches wrapped encryption keys to it.
+//! which matters once phase 2 attaches wrapped data keys to it.
 
 use anyhow::{Context, Result};
 use chrono::{NaiveDateTime, Utc};
@@ -67,7 +67,7 @@ struct NewPasskey<'a> {
 ///
 /// `prf_capable` records whether the authenticator reported PRF support at
 /// creation time. Nothing reads it in phase 1; it exists so phase 2 can tell
-/// which credentials can derive an encryption key without making every user
+/// which credentials can derive an unlock key without making every user
 /// delete and re-enrol (spec section 9.3).
 pub fn insert(conn: &mut DbConn, user_id: i32, key: &Passkey, prf_capable: bool) -> Result<i32> {
     let blob = serde_json::to_vec(key).context("encode Passkey blob")?;

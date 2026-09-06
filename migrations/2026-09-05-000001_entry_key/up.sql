@@ -14,5 +14,5 @@ CREATE TABLE entry_key_wrap (
 CREATE INDEX idx_entry_key_wrap_user ON entry_key_wrap(user_id);
 CREATE UNIQUE INDEX idx_entry_key_wrap_cred
   ON entry_key_wrap(user_id, credential_id) WHERE credential_id IS NOT NULL;
-CREATE UNIQUE INDEX idx_entry_key_wrap_one_recovery
-  ON entry_key_wrap(user_id) WHERE kind = 'recovery';
+CREATE UNIQUE INDEX idx_entry_key_wrap_one_encryption_key
+  ON entry_key_wrap(user_id) WHERE kind = 'encryption_key';

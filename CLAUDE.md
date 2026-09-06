@@ -191,7 +191,10 @@ server-side version scan is exactly what encryption breaks.
 
 **The key hierarchy.** A per-account AES-256-GCM data key (DEK) is generated
 in the browser and wrapped (AES-KW) under independently derived KEKs: one
-from a passkey's WebAuthn PRF output, one from a 160-bit recovery code. Both
+from a passkey's WebAuthn PRF output, one from a 160-bit **encryption key**
+— a printable string the user saves. It is not a recovery code and is not
+single-use: nothing consumes or invalidates it, so it opens every entry on
+any device until the owner generates a replacement. Both
 derivations are HKDF-SHA256 over a fixed `APP_SALT` with a per-route `info`
 string. The server stores only the 40-byte wrapped blobs. Unwrapped, the DEK
 is held as a **non-extractable** `CryptoKey` in IndexedDB (database
@@ -201,12 +204,12 @@ once per page.
 **Enabling has two routes** (spec §6.1), and the account's own capability
 picks one — it is not a user preference:
 
-| | Passkey + recovery | Recovery only |
+| | Passkey + encryption key | Encryption key only |
 |---|---|---|
 | Offered when | some enrolled credential reported `prf_capable` | none did |
-| Wraps written | `passkey` + `recovery` | `recovery` only |
-| Unlock | passkey, in the sign-in gesture; code as backup | the code, typed once per device |
-| Losing the code | survivable while a keyed passkey remains | **total** |
+| Wraps written | `passkey` + `encryption_key` | `encryption_key` only |
+| Unlock | passkey, in the sign-in gesture; the encryption key as the second way in | the encryption key, typed once per device |
+| Losing the encryption key | survivable while a keyed passkey remains | **total** |
 
 The second route exists because PRF support is a property of the browser and
 the authenticator, not a setting: a password-manager extension that never
@@ -214,25 +217,25 @@ implemented the extension makes the first route permanently impossible, and
 what the old dead end ("add a passkey that can hold a key") actually produced
 was a plaintext account. **No migration was needed** —
 `entry_key_wrap.credential_id` is nullable and both unique indexes are
-partial. A recovery-only account stops being one as soon as a PRF-capable
-passkey is given a key from the code, through `/account`'s existing
+partial. An encryption-key-only account stops being one as soon as a
+PRF-capable passkey is given a key from it, through `/account`'s existing
 give-a-key flow. §6.6's "don't delete the last passkey wrap" refusal is
 vacuous while there are zero of them and starts applying at the first.
 
 **Consequences worth knowing before touching any of it:**
 
-- The recovery code is shown **once**, at enable. Losing every passkey *and*
-  the code makes that account's entries unreadable permanently, by everyone
-  — or losing the code alone, on the recovery-only route. There is no
+- The encryption key is shown **once**, at enable. Losing every passkey *and*
+  the encryption key makes that account's entries unreadable permanently, by
+  everyone — or losing the key alone, on the encryption-key-only route. There is no
   operator recourse; that is the feature working. **The panel's two warnings
   are deliberately different sentences and must stay that way**: a user shown
   the two-wrap wording over a one-wrap account has been told they have a
   fallback they do not have. The words hang off `EnableRoute`, not off the
-  section rendering them, and the code screen carries the route for the same
+  section rendering them, and the key screen carries the route for the same
   reason.
 - Adding a passkey to an encrypted account costs **three** authenticator
   interactions (create the new credential; open an *existing* route to
-  re-derive the raw DEK — a passkey assertion, or the recovery code; assert
+  re-derive the raw DEK — a passkey assertion, or the encryption key; assert
   against the new credential for its PRF output). Non-extractability is why:
   a sealed key cannot yield its bytes even to this session's own code, so
   being unlocked buys no shortcut (spec §6.5).
@@ -255,8 +258,8 @@ whose §11 lists the invariants (E1–E7) a change here has to keep.
   in *here* — no component that reads or writes a day's text knows it exists.
 - `src/crypto/` — everything the browser does with keys. `wire.rs` (the v2
   envelope, `APP_SALT`, the HKDF `info` strings — pure and host-tested) and
-  `recovery.rs` (code generation, formatting, normalization — pure, RNG
-  injected) carry the logic; `subtle.rs` (WebCrypto) and `keystore.rs`
+  `encryption_key.rs` (generation, formatting, normalization of the
+  printable encryption key — pure, RNG injected) carry the logic; `subtle.rs` (WebCrypto) and `keystore.rs`
   (IndexedDB) are the thinnest possible browser-only shells, reviewed by
   reading rather than by test. `mod.rs` holds `SessionKey` and `choose_route`;
   `flow.rs` holds the ceremony steps that need the authenticator *and* the
@@ -308,7 +311,7 @@ Configuration section for what each variable does. Summarized here:
   |---|---|
   | `APP_SALT` | SHA-256 of the ASCII bytes `time-tracking-leptos/entry-key/v1` |
   | passkey HKDF `info` | `tt/entry-kek/passkey/v1` |
-  | recovery HKDF `info` | `tt/entry-kek/recovery/v1` |
+  | encryption-key HKDF `info` | `tt/entry-kek/recovery/v1` (the stale `recovery` is deliberate — see below) |
   | envelope v2 `alg` | `a256gcm` |
 
   Changing any one of them silently makes every existing wrapped key
@@ -320,6 +323,12 @@ Configuration section for what each variable does. Summarized here:
   neither opens. `wire.rs`'s `derivation_inputs_are_pinned` and
   `each_kind_keeps_its_own_info_string` exist to make that change impossible
   to do by accident; do not update them to match a new value (invariant E6).
+
+  **The `recovery` inside the second `info` string is deliberately stale.**
+  "Recovery code" was renamed to "encryption key" everywhere else, including
+  the stored `entry_key_wrap.kind` value — but not here, because that string
+  is an opaque domain separator no user ever sees, and rewriting it to match
+  the new vocabulary would be exactly the silent break described above.
 
 ## Design docs
 

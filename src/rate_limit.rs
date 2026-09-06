@@ -36,7 +36,7 @@ const MAGIC_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 /// Phase 2 is what made the sharing untenable. Every encryption ceremony
 /// runs through `flow::assert_with_prf`, which reuses
 /// `passkey_login_start`, so enabling encryption, unlocking, and re-issuing
-/// a recovery code each cost a token — and **adding a passkey to an
+/// an encryption key each cost a token — and **adding a passkey to an
 /// encrypted account costs two**, since it asserts against an existing
 /// credential and then against the new one. Sign in, enable, add a passkey
 /// and four of the five sign-in tokens are gone; the fifth buys one more

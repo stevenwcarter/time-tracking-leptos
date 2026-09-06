@@ -478,7 +478,7 @@ mod tests {
             "server rendered the locked prompt"
         );
         assert!(
-            !html.contains("recovery code"),
+            !html.contains("encryption key"),
             "server rendered unlock UI it cannot know is needed"
         );
     }

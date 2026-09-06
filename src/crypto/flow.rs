@@ -4,12 +4,12 @@
 //! WebCrypto and IndexedDB; `server_fns` reaches the network. The steps
 //! below need both at once, and each is run from more than one place: the
 //! unlock prompt and the `/account` encryption panel share the same
-//! PRF-evaluated assertion and the same recovery re-issue, and the panel
+//! PRF-evaluated assertion and the same encryption-key re-issue, and the panel
 //! shares [`add_passkey_key`] with the account page's enrolment button.
 //!
 //! They live here rather than in whichever component happened to want one
 //! first, so the wording of a failure — and the retry that protects the
-//! recovery wrap — cannot drift between callers. Ceremonies with a single
+//! encryption-key wrap — cannot drift between callers. Ceremonies with a single
 //! caller stay with that caller.
 
 use base64::Engine as _;
@@ -21,7 +21,7 @@ use leptos::logging::error;
 use leptos::prelude::ServerFnError;
 
 #[cfg(feature = "hydrate")]
-use super::{KeySource, Opener, UnlockError, reissue_recovery};
+use super::{KeySource, Opener, UnlockError, reissue_encryption_key};
 #[cfg(feature = "hydrate")]
 use crate::dto::WrapDto;
 
@@ -37,8 +37,8 @@ use crate::dto::WrapDto;
 /// Every step is fallible-safe: a response that is not JSON, carries no
 /// `rawId`, or carries one that is not base64url yields `None` rather than
 /// panicking. Callers treat `None` as "that credential did not identify
-/// itself", which is a different outcome from "the user chose the recovery
-/// route" — see [`super::choose_route`].
+/// itself", which is a different outcome from "the user chose the
+/// encryption-key route" — see [`super::choose_route`].
 pub fn credential_id_from_response(response_json: &str) -> Option<Vec<u8>> {
     let value: serde_json::Value = serde_json::from_str(response_json).ok()?;
     let raw_id = value.get("rawId")?.as_str()?;
@@ -65,7 +65,7 @@ pub struct PrfAssertion {
 ///
 /// Three variants rather than one string, because the three send the user to
 /// three different places and only the caller knows where those are: an
-/// unlock offers the recovery code, while enabling encryption cannot.
+/// unlock offers the encryption key, while enabling encryption cannot.
 #[cfg(feature = "hydrate")]
 pub enum AssertionError {
     /// The ceremony itself failed — cancelled, unsupported, or refused by
@@ -74,7 +74,7 @@ pub enum AssertionError {
     Ceremony(String),
     /// The assertion succeeded and the authenticator returned no PRF output.
     /// Not an error in the ceremony: this authenticator or browser simply
-    /// cannot derive an encryption key.
+    /// cannot derive an unlock key.
     NoPrf,
     /// The response did not say which credential answered, so there is no
     /// way to know which wrap it corresponds to.
@@ -124,18 +124,18 @@ pub async fn assert_with_prf(user: &str) -> Result<PrfAssertion, AssertionError>
 }
 
 /// Turns an assertion failure into a sentence, for a caller with no
-/// recovery-code fallback to point at.
+/// encryption-key fallback to point at.
 ///
 /// `UnlockPrompt` deliberately does *not* use this: every failure there ends
-/// with "try your recovery code instead", which is the right advice for
-/// somebody shut out and the wrong advice on `/account`, where the recovery
-/// code is either not issued yet or not the thing that was asked for.
+/// with "try your encryption key instead", which is the right advice for
+/// somebody shut out and the wrong advice on `/account`, where the encryption
+/// key is either not issued yet or not the thing that was asked for.
 #[cfg(feature = "hydrate")]
 pub fn assertion_message(err: AssertionError) -> String {
     match err {
         AssertionError::Ceremony(message) => message,
-        AssertionError::NoPrf => "That passkey's authenticator didn't produce an encryption \
-                                  key on this browser. Try another passkey."
+        AssertionError::NoPrf => "That passkey's authenticator didn't produce an unlock key \
+                                  on this browser. Try another passkey."
             .to_string(),
         AssertionError::Unidentified => {
             "That passkey didn't identify itself to this browser, so there's no way to tell \
@@ -156,7 +156,7 @@ pub fn assertion_message(err: AssertionError) -> String {
 #[cfg(feature = "hydrate")]
 enum OpenedRoute {
     Passkey { prf_output: Vec<u8>, wrap: Vec<u8> },
-    Recovery { code: String, wrap: Vec<u8> },
+    EncryptionKey { key: String, wrap: Vec<u8> },
 }
 
 #[cfg(feature = "hydrate")]
@@ -164,7 +164,7 @@ impl OpenedRoute {
     fn opener(&self) -> Opener<'_> {
         match self {
             OpenedRoute::Passkey { prf_output, wrap } => Opener::Passkey { prf_output, wrap },
-            OpenedRoute::Recovery { code, wrap } => Opener::Recovery { code, wrap },
+            OpenedRoute::EncryptionKey { key, wrap } => Opener::EncryptionKey { key, wrap },
         }
     }
 
@@ -172,19 +172,18 @@ impl OpenedRoute {
     /// to open the key.
     ///
     /// A passkey's PRF output either derives the KEK or the authenticator
-    /// cannot do it at all, and there is nothing for the user to correct. A
-    /// recovery code is something they typed: telling them "couldn't derive
-    /// an unlock key" for a mistyped code would send them looking for a
-    /// fault in the passkey instead of in the twenty characters they just
-    /// entered.
+    /// cannot do it at all, and there is nothing for the user to correct. An
+    /// encryption key is something they typed: telling them "couldn't derive
+    /// an unlock key" for a mistyped one would send them looking for a fault
+    /// in the passkey instead of in the characters they just entered.
     fn rewrap_failed(&self, err: UnlockError) -> String {
         match (self, err) {
-            (OpenedRoute::Recovery { .. }, UnlockError::Malformed(_)) => {
-                "That doesn't look like a recovery code, so nothing was changed.".to_string()
+            (OpenedRoute::EncryptionKey { .. }, UnlockError::Malformed(_)) => {
+                "That doesn't look like an encryption key, so nothing was changed.".to_string()
             }
-            (OpenedRoute::Recovery { .. }, UnlockError::Crypto(_)) => {
-                "That recovery code didn't open your entries, so that passkey was left as it \
-                 was. Check the code and try again."
+            (OpenedRoute::EncryptionKey { .. }, UnlockError::Crypto(_)) => {
+                "That encryption key didn't open your entries, so that passkey was left as it \
+                 was. Check the key and try again."
                     .to_string()
             }
             (OpenedRoute::Passkey { .. }, _) => {
@@ -216,14 +215,14 @@ async fn open_existing_route(
                 wrap: route.wrapped_key,
             })
         }
-        KeySource::Recovery(code) => {
+        KeySource::EncryptionKey(key) => {
             let route = choose_route(wraps, None).ok_or_else(|| {
-                "This account has no recovery code on file, so there's nothing left to open \
+                "This account has no encryption key on file, so there's nothing left to open \
                  your entries with."
                     .to_string()
             })?;
-            Ok(OpenedRoute::Recovery {
-                code,
+            Ok(OpenedRoute::EncryptionKey {
+                key,
                 wrap: route.wrapped_key,
             })
         }
@@ -261,17 +260,17 @@ fn must_be_target(answered: &[u8], target: &[u8]) -> Result<(), String> {
 /// `wrapKey` needs the raw data key, and neither this device's keystore copy
 /// nor an unlocked [`super::SessionKey`] can produce it (invariant E5) — so
 /// an existing route has to be reopened in the moment. `source` says which
-/// one, and the recovery route is not a convenience: a user who lost every
-/// passkey and got back in with their code has no passkey opener to offer,
-/// so a passkey-only ceremony would leave that account unable to key the
-/// replacement passkey they just enrolled — recovery-code-only, on every
-/// device, for good. Recovering is meant to get somebody back in, not cost
-/// them the way back.
+/// one, and the encryption-key route is not a convenience: a user who lost
+/// every passkey and got back in with their encryption key has no passkey
+/// opener to offer, so a passkey-only ceremony would leave that account
+/// unable to key the replacement passkey they just enrolled —
+/// encryption-key-only, on every device, for good. Getting back in is meant
+/// to cost them nothing.
 ///
 /// The cost differs by route, which is why the panel names it before it
 /// starts. A passkey opener means two authenticator interactions here, three
 /// counting the credential's own creation, and there is no version with
-/// fewer. A recovery opener means one: the assertion against `target`.
+/// fewer. An encryption-key opener means one: the assertion against `target`.
 ///
 /// That assertion must answer with `target`. Filing the wrap under whichever
 /// credential happened to reply would leave `target` still keyless while
@@ -345,70 +344,72 @@ pub fn server_message(err: ServerFnError) -> String {
 /// The shape `commit_enable` already handles honestly, and the only other
 /// place in this feature where the client cannot tell a request that never
 /// arrived from a reply that was lost. Saying "couldn't reach the server"
-/// there asserts the safe outcome — and the unsafe one ends in a recovery
-/// code that opens nothing, discovered on the day every passkey is gone.
+/// there asserts the safe outcome — and the unsafe one ends in an encryption
+/// key that opens nothing, discovered on the day every passkey is gone.
 ///
 /// So it says it cannot tell, and says what to do about it. Both the unlock
 /// prompt and the `/account` panel show this, and both are beside a control
-/// offering to keep the current code; the sentence has to survive being read
+/// offering to keep the current key; the sentence has to survive being read
 /// next to that. Which means the copy it lands on has to admit the
-/// possibility rather than promise the old code still works — `unlock`'s
+/// possibility rather than promise the old key still works — `unlock`'s
 /// `Mode::OfferReissue` body and `encryption_panel`'s `REISSUE_WORDS.intro`
 /// are worded to leave room for this, and changing either back to a flat
 /// promise puts them in contradiction again.
 #[cfg(feature = "hydrate")]
-pub const REISSUE_UNCONFIRMED: &str = "We couldn't confirm the new recovery code was stored, and can't tell whether it \
+pub const REISSUE_UNCONFIRMED: &str = "We couldn't confirm the new encryption key was stored, and can't tell whether it \
      replaced the old one — so don't rely on either. While you still have a passkey \
-     that works, go to your account page and generate a new recovery code.";
+     that works, go to your account page and generate a new encryption key.";
 
-/// Stores a re-issued recovery wrap, retrying once with the identical bytes.
+/// Stores a re-issued encryption-key wrap, retrying once with the identical
+/// bytes.
 ///
 /// The failure this exists for is a *lost response*, not a lost request. If
 /// the replace commits and the reply never arrives, the client would report
-/// "couldn't reach the server" and leave the user believing their old code
-/// still works — while the server now holds a wrap derived from a code they
+/// "couldn't reach the server" and leave the user believing their old key
+/// still works — while the server now holds a wrap derived from a key they
 /// were never shown. They find out when they have lost every passkey and
-/// reach for the recovery code, at which point the entries are unreadable
+/// reach for the encryption key, at which point the entries are unreadable
 /// for good. Low probability, total consequence, and it defeats the one
 /// safety net the design rests on.
 ///
-/// `encryption_replace_recovery_wrap` is idempotent for a given wrap (see
+/// `encryption_replace_key_wrap` is idempotent for a given wrap (see
 /// its own doc), which is what makes a retry safe: the second call either
 /// finds the work already done or finishes it, and either way the account
-/// ends up holding the code the user is about to be shown.
+/// ends up holding the key the user is about to be shown.
 ///
 /// Two attempts that both fail leave the ambiguity unresolved, so the
 /// failure says so — [`REISSUE_UNCONFIRMED`], not the connection hint.
 #[cfg(feature = "hydrate")]
-async fn store_recovery_wrap(wrapped_key: Vec<u8>) -> Result<(), String> {
-    use crate::server_fns::encryption::encryption_replace_recovery_wrap;
+async fn store_encryption_key_wrap(wrapped_key: Vec<u8>) -> Result<(), String> {
+    use crate::server_fns::encryption::encryption_replace_key_wrap;
 
-    if let Err(first) = encryption_replace_recovery_wrap(wrapped_key.clone()).await {
-        error!("storing the re-issued recovery wrap failed, retrying once: {first}");
-        if let Err(second) = encryption_replace_recovery_wrap(wrapped_key).await {
-            error!("the retry failed too; the account's recovery wrap is unknown: {second}");
+    if let Err(first) = encryption_replace_key_wrap(wrapped_key.clone()).await {
+        error!("storing the re-issued encryption-key wrap failed, retrying once: {first}");
+        if let Err(second) = encryption_replace_key_wrap(wrapped_key).await {
+            error!("the retry failed too; the account's encryption-key wrap is unknown: {second}");
             return Err(REISSUE_UNCONFIRMED.to_string());
         }
     }
     Ok(())
 }
 
-/// Spec section 6.4's offer: wraps the data key under a fresh code and
-/// replaces the stored recovery wrap, returning the code to show once.
+/// Spec section 6.4's offer: wraps the data key under a fresh encryption key
+/// and replaces the stored wrap, returning the key to show once.
 ///
 /// `existing` is any route the caller can open right now — the only way to
 /// get the raw key back out, since a [`super::SessionKey`] cannot yield it
-/// (invariant E5). The old code keeps working until the server has replaced
+/// (invariant E5). The old key keeps working until the server has replaced
 /// the row, so a failure here costs the user nothing.
 /// Spec section 6.4's re-issue, run from `/account`, opened with whichever
 /// secret `source` names.
 ///
-/// The recovery route is not a convenience. An account whose passkeys are
-/// all keyless — which is exactly where a user lands after recovering with
-/// their code — has no passkey opener, so the passkey-only version of this
-/// spent an authenticator prompt to reach "that passkey can't open this
-/// account's entries" and left the code they had just typed somewhere
-/// careless as the account's only backup, with no way to replace it.
+/// The encryption-key route is not a convenience. An account whose passkeys
+/// are all keyless — which is exactly where a user lands after getting back
+/// in with their encryption key — has no passkey opener, so the passkey-only
+/// version of this spent an authenticator prompt to reach "that passkey can't
+/// open this account's entries" and left the key they had just typed
+/// somewhere careless as the account's only way in, with no way to replace
+/// it.
 ///
 /// The wraps are fetched before the authenticator is touched, the order
 /// every other ceremony here uses: a server that cannot answer sinks the
@@ -425,11 +426,11 @@ pub async fn reissue_with(user: &str, source: KeySource) -> Result<String, Strin
 
 #[cfg(feature = "hydrate")]
 pub async fn reissue(existing: &Opener<'_>) -> Result<String, String> {
-    let (new_code, new_wrap) = reissue_recovery(existing).await.map_err(|_| {
-        "Couldn't generate a new recovery code. Your current one still works.".to_string()
+    let (new_key, new_wrap) = reissue_encryption_key(existing).await.map_err(|_| {
+        "Couldn't generate a new encryption key. Your current one still works.".to_string()
     })?;
-    store_recovery_wrap(new_wrap).await?;
-    Ok(new_code)
+    store_encryption_key_wrap(new_wrap).await?;
+    Ok(new_key)
 }
 
 #[cfg(test)]

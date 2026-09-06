@@ -24,8 +24,17 @@ pub const WRAPPED_KEY_LEN: usize = 40;
 /// caller reaches an `info` string only by going through the route it
 /// belongs to, never by passing an arbitrary one in.
 const INFO_PASSKEY: &[u8] = b"tt/entry-kek/passkey/v1";
-/// HKDF `info` for the recovery-code route. See [`INFO_PASSKEY`].
-const INFO_RECOVERY: &[u8] = b"tt/entry-kek/recovery/v1";
+/// HKDF `info` for the encryption-key route. See [`INFO_PASSKEY`].
+///
+/// **The `recovery` in the byte string is deliberate and must stay.** It is
+/// the one place the old vocabulary survives: what the user saves was once
+/// called a recovery code, and every wrap ever written derives its KEK from
+/// these exact bytes. Changing them to match the new name would produce
+/// well-formed wraps that no device can open, with no error anywhere that
+/// says why — the failure invariant E6 exists to prevent. These strings are
+/// opaque domain separators that never reach a user, so the disagreement
+/// costs nothing; correcting it costs every account.
+const INFO_ENCRYPTION_KEY: &[u8] = b"tt/entry-kek/recovery/v1";
 
 /// The only KDF this build derives key-encryption keys with, and the value
 /// every stored row's `kdf` column must carry to be trusted.
@@ -64,8 +73,10 @@ pub const APP_SALT: &[u8; 32] = &[
 pub enum WrapKind {
     /// Unwrapped by a key derived from one credential's PRF output.
     Passkey,
-    /// Unwrapped by a key derived from the account's recovery code.
-    Recovery,
+    /// Unwrapped by a key derived from the account's encryption key — the
+    /// printable string its owner saved, and the only route on an account
+    /// whose authenticators cannot do PRF.
+    EncryptionKey,
 }
 
 impl WrapKind {
@@ -73,7 +84,7 @@ impl WrapKind {
     pub fn as_str(self) -> &'static str {
         match self {
             WrapKind::Passkey => "passkey",
-            WrapKind::Recovery => "recovery",
+            WrapKind::EncryptionKey => "encryption_key",
         }
     }
 
@@ -82,7 +93,7 @@ impl WrapKind {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "passkey" => Some(WrapKind::Passkey),
-            "recovery" => Some(WrapKind::Recovery),
+            "encryption_key" => Some(WrapKind::EncryptionKey),
             _ => None,
         }
     }
@@ -97,7 +108,7 @@ impl WrapKind {
     pub fn info(self) -> &'static [u8] {
         match self {
             WrapKind::Passkey => INFO_PASSKEY,
-            WrapKind::Recovery => INFO_RECOVERY,
+            WrapKind::EncryptionKey => INFO_ENCRYPTION_KEY,
         }
     }
 }
@@ -205,7 +216,7 @@ mod tests {
     #[test]
     fn derivation_inputs_are_pinned() {
         assert_eq!(INFO_PASSKEY, b"tt/entry-kek/passkey/v1");
-        assert_eq!(INFO_RECOVERY, b"tt/entry-kek/recovery/v1");
+        assert_eq!(INFO_ENCRYPTION_KEY, b"tt/entry-kek/recovery/v1");
         assert_eq!(ALG_V2, "a256gcm");
         assert_eq!(NONCE_LEN, 12);
         assert_eq!(WRAPPED_KEY_LEN, 40);
@@ -222,12 +233,12 @@ mod tests {
     #[test]
     fn each_kind_keeps_its_own_info_string() {
         assert_eq!(WrapKind::Passkey.info(), INFO_PASSKEY);
-        assert_eq!(WrapKind::Recovery.info(), INFO_RECOVERY);
+        assert_eq!(WrapKind::EncryptionKey.info(), INFO_ENCRYPTION_KEY);
     }
 
     #[test]
     fn as_str_and_parse_round_trip() {
-        for kind in [WrapKind::Passkey, WrapKind::Recovery] {
+        for kind in [WrapKind::Passkey, WrapKind::EncryptionKey] {
             assert_eq!(WrapKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(WrapKind::parse("bogus"), None);
@@ -387,7 +398,7 @@ mod tests {
         /// KEK would change and every stored wrap would stop opening — this
         /// pins the derivation, not just the constants.
         #[test]
-        fn passkey_and_recovery_derivations_differ_and_are_stable() {
+        fn the_two_routes_derivations_differ_and_are_stable() {
             use hkdf::Hkdf;
             use sha2::Sha256;
 
@@ -401,8 +412,11 @@ mod tests {
             };
 
             let passkey = derive(INFO_PASSKEY);
-            let recovery = derive(INFO_RECOVERY);
-            assert_ne!(passkey, recovery, "the two routes must not share a KEK");
+            let encryption_key = derive(INFO_ENCRYPTION_KEY);
+            assert_ne!(
+                passkey, encryption_key,
+                "the two routes must not share a KEK"
+            );
 
             // Pinned so a change to APP_SALT or the info strings fails loudly
             // here rather than silently in a browser.

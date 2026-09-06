@@ -8,6 +8,7 @@
 //! that is both load-bearing and pure — [`choose_route`], which says *which*
 //! stored wrap to open.
 
+pub mod encryption_key;
 /// The ceremony steps that need the authenticator and the server at once,
 /// shared by every component that runs one. `test` as well as `hydrate`:
 /// `flow::credential_id_from_response` is pure and host-tested, the same
@@ -18,7 +19,6 @@ pub mod flow;
 /// no host equivalent, so this module exists solely in the wasm bundle.
 #[cfg(feature = "hydrate")]
 pub mod keystore;
-pub mod recovery;
 /// The `SubtleCrypto` calls. Browser-only: WebCrypto has no host equivalent,
 /// so this module exists solely in the wasm bundle.
 #[cfg(feature = "hydrate")]
@@ -34,8 +34,9 @@ use crate::dto::WrapDto;
 
 #[cfg(feature = "hydrate")]
 pub use self::ceremony::{
-    Enabled, Opener, SessionKey, UnlockError, add_passkey_route, enable, enable_recovery_only,
-    reissue_recovery, unlock_with_prf, unlock_with_recovery,
+    Enabled, Opener, SessionKey, UnlockError, add_passkey_route, enable,
+    enable_encryption_key_only, reissue_encryption_key, unlock_with_encryption_key,
+    unlock_with_prf,
 };
 
 thread_local! {
@@ -133,9 +134,9 @@ pub enum SessionKey {}
 ///
 /// It is a choice the caller has to make because there is not always one to
 /// fall back on. A user who lost every passkey and got back in with their
-/// recovery code has no passkey that can open anything, so a ceremony that
+/// encryption key has no passkey that can open anything, so a ceremony that
 /// only ever asks a passkey would leave that account unable to key a new one
-/// — recovery-code-only, on every device, permanently. See
+/// — encryption-key-only, on every device, permanently. See
 /// [`flow::add_passkey_key`].
 ///
 /// Ungated, unlike `Opener` and the ceremonies that consume it: the panel's
@@ -145,8 +146,8 @@ pub enum SessionKey {}
 pub enum KeySource {
     /// Assert against an enrolled passkey that already holds a wrap.
     Passkey,
-    /// The recovery code, as the user typed it.
-    Recovery(String),
+    /// The account's encryption key, as the user typed it.
+    EncryptionKey(String),
 }
 
 /// The wrap this device is going to try to open, picked out of the rows the
@@ -162,7 +163,7 @@ pub struct WrapRoute {
     /// Which secret opens it, and so which HKDF `info` derives its KEK.
     pub kind: WrapKind,
     /// The credential whose PRF output derives the KEK, on a passkey route;
-    /// `None` on the recovery route.
+    /// `None` on the encryption-key route.
     pub credential_id: Option<Vec<u8>>,
     /// The wrapped data key itself.
     pub wrapped_key: Vec<u8>,
@@ -171,7 +172,7 @@ pub struct WrapRoute {
 /// Picks the wrap to open, given the credential that just asserted.
 ///
 /// `credential_id` is `Some` after a passkey assertion and `None` when the
-/// user is unlocking with a recovery code, and the two do not fall back to
+/// user is unlocking with their encryption key, and the two do not fall back to
 /// one another in either direction. A credential with no wrap of its own —
 /// enrolled before encryption was turned on, or living on an authenticator
 /// with no PRF — gets `None` rather than somebody else's wrap: its PRF
@@ -194,7 +195,7 @@ pub fn choose_route(wraps: &[WrapDto], credential_id: Option<&[u8]>) -> Option<W
         }
         let selected = match (kind, credential_id) {
             (WrapKind::Passkey, Some(id)) => wrap.credential_id.as_deref() == Some(id),
-            (WrapKind::Recovery, None) => true,
+            (WrapKind::EncryptionKey, None) => true,
             _ => false,
         };
         selected.then(|| WrapRoute {
@@ -210,8 +211,8 @@ pub fn choose_route(wraps: &[WrapDto], credential_id: Option<&[u8]>) -> Option<W
 #[cfg(feature = "hydrate")]
 mod ceremony {
     use super::Forgets;
+    use super::encryption_key::{self, EncryptionKeyError, KEY_BYTES};
     use super::keystore;
-    use super::recovery::{self, CODE_BYTES, RecoveryError};
     use super::subtle::{self, CryptoError, DataKey, Kek};
     use super::wire::{self, WrapKind};
 
@@ -328,10 +329,10 @@ mod ceremony {
     /// A stored wrap together with the secret that opens it.
     ///
     /// The two travel as one value because they have to correspond. A KEK
-    /// derived from the recovery code and pointed at a passkey's wrap fails
-    /// with the same authenticated-`unwrapKey` error as a wrong code, so
+    /// derived from the encryption key and pointed at a passkey's wrap fails
+    /// with the same authenticated-`unwrapKey` error as a wrong key, so
     /// mismatching them at a call site would produce a bug reported as "that
-    /// recovery code didn't work". Pairing them in the type removes the
+    /// encryption key didn't work". Pairing them in the type removes the
     /// chance.
     pub enum Opener<'a> {
         /// One credential's PRF output, against that credential's wrap.
@@ -339,15 +340,16 @@ mod ceremony {
             prf_output: &'a [u8],
             wrap: &'a [u8],
         },
-        /// A recovery code as the user typed it, against the recovery wrap.
-        Recovery { code: &'a str, wrap: &'a [u8] },
+        /// The encryption key as the user typed it, against the wrap it
+        /// opens.
+        EncryptionKey { key: &'a str, wrap: &'a [u8] },
     }
 
     impl Opener<'_> {
         /// The wrapped data key this opener unwraps.
         fn wrap(&self) -> &[u8] {
             match *self {
-                Opener::Passkey { wrap, .. } | Opener::Recovery { wrap, .. } => wrap,
+                Opener::Passkey { wrap, .. } | Opener::EncryptionKey { wrap, .. } => wrap,
             }
         }
     }
@@ -355,20 +357,20 @@ mod ceremony {
     /// A ceremony that had to open an existing wrap did not get there.
     #[derive(Debug, Clone, thiserror::Error)]
     pub enum UnlockError {
-        /// What the user typed is not a recovery code at all: the wrong
+        /// What the user typed is not an encryption key at all: the wrong
         /// number of characters, or a character outside the alphabet.
         ///
         /// Deliberately a separate variant from [`UnlockError::Crypto`].
-        /// "That doesn't look like a recovery code" and "that code isn't this
-        /// account's" send the user to two different places, and normalizing
-        /// is the only step that can tell them apart — past it, every failure
-        /// looks the same by design.
-        #[error("that doesn't look like a recovery code: {0}")]
-        Malformed(#[from] RecoveryError),
-        /// The derivation or the unwrap failed: a wrong recovery code, the
+        /// "That doesn't look like an encryption key" and "that key isn't
+        /// this account's" send the user to two different places, and
+        /// normalizing is the only step that can tell them apart — past it,
+        /// every failure looks the same by design.
+        #[error("that doesn't look like an encryption key: {0}")]
+        Malformed(#[from] EncryptionKeyError),
+        /// The derivation or the unwrap failed: a wrong encryption key, the
         /// wrong credential's wrap, a corrupt row, or a browser that could
         /// not do the operation at all. AES-KW authenticates, so the first
-        /// three are indistinguishable here — which is what makes the code
+        /// three are indistinguishable here — which is what makes the key
         /// safe to carry no checksum (spec section 6.4).
         #[error(transparent)]
         Crypto(#[from] CryptoError),
@@ -387,39 +389,39 @@ mod ceremony {
 
     /// Derives the key-encryption key that opens `opener`.
     ///
-    /// The recovery arm normalizes first, so a code that is not a code at all
-    /// is reported as such instead of being HKDF'd into a KEK that was never
-    /// going to open anything.
+    /// The encryption-key arm normalizes first, so a string that is not a key
+    /// at all is reported as such instead of being HKDF'd into a KEK that was
+    /// never going to open anything.
     async fn kek_for(opener: &Opener<'_>) -> Result<Kek, UnlockError> {
         let kek = match *opener {
             Opener::Passkey { prf_output, .. } => derive(WrapKind::Passkey, prf_output).await?,
-            Opener::Recovery { code, .. } => {
-                derive(WrapKind::Recovery, &recovery::normalize(code)?).await?
+            Opener::EncryptionKey { key, .. } => {
+                derive(WrapKind::EncryptionKey, &encryption_key::normalize(key)?).await?
             }
         };
         Ok(kek)
     }
 
-    /// A fresh recovery code and the bytes whose KEK wraps the data key.
+    /// A fresh encryption key and the bytes whose KEK wraps the data key.
     ///
     /// Both come from the same twenty random bytes, and the KEK is derived
     /// from `bytes` rather than by re-normalizing the string. That the two
-    /// agree — that the code the user types back derives this same KEK — is
-    /// `format_code` and `normalize` being exact inverses, which `recovery`'s
-    /// round-trip and known-answer tests pin.
-    fn new_recovery_code() -> Result<(String, [u8; CODE_BYTES]), CryptoError> {
+    /// agree — that the key the user types back derives this same KEK — is
+    /// `format_key` and `normalize` being exact inverses, which
+    /// `encryption_key`'s round-trip and known-answer tests pin.
+    fn new_encryption_key() -> Result<(String, [u8; KEY_BYTES]), CryptoError> {
         // The discarded `Err` payload is the random bytes themselves; the
         // message says only that the length was wrong.
-        let bytes: [u8; CODE_BYTES] = subtle::random_bytes(CODE_BYTES)?
+        let bytes: [u8; KEY_BYTES] = subtle::random_bytes(KEY_BYTES)?
             .try_into()
             .map_err(|_| CryptoError("getRandomValues returned the wrong length".to_string()))?;
-        Ok((recovery::format_code(&bytes), bytes))
+        Ok((encryption_key::format_key(&bytes), bytes))
     }
 
     /// Everything the enable ceremony produced.
     ///
     /// A struct rather than the tuple the plan sketched, because
-    /// `passkey_wrap` and `recovery_wrap` were both `Vec<u8>` and
+    /// `passkey_wrap` and `encryption_key_wrap` were both `Vec<u8>` and
     /// `encryption_enable` took them one after the other: swapping them at
     /// the call site would compile, file each wrap under the other's route,
     /// and leave the account openable by neither secret. The `Option` the
@@ -431,30 +433,30 @@ mod ceremony {
         /// this to `EncryptionCtx::unlock` once the server has confirmed.
         pub session_key: SessionKey,
         /// Shown once and never again (spec section 6.1 step 5).
-        pub recovery_code: String,
+        pub encryption_key: String,
         /// The data key wrapped under the enrolling credential's KEK, or
-        /// `None` on the recovery-code-only route — see
-        /// [`enable_recovery_only`].
+        /// `None` on the encryption-key-only route — see
+        /// [`enable_encryption_key_only`].
         pub passkey_wrap: Option<Vec<u8>>,
-        /// The data key wrapped under the recovery code's KEK. Never
-        /// optional: an account whose recovery code opens nothing is one no
+        /// The data key wrapped under the encryption key's KEK. Never
+        /// optional: an account whose encryption key opens nothing is one no
         /// lost passkey can be recovered from.
-        pub recovery_wrap: Vec<u8>,
+        pub encryption_key_wrap: Vec<u8>,
     }
 
     /// Generates the account's data key and wraps it under every route it is
     /// going to have (spec section 6.1 steps 2 and 3).
     ///
     /// `prf_output` is `Some` on the ordinary route and `None` on the
-    /// recovery-code-only one; everything else about the two is identical,
-    /// which is why they share this rather than each minting a code and a
-    /// key of their own. The recovery wrap is produced unconditionally.
+    /// encryption-key-only one; everything else about the two is identical,
+    /// which is why they share this rather than each minting a key and a data
+    /// key of their own. The encryption-key wrap is produced unconditionally.
     async fn enable_with(
         prf_output: Option<&[u8]>,
         user: &str,
         forgets: Forgets,
     ) -> Result<Enabled, CryptoError> {
-        let (recovery_code, code_bytes) = new_recovery_code()?;
+        let (encryption_key, key_bytes) = new_encryption_key()?;
 
         let raw_key = subtle::generate_dek_extractable().await?;
         let passkey_wrap = match prf_output {
@@ -464,8 +466,8 @@ mod ceremony {
             }
             None => None,
         };
-        let recovery_kek = derive(WrapKind::Recovery, &code_bytes).await?;
-        let recovery_wrap = subtle::wrap_dek(&raw_key, &recovery_kek).await?;
+        let encryption_key_kek = derive(WrapKind::EncryptionKey, &key_bytes).await?;
+        let encryption_key_wrap = subtle::wrap_dek(&raw_key, &encryption_key_kek).await?;
 
         // The extractable handle's whole life runs from `generate` above to
         // the `drop` below: generated, wrapped once per route, read out, and
@@ -482,9 +484,9 @@ mod ceremony {
 
         Ok(Enabled {
             session_key: SessionKey::held(user, key, forgets),
-            recovery_code,
+            encryption_key,
             passkey_wrap,
-            recovery_wrap,
+            encryption_key_wrap,
         })
     }
 
@@ -492,16 +494,16 @@ mod ceremony {
     ///
     /// `prf_output` is the PRF result of an assertion against the credential
     /// being enrolled; `user` is the signed-in identity the key belongs to.
-    /// The caller shows the recovery code and waits for the user to confirm
+    /// The caller shows the encryption key and waits for the user to confirm
     /// it, *then* sends the two wraps to `encryption_enable`, and then hands
-    /// the key to `EncryptionCtx::unlock`, which is where step 6's keystore
-    /// write happens.
+    /// the data key to `EncryptionCtx::unlock`, which is where step 6's
+    /// keystore write happens.
     ///
     /// So as shipped, spec section 6.1's steps run 1 → 2 → 3 → 5 → 4 → 6:
-    /// the caller holds step 5's code screen ahead of step 4's server call,
-    /// which is the one departure §6.1 is amended for. Ordering the code
+    /// the caller holds step 5's key screen ahead of step 4's server call,
+    /// which is the one departure §6.1 is amended for. Ordering the key
     /// screen first is what makes a lost response survivable — whichever way
-    /// the call went, the code in the user's hands is the account's.
+    /// the call went, the key in the user's hands is the account's.
     ///
     /// Nothing here reaches the keystore, deliberately. This function once
     /// wrote the record on the way past, before the account existed
@@ -521,7 +523,7 @@ mod ceremony {
         enable_with(Some(prf_output), user, forgets).await
     }
 
-    /// Turns encryption on with the recovery code as the account's *only*
+    /// Turns encryption on with the encryption key as the account's *only*
     /// route to its data key (spec section 6.1's second route).
     ///
     /// For an account that cannot take [`enable`] at all: the PRF extension
@@ -533,16 +535,16 @@ mod ceremony {
     ///
     /// The cost is real and belongs in the caller's copy, not softened here:
     /// there is no second wrap and no passkey to fall back on, so losing the
-    /// code loses the entries outright. It is not a dead end, though — a
-    /// PRF-capable passkey enrolled later is keyed from the recovery code
-    /// through [`add_passkey_route`], the same path a user who recovered
-    /// from a total passkey loss takes (spec section 6.5).
+    /// encryption key loses the entries outright. It is not a dead end,
+    /// though — a PRF-capable passkey enrolled later is keyed from the
+    /// encryption key through [`add_passkey_route`], the same path a user who
+    /// got back in after a total passkey loss takes (spec section 6.5).
     ///
     /// `forgets` is a parameter for consistency with [`enable`] rather than
     /// out of need: this route runs no assertion, so the caller's first await
     /// really is this call. Reading [`Forgets::now`] here would be correct
     /// today and silently wrong the day a caller awaits something first.
-    pub async fn enable_recovery_only(
+    pub async fn enable_encryption_key_only(
         user: &str,
         forgets: Forgets,
     ) -> Result<Enabled, CryptoError> {
@@ -585,17 +587,17 @@ mod ceremony {
         unlock(Opener::Passkey { prf_output, wrap }, user, forgets).await
     }
 
-    /// Unlocks with a typed recovery code (spec section 6.4).
+    /// Unlocks with a typed encryption key (spec section 6.4).
     ///
     /// Works on a browser with no PRF support at all, which is the point of
     /// the route. `forgets`: see [`unlock_with_prf`].
-    pub async fn unlock_with_recovery(
-        code: &str,
+    pub async fn unlock_with_encryption_key(
+        key: &str,
         wrap: &[u8],
         user: &str,
         forgets: Forgets,
     ) -> Result<SessionKey, UnlockError> {
-        unlock(Opener::Recovery { code, wrap }, user, forgets).await
+        unlock(Opener::EncryptionKey { key, wrap }, user, forgets).await
     }
 
     /// Re-wraps the account's data key under a new key-encryption key.
@@ -635,16 +637,21 @@ mod ceremony {
         rewrap(existing, WrapKind::Passkey, new_prf_output).await
     }
 
-    /// Issues a fresh recovery code and wraps the data key under it (6.4).
+    /// Issues a fresh encryption key and wraps the data key under it (6.4).
     ///
-    /// Returns the code to show once and the blob for
-    /// `encryption_replace_recovery_wrap`. Offered after a recovery unlock,
-    /// because the old code has just been typed and possibly left somewhere
-    /// careless; the old code keeps working until the server has replaced the
-    /// row, so declining costs the user nothing.
-    pub async fn reissue_recovery(existing: &Opener<'_>) -> Result<(String, Vec<u8>), UnlockError> {
-        let (code, bytes) = new_recovery_code()?;
-        Ok((code, rewrap(existing, WrapKind::Recovery, &bytes).await?))
+    /// Returns the key to show once and the blob for
+    /// `encryption_replace_key_wrap`. Offered after an unlock that used the
+    /// encryption key, because it has just been typed and possibly left
+    /// somewhere careless; the old key keeps working until the server has
+    /// replaced the row, so declining costs the user nothing.
+    pub async fn reissue_encryption_key(
+        existing: &Opener<'_>,
+    ) -> Result<(String, Vec<u8>), UnlockError> {
+        let (key, bytes) = new_encryption_key()?;
+        Ok((
+            key,
+            rewrap(existing, WrapKind::EncryptionKey, &bytes).await?,
+        ))
     }
 }
 
@@ -711,7 +718,7 @@ mod tests {
         let rows = vec![
             wrap(WrapKind::Passkey, Some(b"cred-a"), 1),
             wrap(WrapKind::Passkey, Some(b"cred-b"), 2),
-            wrap(WrapKind::Recovery, None, 3),
+            wrap(WrapKind::EncryptionKey, None, 3),
         ];
         let chosen = choose_route(&rows, Some(b"cred-b")).expect("route");
         assert_eq!(chosen.credential_id.as_deref(), Some(&b"cred-b"[..]));
@@ -725,24 +732,24 @@ mod tests {
     fn a_credential_with_no_wrap_has_no_route() {
         let rows = vec![
             wrap(WrapKind::Passkey, Some(b"cred-a"), 1),
-            wrap(WrapKind::Recovery, None, 2),
+            wrap(WrapKind::EncryptionKey, None, 2),
         ];
         assert!(choose_route(&rows, Some(b"unknown")).is_none());
     }
 
     #[test]
-    fn no_credential_selects_the_recovery_route() {
+    fn no_credential_selects_the_encryption_key_route() {
         let rows = vec![
             wrap(WrapKind::Passkey, Some(b"cred-a"), 1),
-            wrap(WrapKind::Recovery, None, 2),
+            wrap(WrapKind::EncryptionKey, None, 2),
         ];
         let chosen = choose_route(&rows, None).expect("route");
-        assert_eq!(chosen.kind, WrapKind::Recovery);
+        assert_eq!(chosen.kind, WrapKind::EncryptionKey);
         assert_eq!(chosen.wrapped_key, vec![2; wire::WRAPPED_KEY_LEN]);
     }
 
     #[test]
-    fn an_account_with_no_recovery_wrap_has_no_recovery_route() {
+    fn an_account_with_no_encryption_key_wrap_has_no_such_route() {
         let rows = vec![wrap(WrapKind::Passkey, Some(b"cred-a"), 1)];
         assert!(choose_route(&rows, None).is_none());
     }
@@ -751,17 +758,17 @@ mod tests {
     /// treating an unknown kind as one of the two known ones — would derive
     /// under the wrong `info` and fail as a corrupt row.
     ///
-    /// Covers both wrong defaults, not just one: a recovery-shaped row with
-    /// an unrecognized `kind` would slip past an implementation that defaults
-    /// to `WrapKind::Recovery`, and a passkey-shaped row whose credential
+    /// Covers both wrong defaults, not just one: an encryption-key-shaped row
+    /// with an unrecognized `kind` would slip past an implementation that defaults
+    /// to `WrapKind::EncryptionKey`, and a passkey-shaped row whose credential
     /// matches the query would slip past one that defaults to
     /// `WrapKind::Passkey`.
     #[test]
     fn a_row_of_an_unrecognized_kind_is_skipped() {
-        let mut recovery_shaped = wrap(WrapKind::Recovery, None, 1);
-        recovery_shaped.kind = "future".to_string();
-        assert!(choose_route(&[recovery_shaped.clone()], None).is_none());
-        assert!(choose_route(&[recovery_shaped], Some(b"cred-a")).is_none());
+        let mut key_shaped = wrap(WrapKind::EncryptionKey, None, 1);
+        key_shaped.kind = "future".to_string();
+        assert!(choose_route(&[key_shaped.clone()], None).is_none());
+        assert!(choose_route(&[key_shaped], Some(b"cred-a")).is_none());
 
         let mut passkey_shaped = wrap(WrapKind::Passkey, Some(b"cred-x"), 2);
         passkey_shaped.kind = "future".to_string();
@@ -787,7 +794,7 @@ mod tests {
     /// use (spec section 5.2).
     #[test]
     fn a_row_with_an_unrecognized_kdf_is_skipped() {
-        let mut rows = vec![wrap(WrapKind::Recovery, None, 1)];
+        let mut rows = vec![wrap(WrapKind::EncryptionKey, None, 1)];
         rows[0].kdf = "future-kdf".to_string();
         assert!(choose_route(&rows, None).is_none());
     }
@@ -795,7 +802,7 @@ mod tests {
     /// The same, for `wrap_alg`.
     #[test]
     fn a_row_with_an_unrecognized_wrap_alg_is_skipped() {
-        let mut rows = vec![wrap(WrapKind::Recovery, None, 1)];
+        let mut rows = vec![wrap(WrapKind::EncryptionKey, None, 1)];
         rows[0].wrap_alg = "future-wrap-alg".to_string();
         assert!(choose_route(&rows, None).is_none());
     }

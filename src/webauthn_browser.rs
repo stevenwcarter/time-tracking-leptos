@@ -236,7 +236,7 @@ mod browser {
     ///
     /// `toJSON()` omits extension results, so this has to come from
     /// `getClientExtensionResults()` separately. Phase 1 only records the
-    /// answer; phase 2 derives an encryption key from PRF output on
+    /// answer; phase 2 derives an unlock key from PRF output on
     /// credentials where this was true (spec section 9.3).
     ///
     /// Only "can we reach the results at all" lives here — a missing
@@ -342,7 +342,7 @@ mod browser {
     /// yield `Ok((json, None))` and let sign-in complete. This same call
     /// performs the sign-in: failing it because PRF was unavailable would
     /// lock the user out of the application, where `None` only lands them in
-    /// a locked session they can open with their recovery code.
+    /// a locked session they can open with their encryption key.
     ///
     /// **The extension is set here, on the parsed options object, and not in
     /// the server's challenge JSON.** Browser support for `prf.eval` inside
@@ -476,7 +476,7 @@ mod tests {
     /// Both are raised by `server_fns::passkey`/`server_fns::encryption` and
     /// reach the user through `account_page::passkey_error`, which runs them
     /// through here. Collapsing the first would replace "removing this would
-    /// lock you out — use your recovery code" with "please try again", and
+    /// lock you out — use your encryption key" with "please try again", and
     /// the user would try again until the passkey was gone. Kept in its own
     /// test, rather than folded into `server_messages_pass_through` above,
     /// because these two are the ones where the generic fallback is
@@ -493,7 +493,7 @@ mod tests {
         for raw in [
             // `server_fns::passkey::passkey_delete`, spec section 6.6.
             "This is your last passkey that can unlock your encrypted entries. \
-             Removing it would lock you out for good — use your recovery code, \
+             Removing it would lock you out for good — use your encryption key, \
              or add another passkey first.",
             // `server_fns::encryption::encryption_enable`.
             "Encryption is already enabled for this account.",

@@ -29,7 +29,7 @@
 //!    A private window, cleared site data, IndexedDB switched off, an open
 //!    blocked by another connection — all of these are ordinary, and all of
 //!    them must land the session on `Locked` with an unlock prompt. The user
-//!    still has their passkey and their recovery code; a panic would take
+//!    still has their passkey and their encryption key; a panic would take
 //!    both away from them.
 //! 3. [`put`] and [`clear`] await the transaction's `complete` event, not
 //!    the request's `success` (see [`write`]). An aborted transaction is

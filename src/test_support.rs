@@ -347,30 +347,33 @@ impl SessionClient {
         &self,
         passkey_wrap: &[u8],
         credential_id: &[u8],
-        recovery_wrap: &[u8],
+        encryption_key_wrap: &[u8],
     ) -> Result<(), String> {
         self.call_bytes(
             "encryption/enable",
             &[
                 ("passkey[credential_id]", credential_id),
                 ("passkey[wrapped_key]", passkey_wrap),
-                ("recovery_wrap", recovery_wrap),
+                ("encryption_key_wrap", encryption_key_wrap),
             ],
         )
         .await
     }
 
-    /// Turns encryption on with the recovery wrap alone (spec section 6.1's
-    /// second route), by omitting the `passkey` field entirely rather than
-    /// sending it empty. That absence is what the server reads as "no
+    /// Turns encryption on with the encryption-key wrap alone (spec section
+    /// 6.1's second route), by omitting the `passkey` field entirely rather
+    /// than sending it empty. That absence is what the server reads as "no
     /// passkey wrap", so a test posting an empty field would be exercising a
     /// different case than the browser produces.
-    pub async fn encryption_enable_recovery_only(
+    pub async fn encryption_enable_key_only(
         &self,
-        recovery_wrap: &[u8],
+        encryption_key_wrap: &[u8],
     ) -> Result<(), String> {
-        self.call_bytes("encryption/enable", &[("recovery_wrap", recovery_wrap)])
-            .await
+        self.call_bytes(
+            "encryption/enable",
+            &[("encryption_key_wrap", encryption_key_wrap)],
+        )
+        .await
     }
 
     /// Adds a wrap for a newly enrolled passkey.
@@ -389,10 +392,10 @@ impl SessionClient {
         .await
     }
 
-    /// Re-issues this account's recovery wrap.
-    pub async fn encryption_replace_recovery_wrap(&self, wrapped_key: &[u8]) -> Result<(), String> {
+    /// Re-issues this account's encryption-key wrap.
+    pub async fn encryption_replace_key_wrap(&self, wrapped_key: &[u8]) -> Result<(), String> {
         self.call_bytes(
-            "encryption/replace_recovery_wrap",
+            "encryption/replace_key_wrap",
             &[("wrapped_key", wrapped_key)],
         )
         .await

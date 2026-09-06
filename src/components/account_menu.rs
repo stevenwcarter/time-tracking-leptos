@@ -305,7 +305,7 @@ async fn run_passkey_login(typed_email: String) -> Result<(), String> {
     // back. An authenticator with no PRF, a browser that ignored the
     // extension, or a result in a shape this build did not expect all arrive
     // here as `None` — see `authenticate_with_prf` — and all of them are an
-    // ordinary sign-in that lands in a `Locked` session the recovery code
+    // ordinary sign-in that lands in a `Locked` session the encryption key
     // opens. Turning any of them into an error would lock the user out of
     // the application itself, which is a far worse failure than the one this
     // feature exists to prevent.
@@ -386,7 +386,7 @@ async fn unlock_after_sign_in(credential_json: &str, prf_output: &[u8]) {
         // The credential signs in but has no wrap of its own: enrolled
         // before encryption was turned on, or its keying step never
         // finished. `/account` labels it, and the unlock prompt offers the
-        // recovery code — neither is this function's business.
+        // encryption key — neither is this function's business.
         return;
     };
     // The key is never published anywhere — signing in reloads the page —

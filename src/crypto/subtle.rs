@@ -2,7 +2,7 @@
 //!
 //! **Not covered by any automated test.** WebCrypto exists only in a browser
 //! and this project has no wasm test runner. Everything decidable without a
-//! browser was pushed into [`super::wire`] and [`super::recovery`], which are
+//! browser was pushed into [`super::wire`] and [`super::encryption_key`], which are
 //! host-tested; what is left here is the calls themselves. The wire format
 //! they produce *is* pinned, by `wire`'s cross-implementation tests against
 //! the `aes-gcm` crate — so a format error fails on the host. What only a
@@ -28,7 +28,7 @@
 //! `navigator.credentials`. That keeps this feature's `web-sys` growth to the
 //! IndexedDB types the keystore needs (spec section 7.2).
 //!
-//! No error here carries key material, PRF output, a recovery code, or
+//! No error here carries key material, PRF output, an encryption key, or
 //! plaintext. A failure names the operation and repeats what the browser
 //! said about it; it never repeats the operation's inputs. See [`failed`] for
 //! why the browser's own words are safe to keep and what would change that.
@@ -186,7 +186,7 @@ fn js_array(items: &[&JsValue]) -> Array {
 /// into, so the reasoning is worth stating:
 ///
 /// - Every secret this module handles crosses into JS as a `Uint8Array`
-///   BufferSource: key material, PRF output, recovery-code bytes, entry
+///   BufferSource: key material, PRF output, encryption-key bytes, entry
 ///   plaintext. The strings passed to WebCrypto are all compile-time
 ///   constants — `"raw"`, `"AES-GCM"`, `"AES-KW"`, `"HKDF"`, `"SHA-256"`,
 ///   the usage names. IndexedDB, via [`super::keystore`], additionally
@@ -307,14 +307,14 @@ fn as_bytes(operation: &str, resolved: JsValue) -> Result<Vec<u8>, CryptoError> 
 /// `crypto.getRandomValues(new Uint8Array(n))`.
 ///
 /// The only source of randomness in this crate's browser half: the AES-GCM
-/// nonce in [`seal`] and the recovery code's entropy both come from here.
+/// nonce in [`seal`] and an encryption key's entropy both come from here.
 /// Unlike everything else here it does not go through [`subtle`], so it works
 /// in an insecure context too.
 ///
 /// Only sane lengths are `Err`-safe. `Uint8Array::new_with_length` is not a
 /// `catch` import, so a length the JS engine refuses to allocate throws
 /// across the wasm boundary instead of returning `Err`. The two call sites
-/// ask for [`NONCE_LEN`] and [`super::recovery::CODE_BYTES`] — 12 and 20
+/// ask for [`NONCE_LEN`] and [`super::encryption_key::KEY_BYTES`] — 12 and 20
 /// bytes — so nothing here comes near that bound.
 pub fn random_bytes(n: usize) -> Result<Vec<u8>, CryptoError> {
     let length =
@@ -366,7 +366,7 @@ pub async fn import_dek_non_extractable(raw: &[u8]) -> Result<DataKey, CryptoErr
 }
 
 /// Derives a key-encryption key from input keying material — a passkey's PRF
-/// output, or a recovery code — with HKDF-SHA256.
+/// output, or an encryption key — with HKDF-SHA256.
 ///
 /// ```js
 /// const k = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveKey"]);
@@ -449,9 +449,9 @@ pub async fn wrap_dek(dek: &RawDataKey, kek: &Kek) -> Result<Vec<u8>, CryptoErro
 /// The `extractable` argument is not a parameter: the two public wrappers
 /// below each pass their own, and their return types say which they passed.
 ///
-/// AES-KW is authenticated, so the wrong KEK — a wrong recovery code, the
+/// AES-KW is authenticated, so the wrong KEK — a wrong encryption key, the
 /// wrong credential's wrap — fails here cleanly instead of yielding a key
-/// that decrypts to garbage. That is why the recovery code carries no
+/// that decrypts to garbage. That is why the encryption key carries no
 /// checksum (spec section 6.4).
 async fn unwrap_key(
     wrapped: &[u8],

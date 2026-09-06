@@ -3,8 +3,8 @@
 //! Every function here handles opaque bytes end to end: none can derive a
 //! data key, and none reads an entry body (spec section 7.6, invariant E1).
 //! The repository underneath (`entry_key::store`) owns the schema-level
-//! invariants (one recovery wrap, a wrap per credential); this module's own
-//! job is authorization — whose wraps these are, and the one refusal spec
+//! invariants (one encryption-key wrap, a wrap per credential); this module's
+//! own job is authorization — whose wraps these are, and the one refusal spec
 //! section 6.6 requires.
 
 use leptos::prelude::*;
@@ -63,30 +63,31 @@ pub async fn encryption_wraps() -> Result<Vec<WrapDto>, ServerFnError> {
 /// Turns encryption on: one transaction that marks the account and inserts
 /// its starting wraps (spec section 6.1 step 4).
 ///
-/// `passkey` is optional and `recovery_wrap` is not, which is the asymmetry
-/// spec section 6.1's two routes have. An account with a PRF-capable passkey
-/// sends both and can open its key either way; an account whose
-/// authenticators cannot produce a PRF output — a browser extension with no
-/// PRF support, say — sends the recovery wrap alone and has exactly one way
-/// in, forever. There is no third case: a wrap the recovery code cannot open
-/// is an account nothing can rescue, so the recovery half is never optional.
+/// `passkey` is optional and `encryption_key_wrap` is not, which is the
+/// asymmetry spec section 6.1's two routes have. An account with a
+/// PRF-capable passkey sends both and can open its key either way; an account
+/// whose authenticators cannot produce a PRF output — a browser extension
+/// with no PRF support, say — sends the encryption-key wrap alone and has
+/// exactly one way in, forever. There is no third case: a wrap the encryption
+/// key cannot open is an account nothing can rescue, so that half is never
+/// optional.
 ///
 /// The schema already permits the one-wrap shape without a migration:
 /// `entry_key_wrap.credential_id` is nullable and both unique indexes are
-/// partial, so zero passkey wraps beside one recovery wrap is a state it
-/// describes rather than tolerates.
+/// partial, so zero passkey wraps beside one encryption-key wrap is a state
+/// it describes rather than tolerates.
 ///
 /// Errors if `encrypted_at` is already set, checked inside the same
 /// transaction as the writes rather than before it — a double-submit must
 /// see one consistent account state, not a check and a write that could
 /// straddle two different ones. That guard is on `encrypted_at` and not on
-/// the wraps, so it holds identically for both routes: a second call at a
-/// recovery-only account would otherwise be the *first* insert of a passkey
-/// wrap and collide with nothing.
+/// the wraps, so it holds identically for both routes: a second call at an
+/// encryption-key-only account would otherwise be the *first* insert of a
+/// passkey wrap and collide with nothing.
 #[server(endpoint = "encryption/enable")]
 pub async fn encryption_enable(
     passkey: Option<PasskeyWrapDto>,
-    recovery_wrap: Vec<u8>,
+    encryption_key_wrap: Vec<u8>,
 ) -> Result<(), ServerFnError> {
     use diesel::prelude::*;
 
@@ -119,7 +120,13 @@ pub async fn encryption_enable(
                     &passkey.wrapped_key,
                 )?;
             }
-            store::insert_wrap(conn, me.id, WrapKind::Recovery, None, &recovery_wrap)?;
+            store::insert_wrap(
+                conn,
+                me.id,
+                WrapKind::EncryptionKey,
+                None,
+                &encryption_key_wrap,
+            )?;
             Ok(Ok(()))
         })
         .map_err(super::log_and_fail(
@@ -203,18 +210,19 @@ pub async fn encryption_add_passkey_wrap(
     ))
 }
 
-/// Re-issues the recovery wrap after a recovery unlock (spec section 6.4).
-/// `entry_key::store::replace_recovery_wrap` already deletes-then-inserts in
-/// its own transaction, so there is nothing more to wrap here.
+/// Re-issues the account's encryption-key wrap (spec section 6.4).
+/// `entry_key::store::replace_encryption_key_wrap` already
+/// deletes-then-inserts in its own transaction, so there is nothing more to
+/// wrap here.
 ///
 /// Idempotent for a given `wrapped_key`, which the store guarantees rather
 /// than this layer: a client whose first response was lost may resend the
 /// same bytes and will be told it succeeded. Without that, a reply dropped
-/// after a successful replace leaves the user holding a recovery code that
+/// after a successful replace leaves the user holding an encryption key that
 /// no longer opens anything, believing it does — the one failure in this
 /// design that ends in permanently unreadable entries.
-#[server(endpoint = "encryption/replace_recovery_wrap")]
-pub async fn encryption_replace_recovery_wrap(wrapped_key: Vec<u8>) -> Result<(), ServerFnError> {
+#[server(endpoint = "encryption/replace_key_wrap")]
+pub async fn encryption_replace_key_wrap(wrapped_key: Vec<u8>) -> Result<(), ServerFnError> {
     use crate::entry_key::store;
 
     let (ctx, me) = super::require_user()?;
@@ -222,8 +230,8 @@ pub async fn encryption_replace_recovery_wrap(wrapped_key: Vec<u8>) -> Result<()
         .conn()
         .map_err(super::log_and_fail("conn", "Internal server error"))?;
 
-    store::replace_recovery_wrap(&mut conn, me.id, &wrapped_key).map_err(super::log_and_fail(
-        "replace recovery wrap",
+    store::replace_encryption_key_wrap(&mut conn, me.id, &wrapped_key).map_err(super::log_and_fail(
+        "replace encryption key wrap",
         "Internal server error",
     ))
 }

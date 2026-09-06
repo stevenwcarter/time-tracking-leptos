@@ -30,7 +30,7 @@ fn set_cookie(value: String) {
 ///    stored registration state is unaffected; verification works either way.
 /// 2. `extensions.prf`. Requesting PRF is only possible at *creation* time,
 ///    and webauthn-rs 0.6 has no typed API for it. Phase 1 ignores the
-///    result; phase 2 derives an encryption key from it. Without this, every
+///    result; phase 2 derives an unlock key from it. Without this, every
 ///    passkey enrolled now would have to be deleted and re-added later
 ///    (spec section 9.3).
 #[cfg(feature = "ssr")]
@@ -425,7 +425,7 @@ pub async fn passkey_rename(id: i32, name: String) -> Result<(), ServerFnError> 
 ///
 /// Refuses to remove the account's last passkey-unlock wrap while the
 /// account is encrypted (spec section 6.6): without this, a user with one
-/// passkey and a lost recovery code could destroy their own data with a
+/// passkey and a lost encryption key could destroy their own data with a
 /// single click and no way back in. The check and both deletes share one
 /// transaction, so a second concurrent delete cannot slip through between
 /// the check and the write.
@@ -465,7 +465,7 @@ pub async fn passkey_delete(id: i32) -> Result<(), ServerFnError> {
             if encrypted && this_credential_has_a_wrap && passkey_wrap_count <= 1 {
                 return Ok(Err(
                     "This is your last passkey that can unlock your encrypted entries. \
-                     Removing it would lock you out for good — use your recovery code, \
+                     Removing it would lock you out for good — use your encryption key, \
                      or add another passkey first.",
                 ));
             }

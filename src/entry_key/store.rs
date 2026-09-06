@@ -56,7 +56,7 @@ struct NewWrap<'a> {
     created_at: NaiveDateTime,
 }
 
-/// Inserts a row without its own transaction, so [`replace_recovery_wrap`]
+/// Inserts a row without its own transaction, so [`replace_encryption_key_wrap`]
 /// can share it with a preceding delete.
 fn insert_row(
     conn: &mut DbConn,
@@ -164,26 +164,30 @@ pub fn delete_wrap_for_credential(
     Ok(())
 }
 
-/// Replaces the account's recovery wrap, leaving exactly one. Re-issuing a
-/// recovery code must not accumulate rows — only the newest one should ever
-/// open the data key.
+/// Replaces the account's encryption-key wrap, leaving exactly one.
+/// Re-issuing an encryption key must not accumulate rows — only the newest
+/// one should ever open the data key.
 ///
 /// **Idempotent for a given `wrapped_key`**: submitting the wrap the account
 /// already holds reports success without touching the row. That is what
 /// makes the client's retry safe, and the client needs one — a reply lost on
 /// the way back from a successful replace would otherwise leave the user
-/// believing the code they still hold works, when the server had already
-/// swapped it for a code they were never shown (see
-/// `components::unlock`'s `store_recovery_wrap`).
+/// believing the key they still hold works, when the server had already
+/// swapped it for a key they were never shown (see
+/// `components::unlock`'s `store_encryption_key_wrap`).
 ///
 /// The comparison runs inside the same transaction as the write it might
 /// skip, so a concurrent re-issue cannot land between them and turn "already
 /// done" into a lie.
-pub fn replace_recovery_wrap(conn: &mut DbConn, user_id: i32, wrapped_key: &[u8]) -> Result<()> {
+pub fn replace_encryption_key_wrap(
+    conn: &mut DbConn,
+    user_id: i32,
+    wrapped_key: &[u8],
+) -> Result<()> {
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
         let current: Option<Vec<u8>> = entry_key_wrap::table
             .filter(entry_key_wrap::user_id.eq(user_id))
-            .filter(entry_key_wrap::kind.eq(WrapKind::Recovery.as_str()))
+            .filter(entry_key_wrap::kind.eq(WrapKind::EncryptionKey.as_str()))
             .select(entry_key_wrap::wrapped_key)
             .first(conn)
             .optional()?;
@@ -193,17 +197,17 @@ pub fn replace_recovery_wrap(conn: &mut DbConn, user_id: i32, wrapped_key: &[u8]
         diesel::delete(
             entry_key_wrap::table
                 .filter(entry_key_wrap::user_id.eq(user_id))
-                .filter(entry_key_wrap::kind.eq(WrapKind::Recovery.as_str())),
+                .filter(entry_key_wrap::kind.eq(WrapKind::EncryptionKey.as_str())),
         )
         .execute(conn)?;
-        insert_row(conn, user_id, WrapKind::Recovery, None, wrapped_key)
+        insert_row(conn, user_id, WrapKind::EncryptionKey, None, wrapped_key)
     })
-    .context("replace recovery wrap")
+    .context("replace encryption key wrap")
 }
 
 /// How many passkey-unlockable wraps the account has. Used to decide
 /// whether disabling a passkey would leave the account with no way in
-/// short of the recovery code.
+/// short of the encryption key.
 pub fn passkey_wrap_count(conn: &mut DbConn, user_id: i32) -> Result<i64> {
     entry_key_wrap::table
         .filter(entry_key_wrap::user_id.eq(user_id))
@@ -250,7 +254,7 @@ mod tests {
         let (mut conn, uid) = seed();
         set_encrypted(&mut conn, uid).expect("mark");
         insert_wrap(&mut conn, uid, WrapKind::Passkey, Some(b"cred-1"), &[7; 40]).expect("passkey");
-        insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[9; 40]).expect("recovery");
+        insert_wrap(&mut conn, uid, WrapKind::EncryptionKey, None, &[9; 40]).expect("key");
 
         assert!(is_encrypted(&mut conn, uid).expect("query"));
         let wraps = list_wraps(&mut conn, uid).expect("list");
@@ -277,64 +281,64 @@ mod tests {
         insert_wrap(&mut conn, b, WrapKind::Passkey, Some(b"cred-1"), &[8; 40]).expect("b");
     }
 
-    /// Several recovery rows would make "which one does the code open?"
+    /// Several encryption-key rows would make "which one does the key open?"
     /// ambiguous. Re-issuing replaces rather than accumulates.
     #[test]
-    fn replacing_the_recovery_wrap_leaves_exactly_one() {
+    fn replacing_the_encryption_key_wrap_leaves_exactly_one() {
         let (mut conn, uid) = seed();
-        insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[1; 40]).expect("first");
-        replace_recovery_wrap(&mut conn, uid, &[2; 40]).expect("replace");
+        insert_wrap(&mut conn, uid, WrapKind::EncryptionKey, None, &[1; 40]).expect("first");
+        replace_encryption_key_wrap(&mut conn, uid, &[2; 40]).expect("replace");
 
-        let recovery: Vec<_> = list_wraps(&mut conn, uid)
+        let rows: Vec<_> = list_wraps(&mut conn, uid)
             .expect("list")
             .into_iter()
-            .filter(|w| w.kind == WrapKind::Recovery)
+            .filter(|w| w.kind == WrapKind::EncryptionKey)
             .collect();
-        assert_eq!(recovery.len(), 1);
-        assert_eq!(recovery[0].wrapped_key, vec![2; 40]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].wrapped_key, vec![2; 40]);
     }
 
     /// The lost-response failure mode, from the server's side. A client that
     /// never learned whether its submit landed must be able to send the same
     /// wrap again: the retry has to *succeed* — reporting failure would send
-    /// the user back to a screen telling them their old code still works,
+    /// the user back to a screen telling them their old key still works,
     /// after this row had already been replaced — and it has to leave one
     /// row, not two.
     #[test]
-    fn resubmitting_the_same_recovery_wrap_succeeds_and_leaves_one_row() {
+    fn resubmitting_the_same_key_wrap_succeeds_and_leaves_one_row() {
         let (mut conn, uid) = seed();
-        insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[1; 40]).expect("first");
-        replace_recovery_wrap(&mut conn, uid, &[2; 40]).expect("replace");
-        replace_recovery_wrap(&mut conn, uid, &[2; 40]).expect("the retry must succeed");
+        insert_wrap(&mut conn, uid, WrapKind::EncryptionKey, None, &[1; 40]).expect("first");
+        replace_encryption_key_wrap(&mut conn, uid, &[2; 40]).expect("replace");
+        replace_encryption_key_wrap(&mut conn, uid, &[2; 40]).expect("the retry must succeed");
 
-        let recovery: Vec<_> = list_wraps(&mut conn, uid)
+        let rows: Vec<_> = list_wraps(&mut conn, uid)
             .expect("list")
             .into_iter()
-            .filter(|w| w.kind == WrapKind::Recovery)
+            .filter(|w| w.kind == WrapKind::EncryptionKey)
             .collect();
-        assert_eq!(recovery.len(), 1, "a retry must not accumulate rows");
-        assert_eq!(recovery[0].wrapped_key, vec![2; 40]);
+        assert_eq!(rows.len(), 1, "a retry must not accumulate rows");
+        assert_eq!(rows[0].wrapped_key, vec![2; 40]);
     }
 
-    /// The schema, not just `replace_recovery_wrap`'s convention, must stop a
-    /// second recovery row from ever existing — a caller that inserts
-    /// directly instead of replacing would otherwise leave two, and "which
-    /// one does the code open?" becomes ambiguous.
+    /// The schema, not just `replace_encryption_key_wrap`'s convention, must
+    /// stop a second encryption-key row from ever existing — a caller that
+    /// inserts directly instead of replacing would otherwise leave two, and
+    /// "which one does the key open?" becomes ambiguous.
     #[test]
-    fn a_second_recovery_wrap_is_rejected() {
+    fn a_second_encryption_key_wrap_is_rejected() {
         let (mut conn, uid) = seed();
-        insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[1; 40]).expect("first");
-        assert!(insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[2; 40]).is_err());
+        insert_wrap(&mut conn, uid, WrapKind::EncryptionKey, None, &[1; 40]).expect("first");
+        assert!(insert_wrap(&mut conn, uid, WrapKind::EncryptionKey, None, &[2; 40]).is_err());
     }
 
-    /// The one-recovery-row index is per user, not global — two accounts
-    /// must each be able to hold their own recovery wrap.
+    /// The one-row index is per user, not global — two accounts must each be
+    /// able to hold their own encryption-key wrap.
     #[test]
-    fn the_recovery_index_is_scoped_to_one_user() {
+    fn the_encryption_key_index_is_scoped_to_one_user() {
         let (mut conn, a) = seed();
         let b = seed_another_user(&mut conn);
-        insert_wrap(&mut conn, a, WrapKind::Recovery, None, &[1; 40]).expect("a");
-        insert_wrap(&mut conn, b, WrapKind::Recovery, None, &[2; 40]).expect("b");
+        insert_wrap(&mut conn, a, WrapKind::EncryptionKey, None, &[1; 40]).expect("a");
+        insert_wrap(&mut conn, b, WrapKind::EncryptionKey, None, &[2; 40]).expect("b");
     }
 
     #[test]
@@ -353,7 +357,7 @@ mod tests {
     #[test]
     fn wraps_cascade_with_the_user() {
         let (mut conn, uid) = seed();
-        insert_wrap(&mut conn, uid, WrapKind::Recovery, None, &[1; 40]).expect("wrap");
+        insert_wrap(&mut conn, uid, WrapKind::EncryptionKey, None, &[1; 40]).expect("wrap");
         delete_user(&mut conn, uid).expect("delete user");
         assert!(list_wraps(&mut conn, uid).expect("list").is_empty());
     }

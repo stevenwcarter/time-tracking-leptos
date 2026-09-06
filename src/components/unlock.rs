@@ -10,9 +10,10 @@
 //! there, not merely unreachable UI.
 //!
 //! Two routes open the account's data key: a passkey assertion with the PRF
-//! extension evaluated, and a typed recovery code. A recovery unlock has one
-//! more step than a passkey one — spec section 6.4's offer of a fresh code —
-//! which is why the flow below has more than two states.
+//! extension evaluated, and a typed encryption key. Typing the key in has one
+//! more step than a passkey unlock — spec section 6.4's offer of a fresh key,
+//! because a key that has just been typed somewhere is a key worth replacing
+//! — which is why the flow below has more than two states.
 
 use leptos::either::{Either, EitherOf4};
 use leptos::prelude::*;
@@ -64,14 +65,14 @@ enum Mode {
     /// The two routes, plus whatever `status` holds from the last attempt.
     #[default]
     Choosing,
-    /// The recovery code input is open.
-    EnteringCode,
-    /// A recovery unlock just succeeded. `code`/`wrap` are the *old*
-    /// route's own bytes — kept only long enough to build the `Opener`
-    /// `reissue_recovery` needs if the user accepts the offer.
-    OfferReissue { code: String, wrap: Vec<u8> },
-    /// The freshly generated code, shown once.
-    ShowNewCode(String),
+    /// The encryption key input is open.
+    EnteringKey,
+    /// An unlock with the typed encryption key just succeeded. `key`/`wrap`
+    /// are the *old* route's own bytes — kept only long enough to build the
+    /// `Opener` `reissue_encryption_key` needs if the user accepts the offer.
+    OfferReissue { key: String, wrap: Vec<u8> },
+    /// The freshly generated encryption key, shown once.
+    ShowNewKey(String),
 }
 
 #[component]
@@ -89,16 +90,16 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
     let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     let mode = RwSignal::new(Mode::default());
     let status = RwSignal::new(String::new());
-    let code_input = RwSignal::new(String::new());
+    let key_input = RwSignal::new(String::new());
     // Whether a ceremony is in flight. Every button that starts one — and
     // every button that would tear this component down while one is running
     // — is disabled on it, so a double-click cannot open two assertions, and
-    // "keep my current code" cannot unmount the panel out from under a
+    // "keep my current key" cannot unmount the panel out from under a
     // re-issue that is still awaiting the server.
     let busy = RwSignal::new(false);
 
-    // Bridges a recovery unlock's two clicks: the code submit, which
-    // produces the key, and the reissue answer, which is what actually
+    // Bridges the typed-key route's two clicks: the key submit, which
+    // produces the data key, and the reissue answer, which is what actually
     // hands it to `EncryptionCtx`. Publishing the key the moment the unwrap
     // succeeds — instead of holding it here — would flip `EncryptionCtx` to
     // `Unlocked` immediately, which is what the parent's gate watches: this
@@ -140,9 +141,9 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
         }
     };
 
-    let open_code_entry = move |_| {
+    let open_key_entry = move |_| {
         status.set(String::new());
-        mode.set(Mode::EnteringCode);
+        mode.set(Mode::EnteringKey);
     };
 
     let back_to_choosing = move |_| {
@@ -150,22 +151,22 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
         mode.set(Mode::Choosing);
     };
 
-    let submit_code = move |_| {
+    let submit_key = move |_| {
         status.set(String::new());
         #[cfg(feature = "hydrate")]
         {
             let Some(user) = auth.user.get_untracked() else {
                 return;
             };
-            let typed = code_input.get_untracked();
+            let typed = key_input.get_untracked();
             busy.set(true);
             spawn_local(async move {
-                let outcome = ceremony::unlock_with_recovery_code(&typed, &user).await;
+                let outcome = ceremony::unlock_with_typed_key(&typed, &user).await;
                 busy.set(false);
                 match outcome {
-                    Ok((key, code, wrap)) => {
-                        pending_key.set_value(Some(key));
-                        mode.set(Mode::OfferReissue { code, wrap });
+                    Ok((data_key, key, wrap)) => {
+                        pending_key.set_value(Some(data_key));
+                        mode.set(Mode::OfferReissue { key, wrap });
                     }
                     Err(msg) => status.set(msg),
                 }
@@ -180,29 +181,29 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
         }
     };
 
-    let generate_new_code = move |_| {
+    let generate_new_key = move |_| {
         status.set(String::new());
         #[cfg(feature = "hydrate")]
         {
-            let Mode::OfferReissue { code, wrap } = mode.get_untracked() else {
+            let Mode::OfferReissue { key, wrap } = mode.get_untracked() else {
                 return;
             };
             busy.set(true);
             spawn_local(async move {
-                let outcome = ceremony::reissue_recovery_code(&code, &wrap).await;
+                let outcome = ceremony::reissue_encryption_key(&key, &wrap).await;
                 busy.set(false);
                 match outcome {
-                    Ok(new_code) => mode.set(Mode::ShowNewCode(new_code)),
+                    Ok(new_key) => mode.set(Mode::ShowNewKey(new_key)),
                     Err(msg) => {
                         status.set(msg);
-                        mode.set(Mode::OfferReissue { code, wrap });
+                        mode.set(Mode::OfferReissue { key, wrap });
                     }
                 }
             });
         }
     };
 
-    let finish_after_new_code = move |_| {
+    let finish_after_new_key = move |_| {
         #[cfg(feature = "hydrate")]
         if let Some(Some(key)) = pending_key.try_update_value(Option::take) {
             spawn_local(async move { encryption.unlock(key).await });
@@ -268,30 +269,34 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
                                     type="button"
                                     class="w-full border border-gray-300 text-sm rounded py-2 hover:bg-gray-50 disabled:opacity-60"
                                     disabled=move || busy.get()
-                                    on:click=open_code_entry
+                                    on:click=open_key_entry
                                 >
-                                    "Enter your recovery code"
+                                    "Enter your encryption key"
                                 </button>
                             </div>
                         }),
-                        Mode::EnteringCode => EitherOf4::B(view! {
+                        Mode::EnteringKey => EitherOf4::B(view! {
                             <div>
-                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Enter your recovery code"</h2>
-                                <p class="text-sm text-gray-600 mb-3">"Thirty-two characters, in groups of four."</p>
+                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Enter your encryption key"</h2>
+                                <p class="text-sm text-gray-600 mb-3">
+                                    "Thirty-two characters, in groups of four. It isn't used up by \
+                                     being typed — the same key unlocks every browser you use, \
+                                     until you replace it."
+                                </p>
                                 <input
                                     type="text"
                                     autocomplete="off"
                                     spellcheck="false"
                                     class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm mb-3 font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                                     placeholder="0000-0000-0000-0000-0000-0000-0000-0000"
-                                    prop:value=move || code_input.get()
-                                    on:input=move |ev| code_input.set(event_target_value(&ev))
+                                    prop:value=move || key_input.get()
+                                    on:input=move |ev| key_input.set(event_target_value(&ev))
                                 />
                                 <button
                                     type="button"
                                     class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 mb-2 disabled:opacity-60"
                                     disabled=move || busy.get()
-                                    on:click=submit_code
+                                    on:click=submit_key
                                 >
                                     "Unlock"
                                 </button>
@@ -307,21 +312,22 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
                         }),
                         Mode::OfferReissue { .. } => EitherOf4::C(view! {
                             <div>
-                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Get a new recovery code?"</h2>
+                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Get a new encryption key?"</h2>
                                 <p class="text-sm text-gray-600 mb-4">
-                                    "You just typed the code you have, so treat it as less private than it was. \
-                                     A new one replaces it — the old code stops working once the new one is \
-                                     stored — or you can keep the one you have. If we can't confirm the swap \
-                                     either way, neither code can be relied on, and the message above this \
-                                     will say what to do."
+                                    "You just typed the key you have, and it goes on opening every entry in \
+                                     this account until it is replaced — so treat it as less private than it \
+                                     was. A new one replaces it: the old key stops working once the new one \
+                                     is stored. You can also keep the one you have. If we can't confirm the \
+                                     swap either way, neither key can be relied on, and the message above \
+                                     this will say what to do."
                                 </p>
                                 <button
                                     type="button"
                                     class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700 mb-2 disabled:opacity-60"
                                     disabled=move || busy.get()
-                                    on:click=generate_new_code
+                                    on:click=generate_new_key
                                 >
-                                    "Generate a new code"
+                                    "Generate a new key"
                                 </button>
                                 <button
                                     type="button"
@@ -329,24 +335,25 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
                                     disabled=move || busy.get()
                                     on:click=skip_reissue
                                 >
-                                    "Keep my current code"
+                                    "Keep my current key"
                                 </button>
                             </div>
                         }),
-                        Mode::ShowNewCode(code) => EitherOf4::D(view! {
+                        Mode::ShowNewKey(key) => EitherOf4::D(view! {
                             <div>
-                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Your new recovery code"</h2>
+                                <h2 class="text-lg font-semibold text-gray-800 mb-1">"Your new encryption key"</h2>
                                 <p class="text-sm text-gray-600 mb-3">
-                                    "Write this down or save it somewhere safe. It won't be shown again, and the \
-                                     code you just used no longer works."
+                                    "Write this down or save it somewhere safe. It won't be shown again, the \
+                                     key you just used no longer works, and this one opens every entry in \
+                                     this account until you replace it in turn."
                                 </p>
                                 <p class="font-mono text-sm bg-gray-50 border border-gray-200 rounded px-3 py-2 mb-4 break-all">
-                                    {code}
+                                    {key}
                                 </p>
                                 <button
                                     type="button"
                                     class="w-full bg-blue-600 text-white text-sm font-semibold rounded py-2 hover:bg-blue-700"
-                                    on:click=finish_after_new_code
+                                    on:click=finish_after_new_key
                                 >
                                     "I've saved it"
                                 </button>
@@ -360,10 +367,10 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
 }
 
 /// This prompt's two routes to the data key, and spec section 6.4's offer
-/// of a fresh code after the second one.
+/// of a fresh encryption key after the second one.
 ///
 /// Thin over [`crate::crypto::flow`], which owns the steps the `/account`
-/// encryption panel runs too — the assertion and the recovery re-issue. What
+/// encryption panel runs too — the assertion and the re-issue. What
 /// stays here is the wording: every failure below is phrased for somebody
 /// who is shut out and looking for a way back in, which is not what the same
 /// failure means on `/account`.
@@ -374,8 +381,8 @@ pub fn UnlockPrompt(reason: UnlockReason) -> impl IntoView {
 mod ceremony {
     use crate::crypto::flow::{self, AssertionError};
     use crate::crypto::{
-        Forgets, Opener, SessionKey, UnlockError, choose_route, unlock_with_prf,
-        unlock_with_recovery,
+        Forgets, Opener, SessionKey, UnlockError, choose_route, unlock_with_encryption_key,
+        unlock_with_prf,
     };
     use crate::server_fns::encryption::encryption_wraps;
 
@@ -383,8 +390,8 @@ mod ceremony {
     /// way passkey sign-in verifies one, with the PRF extension evaluated
     /// alongside it.
     ///
-    /// Every failure that is not the unwrap itself points at the recovery
-    /// code, because that route works when this one does not — including on
+    /// Every failure that is not the unwrap itself points at the encryption
+    /// key, because that route works when this one does not — including on
     /// a browser with no PRF support at all.
     pub async fn unlock_with_passkey(user: &str) -> Result<SessionKey, String> {
         // Captured here, before this ceremony's first await, not inside
@@ -406,23 +413,23 @@ mod ceremony {
 
         // The credential id is kept apart from `choose_route`'s `None`,
         // rather than folded into it: `None` there means "the user chose the
-        // recovery route", and a `rawId` that could not be parsed is not
+        // encryption-key route", and a `rawId` that could not be parsed is not
         // that. Sharing one representation would send the passkey path off
-        // to open the *recovery* wrap with a PRF output — the unwrap would
+        // to open the *encryption-key* wrap with a PRF output — the unwrap would
         // fail, so the user is never told a wrong thing succeeded, but they
         // would be told the wrong reason it failed.
         let assertion = flow::assert_with_prf(user).await.map_err(|err| match err {
             AssertionError::Ceremony(message) => message,
             AssertionError::NoPrf => "That passkey didn't provide an unlock key on this \
-                                      browser. Try your recovery code instead."
+                                      browser. Try your encryption key instead."
                 .to_string(),
             AssertionError::Unidentified => "That passkey didn't identify itself to this \
-                                             browser. Try your recovery code instead."
+                                             browser. Try your encryption key instead."
                 .to_string(),
         })?;
 
         let route = choose_route(&wraps, Some(&assertion.credential_id)).ok_or_else(|| {
-            "That passkey can't unlock this account. Try your recovery code instead.".to_string()
+            "That passkey can't unlock this account. Try your encryption key instead.".to_string()
         })?;
 
         unlock_with_prf(&assertion.prf_output, &route.wrapped_key, user, forgets)
@@ -430,16 +437,17 @@ mod ceremony {
             .map_err(|_| "That passkey couldn't unlock this account.".to_string())
     }
 
-    /// The recovery route (spec section 6.4). Returns the unlocked key
-    /// together with the code and wrap that opened it — `reissue_recovery`
-    /// needs both to reopen the same route if the user accepts a fresh one.
+    /// The encryption-key route (spec section 6.4). Returns the unlocked data
+    /// key together with the encryption key and wrap that opened it —
+    /// `reissue_encryption_key` needs both to reopen the same route if the
+    /// user accepts a fresh one.
     ///
-    /// The two errors `unlock_with_recovery` can return say two different
-    /// things and must stay two different sentences: a malformed code never
-    /// reached the unwrap at all, while a well-formed one that failed could
-    /// be wrong, or could be a corrupt row — AES-KW's unwrap cannot tell
-    /// those apart, so this must not claim either specifically.
-    pub async fn unlock_with_recovery_code(
+    /// The two errors `unlock_with_encryption_key` can return say two
+    /// different things and must stay two different sentences: a malformed
+    /// key never reached the unwrap at all, while a well-formed one that
+    /// failed could be wrong, or could be a corrupt row — AES-KW's unwrap
+    /// cannot tell those apart, so this must not claim either specifically.
+    pub async fn unlock_with_typed_key(
         typed: &str,
         user: &str,
     ) -> Result<(SessionKey, String, Vec<u8>), String> {
@@ -448,13 +456,15 @@ mod ceremony {
         let forgets = Forgets::now();
         let wraps = encryption_wraps().await.map_err(flow::server_unreachable)?;
         let route = choose_route(&wraps, None)
-            .ok_or_else(|| "This account has no recovery code set up.".to_string())?;
+            .ok_or_else(|| "This account has no encryption key set up.".to_string())?;
 
-        let key = unlock_with_recovery(typed, &route.wrapped_key, user, forgets)
+        let key = unlock_with_encryption_key(typed, &route.wrapped_key, user, forgets)
             .await
             .map_err(|err| match err {
-                UnlockError::Malformed(_) => "That doesn't look like a recovery code.".to_string(),
-                UnlockError::Crypto(_) => "That recovery code didn't work.".to_string(),
+                UnlockError::Malformed(_) => {
+                    "That doesn't look like an encryption key.".to_string()
+                }
+                UnlockError::Crypto(_) => "That encryption key didn't work.".to_string(),
             })?;
 
         Ok((key, typed.to_string(), route.wrapped_key))
@@ -462,12 +472,12 @@ mod ceremony {
 
     /// Spec section 6.4's offer, reopening the route that just succeeded.
     ///
-    /// `old_code`/`old_wrap` are the only way to get the raw key back out,
-    /// since the `SessionKey` the caller is already holding cannot yield it
-    /// (invariant E5).
-    pub async fn reissue_recovery_code(old_code: &str, old_wrap: &[u8]) -> Result<String, String> {
-        flow::reissue(&Opener::Recovery {
-            code: old_code,
+    /// `old_key`/`old_wrap` are the only way to get the raw data key back
+    /// out, since the `SessionKey` the caller is already holding cannot yield
+    /// it (invariant E5).
+    pub async fn reissue_encryption_key(old_key: &str, old_wrap: &[u8]) -> Result<String, String> {
+        flow::reissue(&Opener::EncryptionKey {
+            key: old_key,
             wrap: old_wrap,
         })
         .await
