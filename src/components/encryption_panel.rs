@@ -2024,6 +2024,11 @@ mod tests {
             sentence.contains("“Bitwarden” and “Old token” sign you in"),
             "both names, and a plural verb to match: {sentence}"
         );
+        assert!(
+            sentence.contains("their authenticators cannot hold an unlock key"),
+            "the possessive must agree with the plural verb too, or a user \
+             with several passkeys reads a sentence that contradicts itself: {sentence}"
+        );
 
         let capable = Overview {
             routes: vec![classify(passkey("Phone", b"cred-b", true), &[])],
@@ -2033,6 +2038,28 @@ mod tests {
             KeyOnlyReason::of(&capable),
             None,
             "the ordinary route owes no explanation, and one offered anyway reads as a fault"
+        );
+    }
+
+    /// `quoted_list`'s two- and one-name cases are exercised above, but three
+    /// or more is where an off-by-one in the join would actually show up — a
+    /// trailing comma, a missing "and", or a dropped final name — and no
+    /// existing case reaches it.
+    #[test]
+    fn quoted_list_uses_an_oxford_comma_for_three_or_more_names() {
+        let three = Overview {
+            routes: vec![
+                classify(passkey("Bitwarden", b"cred-c", false), &[]),
+                classify(passkey("Old token", b"cred-d", false), &[]),
+                classify(passkey("YubiKey", b"cred-e", false), &[]),
+            ],
+            ..Overview::default()
+        };
+        let sentence = KeyOnlyReason::of(&three).expect("a reason").sentence();
+        assert!(
+            sentence.contains("“Bitwarden”, “Old token” and “YubiKey” sign you in"),
+            "three names must be comma-joined with a final \"and\", no trailing \
+             comma and no name dropped: {sentence}"
         );
     }
 
