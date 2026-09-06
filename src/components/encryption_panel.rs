@@ -11,9 +11,14 @@
 //! Three things the ceremonies make unavoidable, which the panel therefore
 //! states before it starts rather than springing mid-flow:
 //!
-//! 1. **Enabling asks for a passkey again.** Creating a credential reports
-//!    only *whether* PRF is available, never the output, so the key material
-//!    has to come from a fresh assertion (spec section 6.1 step 1).
+//! 1. **Enabling asks for a passkey again** — on the route that uses one.
+//!    Creating a credential reports only *whether* PRF is available, never
+//!    the output, so the key material has to come from a fresh assertion
+//!    (spec section 6.1 step 1). An account whose authenticators cannot
+//!    produce a PRF output at all takes the other route, where the recovery
+//!    code is the only wrap and no passkey is asked for — see [`EnableRoute`],
+//!    whose two sets of words are the difference between "you have a backup"
+//!    and "this code is the account".
 //! 2. **Adding a passkey costs three authenticator interactions** — create
 //!    it, assert against a credential that can already unlock to re-derive
 //!    the raw key, assert against the new one for its PRF output. An
@@ -390,6 +395,122 @@ impl Openers {
     }
 }
 
+/// Which of spec section 6.1's two routes to encryption an account can take.
+///
+/// The account's own capability decides it, not a preference: the PRF
+/// extension is a property of the browser and the authenticator, and one
+/// that does not implement it never will on the credentials already
+/// enrolled. So an account with no capable passkey is not being offered a
+/// weaker option alongside a stronger one — the stronger one does not exist
+/// for it, and the real alternative is entries stored in the clear.
+///
+/// The routes cost different things and the panel must not blur them. Two
+/// wraps means losing every passkey *and* the code is fatal; one wrap means
+/// losing the code is fatal on its own. A user who reads the two-wrap
+/// sentence and ends up with a one-wrap account has been told they have
+/// slack they do not have, which is why the words hang off this value rather
+/// than off the section that renders them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EnableRoute {
+    /// The data key is wrapped under a PRF-capable passkey *and* under the
+    /// recovery code. What most accounts get.
+    PasskeyAndRecovery,
+    /// The data key is wrapped under the recovery code alone, because no
+    /// enrolled passkey can hold one.
+    RecoveryOnly,
+}
+
+impl EnableRoute {
+    fn of(overview: &Overview) -> Self {
+        if overview.has_capable_passkey() {
+            EnableRoute::PasskeyAndRecovery
+        } else {
+            EnableRoute::RecoveryOnly
+        }
+    }
+
+    fn words(self) -> EnableWords {
+        match self {
+            EnableRoute::PasskeyAndRecovery => PASSKEY_AND_RECOVERY_WORDS,
+            EnableRoute::RecoveryOnly => RECOVERY_ONLY_WORDS,
+        }
+    }
+}
+
+/// The words one [`EnableRoute`] wears.
+///
+/// Every sentence that differs between the routes lives here, for the reason
+/// [`OpenerWords`] gives one screen further on: a card built from the other
+/// route's words would still render, and the sentence it got wrong is the
+/// one telling the user how much room for error they have.
+#[derive(Clone, Copy)]
+struct EnableWords {
+    /// Why this route and not the ordinary one. `None` where no explanation
+    /// is owed.
+    why: Option<&'static str>,
+    /// The red block's first line.
+    warning_heading: &'static str,
+    /// The red block itself: what is lost, and what nobody can do about it.
+    warning: &'static str,
+    /// What the ceremony asks for first.
+    first_step: &'static str,
+    /// What the recovery code is, in the list of what happens.
+    code_step: &'static str,
+    /// What enrolling another passkey costs afterwards.
+    later_passkey: &'static str,
+    /// The sentence beside the checkbox that gates the button.
+    acknowledgement: &'static str,
+    /// The button that starts the ceremony.
+    button: &'static str,
+}
+
+const PASSKEY_AND_RECOVERY_WORDS: EnableWords = EnableWords {
+    why: None,
+    warning_heading: "There is no reset.",
+    warning: "If you lose every passkey and your recovery code, your entries are gone forever \
+              — for you and for whoever runs this server. Nobody can unlock them, because \
+              nobody else ever has the key. This is not a password that can be reissued.",
+    first_step: "Your browser asks for a passkey. Creating a passkey doesn't hand back the key \
+                 material this needs, so even one you added a moment ago has to answer a fresh \
+                 prompt.",
+    code_step: "You're shown a recovery code, once, before encryption is switched on. Save it \
+                before you go on — it is never shown again.",
+    later_passkey: "Adding another passkey afterwards takes three passkey prompts, unless you \
+                    use your recovery code in place of one of them. That's a consequence of the \
+                    key never leaving your authenticator in a copyable form, not a bug to be \
+                    fixed later.",
+    acknowledgement: "I understand that losing every passkey and my recovery code means losing \
+                      my entries for good.",
+    button: "Turn on encryption",
+};
+
+/// Deliberately not a softened copy of the words above. The two-wrap warning
+/// describes a loss that takes two mistakes; this one takes one.
+const RECOVERY_ONLY_WORDS: EnableWords = EnableWords {
+    why: Some(
+        "None of your passkeys can hold an encryption key — their authenticators don't support \
+         the extension the key is derived from, and that isn't something a setting turns on. \
+         You can still encrypt your entries, with a recovery code as the key.",
+    ),
+    warning_heading: "Your recovery code will be the only key.",
+    warning: "Not a backup — the key itself. No passkey on this account can hold a copy, so \
+              there is no second way in and nothing to fall back on. Lose the code and your \
+              entries are gone forever, for you and for whoever runs this server. Nobody can \
+              unlock them, because nobody else ever has the key. This is not a password that \
+              can be reissued.",
+    first_step: "Your browser generates the key. There is no passkey prompt on this route — \
+                 which is exactly why the code has to carry the whole account.",
+    code_step: "You're shown the recovery code, once, before encryption is switched on. Store \
+                it somewhere you would trust with the entries themselves, because that is what \
+                it is worth. It is never shown again.",
+    later_passkey: "If you ever enrol a passkey that can hold a key, you can give it one from \
+                    this panel using the recovery code. Until then the code stays the only \
+                    thing that opens your entries.",
+    acknowledgement: "I understand that my recovery code will be the only key to my entries, \
+                      and that losing it loses them for good.",
+    button: "Turn on encryption with a recovery code only",
+};
+
 /// Where the panel is in a flow it started itself.
 ///
 /// Half of what decides the screen; [`Phase`] is the other half, and
@@ -407,7 +528,13 @@ enum Mode {
     /// The code minted by the enable ceremony, held while the server still
     /// knows nothing. Confirming it is what turns encryption on: the
     /// server call, then the key, then the migration.
-    NewCode(String),
+    ///
+    /// The route travels with the code because the card's words depend on
+    /// it, and by then the overview it was chosen from is no longer what the
+    /// screen is reading. A code minted on the recovery-only route and
+    /// described as a passkey's backup would be the one lie this panel
+    /// cannot afford.
+    NewCode { code: String, route: EnableRoute },
     /// A re-issued code. Confirming it just closes.
     ReissuedCode(String),
     /// One keyless passkey, and the choice of which secret will open the
@@ -441,8 +568,10 @@ enum Mode {
 /// the thing that turns encryption on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CodeKind {
-    /// Minted by the enable ceremony, with the server not yet told.
-    New,
+    /// Minted by the enable ceremony, with the server not yet told. Carries
+    /// the route because what this code *is* differs between them: a backup
+    /// behind a passkey, or the account's only key.
+    New(EnableRoute),
     /// Minted by a re-issue, replacing one that has stopped working.
     Reissued,
 }
@@ -450,17 +579,25 @@ enum CodeKind {
 impl CodeKind {
     fn heading(self) -> &'static str {
         match self {
-            CodeKind::New => "Save your recovery code",
+            CodeKind::New(_) => "Save your recovery code",
             CodeKind::Reissued => "Your new recovery code",
         }
     }
 
     fn intro(self) -> &'static str {
         match self {
-            CodeKind::New => {
+            CodeKind::New(EnableRoute::PasskeyAndRecovery) => {
                 "This is the only thing that opens your entries if you lose every passkey. It \
                  is shown once — leaving this page without it means generating a replacement \
                  from this panel while you still have a passkey that works."
+            }
+            // The last screen before the account becomes unrecoverable
+            // without this string of characters, so it says so rather than
+            // repeating the sentence above with "passkey" quietly removed.
+            CodeKind::New(EnableRoute::RecoveryOnly) => {
+                "This is not a backup — it is the key. No passkey on this account can hold a \
+                 copy, so nothing else will ever open your entries. It is shown once. Save it \
+                 before you press the button below; after that, losing it loses your entries."
             }
             CodeKind::Reissued => {
                 "Your previous code no longer works. This one is shown once and never again."
@@ -470,7 +607,7 @@ impl CodeKind {
 
     fn confirm(self) -> &'static str {
         match self {
-            CodeKind::New => "I've saved it — finish turning on encryption",
+            CodeKind::New(_) => "I've saved it — finish turning on encryption",
             CodeKind::Reissued => "I've saved it",
         }
     }
@@ -526,9 +663,9 @@ impl Screen {
     /// up; this makes the card not depend on that staying true.
     fn of(mode: Mode, phase: impl FnOnce() -> Phase) -> Self {
         match mode {
-            Mode::NewCode(code) => Screen::Code {
+            Mode::NewCode { code, route } => Screen::Code {
                 code,
-                kind: CodeKind::New,
+                kind: CodeKind::New(route),
             },
             Mode::ReissuedCode(code) => Screen::Code {
                 code,
@@ -790,7 +927,11 @@ pub fn EncryptionPanel(
         }
     };
 
-    let turn_on = move || {
+    // `route` is decided by the section that rendered the button, not
+    // re-derived here: the words the user just read and the ceremony that
+    // runs have to be the same choice, and two independent reads of the
+    // overview could land either side of a refresh.
+    let turn_on = move |route: EnableRoute| {
         status.set(None);
         #[cfg(feature = "hydrate")]
         {
@@ -802,18 +943,23 @@ pub fn EncryptionPanel(
             };
             busy.set(true);
             spawn_local(async move {
-                let outcome = ceremony::begin_enable(&user).await;
+                let outcome = match route {
+                    EnableRoute::PasskeyAndRecovery => ceremony::begin_enable(&user).await,
+                    EnableRoute::RecoveryOnly => ceremony::begin_enable_recovery_only(&user).await,
+                };
                 busy.set(false);
                 match outcome {
                     Ok(pending) => {
                         let code = pending.recovery_code().to_string();
                         pending_enable.set_value(Some(pending));
-                        mode.set(Mode::NewCode(code));
+                        mode.set(Mode::NewCode { code, route });
                     }
                     Err(message) => status.set(Some(Status::Problem(message))),
                 }
             });
         }
+        #[cfg(not(feature = "hydrate"))]
+        let _ = route;
     };
 
     // Spec section 6.1's step 4, reached only once the user has said they
@@ -1004,7 +1150,7 @@ pub fn EncryptionPanel(
                         confirm=kind.confirm()
                         busy=busy
                         on_confirm=move || match kind {
-                            CodeKind::New => confirm_new_code(),
+                            CodeKind::New(_) => confirm_new_code(),
                             CodeKind::Reissued => close_card(),
                         }
                     />
@@ -1157,26 +1303,31 @@ fn RecoveryCodeCard(
 }
 
 /// The pitch, the warning, and the gate (spec section 6.1).
+///
+/// There is no third state here any more. An account with no PRF-capable
+/// passkey used to get a dead control and a sentence telling it to go and
+/// add one — advice with nowhere to go, since an authenticator that does not
+/// implement the extension will not start, and the account it left behind
+/// was a plaintext one. It now gets [`EnableRoute::RecoveryOnly`] and a
+/// warning written for the loss that route actually carries.
 #[component]
 fn EnableSection(
     overview: RwSignal<Fetched>,
     understood: RwSignal<bool>,
     busy: RwSignal<bool>,
-    on_enable: impl Fn() + Copy + Send + 'static,
+    on_enable: impl Fn(EnableRoute) + Copy + Send + 'static,
 ) -> impl IntoView {
-    // Three answers, not two. Until the fetch lands nothing is known, which
-    // disables the button — offering a ceremony that would fail at its first
-    // assertion is worse than a moment of greyed-out control — but it must
-    // not yet *say* the account has no usable passkey. That claim is only
-    // true once the list is in, and rendering it before then would flash a
-    // false alarm on every visit, including the server's own render.
-    let known = move || overview.get().loaded().is_some();
-    let capable = move || {
-        overview
-            .get()
-            .loaded()
-            .is_some_and(|overview| overview.has_capable_passkey())
-    };
+    // `None` until the passkey list lands, and that is what holds the button
+    // shut: starting a ceremony before the account's capability is known
+    // would pick a route by guess, and the two are not interchangeable.
+    let route_of = |fetched: Fetched| fetched.loaded().map(|it| EnableRoute::of(&it));
+    let route = move || route_of(overview.get());
+    // The words shown while nothing is known are the ordinary route's,
+    // because most accounts take it and a panel that says nothing at all
+    // until a fetch lands would render blank on the server too (invariant
+    // E2's `Checking` branch is a different screen entirely). Nothing can be
+    // started under them: the gate above is what the button reads.
+    let words = move || route().unwrap_or(EnableRoute::PasskeyAndRecovery).words();
 
     view! {
         <div>
@@ -1188,43 +1339,26 @@ fn EnableSection(
                  ever holds."
             </p>
 
-            <div class="rounded border border-red-200 bg-red-50 p-3 mb-4">
-                <p class="text-sm font-semibold text-red-900 mb-1">"There is no reset."</p>
-                <p class="text-sm text-red-900">
-                    "If you lose every passkey and your recovery code, your entries are gone \
-                     forever — for you and for whoever runs this server. Nobody can unlock \
-                     them, because nobody else ever has the key. This is not a password that \
-                     can be reissued."
+            {move || words().why.map(|why| view! {
+                <p class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-3 mb-4">
+                    {why}
                 </p>
+            })}
+
+            <div class="rounded border border-red-200 bg-red-50 p-3 mb-4">
+                <p class="text-sm font-semibold text-red-900 mb-1">
+                    {move || words().warning_heading}
+                </p>
+                <p class="text-sm text-red-900">{move || words().warning}</p>
             </div>
 
             <p class="text-sm font-medium text-gray-800 mb-1">"What happens when you turn it on"</p>
             <ul class="list-disc pl-5 text-sm text-gray-600 mb-4 space-y-1">
-                <li>
-                    "Your browser asks for a passkey. Creating a passkey doesn't hand back the \
-                     key material this needs, so even one you added a moment ago has to answer \
-                     a fresh prompt."
-                </li>
-                <li>
-                    "You're shown a recovery code, once, before encryption is switched on. \
-                     Save it before you go on — it is never shown again."
-                </li>
+                <li>{move || words().first_step}</li>
+                <li>{move || words().code_step}</li>
                 <li>"Entries you've already saved are re-encrypted in place. Nothing is deleted."</li>
-                <li>
-                    "Adding another passkey afterwards takes three passkey prompts, unless you \
-                     use your recovery code in place of one of them. That's a consequence of \
-                     the key never leaving your authenticator in a copyable form, not a bug to \
-                     be fixed later."
-                </li>
+                <li>{move || words().later_passkey}</li>
             </ul>
-
-            {move || (known() && !capable()).then(|| view! {
-                <p class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-3 mb-4">
-                    "Encryption needs a passkey that can hold a key. Add one above first — if \
-                     you already have passkeys, none of their authenticators reported support \
-                     for the extension the key is derived from."
-                </p>
-            })}
 
             <label class="flex items-start gap-2 text-sm text-gray-700 mb-4">
                 <input
@@ -1233,19 +1367,20 @@ fn EnableSection(
                     prop:checked=move || understood.get()
                     on:change=move |ev| understood.set(event_target_checked(&ev))
                 />
-                <span>
-                    "I understand that losing every passkey and my recovery code means losing \
-                     my entries for good."
-                </span>
+                <span>{move || words().acknowledgement}</span>
             </label>
 
             <button
                 type="button"
                 class="bg-blue-600 text-white text-sm font-semibold rounded px-4 py-2 hover:bg-blue-700 disabled:opacity-60"
-                disabled=move || busy.get() || !understood.get() || !capable()
-                on:click=move |_| on_enable()
+                disabled=move || busy.get() || !understood.get() || route().is_none()
+                on:click=move |_| {
+                    if let Some(route) = route_of(overview.get_untracked()) {
+                        on_enable(route);
+                    }
+                }
             >
-                "Turn on encryption"
+                {move || words().button}
             </button>
         </div>
     }
@@ -1303,6 +1438,28 @@ fn ManageSection(
                 None => Either::Left(view! { <p class="text-sm text-gray-500">"Loading…"</p> }),
                 Some(overview) => Either::Right(view! {
                     <div>
+                        // Answers the heading before the list qualifies it. A
+                        // list where every row says "won't open your entries" —
+                        // or no rows at all — is the ordinary screen for an
+                        // account enabled by the recovery-only route, and a
+                        // heading followed by nothing but bad news reads as a
+                        // failure to load rather than as the truth.
+                        //
+                        // Conditioned on the recovery wrap so it cannot appear
+                        // beside the red warning below, which is the same account
+                        // one step worse off and the more urgent thing to read.
+                        // Written above the list because the list *consumes*
+                        // `routes`, and this has to read them.
+                        {(overview.has_recovery_wrap
+                            && !overview.routes.iter().any(|r| r.status == RouteStatus::CanUnlock))
+                            .then(|| view! {
+                                <p class="text-sm text-gray-700 bg-gray-50 border border-gray-200 rounded p-3 mb-2">
+                                    "Your recovery code is the only thing that opens your \
+                                     entries right now. If you enrol a passkey whose \
+                                     authenticator can hold a key, you can give it one from \
+                                     here using that code."
+                                </p>
+                            })}
                         <ul class="divide-y divide-gray-100 mb-2">
                             {overview.routes.into_iter()
                                 .map(|route| view! { <RouteRow route=route busy=busy on_give_key=on_give_key/> })
@@ -1671,7 +1828,8 @@ fn RouteRow(
 mod ceremony {
     use super::{MigrationPlan, Overview, classify, pass_failed};
     use crate::crypto::flow::{self, PrfAssertion};
-    use crate::crypto::{Enabled, Forgets, SessionKey, choose_route, enable};
+    use crate::crypto::{Enabled, Forgets, SessionKey, choose_route, enable, enable_recovery_only};
+    use crate::dto::PasskeyWrapDto;
     use crate::server_fns::encryption::{encryption_enable, encryption_wraps};
     use crate::server_fns::entries::entries_all;
     use crate::server_fns::passkey::passkey_list;
@@ -1725,33 +1883,45 @@ mod ceremony {
 
     /// The enable ceremony, paused with the recovery code on screen.
     ///
-    /// Everything the account needs already exists — a data key, both wraps,
-    /// a code, and this device's keystore record — and the server still
-    /// knows none of it, so the account is *not* encrypted. That gap is the
-    /// point of the type: it holds the ceremony open across the one-time
-    /// display of the code, so the user has saved it before the transaction
-    /// that makes it their only backup.
+    /// Everything the account needs already exists — a data key, its wraps
+    /// and a code — and the server still knows none of it, so the account is
+    /// *not* encrypted. That gap is the point of the type: it holds the
+    /// ceremony open across the one-time display of the code, so the user
+    /// has saved it before the transaction that makes it their only backup.
+    ///
+    /// Flattened out of the [`Enabled`] it is built from so the passkey wrap
+    /// travels joined to the credential it will be filed under. The two are
+    /// present or absent together — [`enable`] produces both,
+    /// [`enable_recovery_only`] neither — and keeping them as one field is
+    /// what stops a later edit from carrying a wrap with nothing to file it
+    /// under, or a credential id with nothing to store.
     pub struct PendingEnable {
-        enabled: Enabled,
-        /// The credential that asserted, filed alongside its own wrap.
-        credential_id: Vec<u8>,
+        session_key: SessionKey,
+        recovery_code: String,
+        /// `None` on the recovery-code-only route.
+        passkey: Option<PasskeyWrapDto>,
+        recovery_wrap: Vec<u8>,
     }
 
     impl PendingEnable {
         /// The code to show once, before committing to it.
         pub fn recovery_code(&self) -> &str {
-            &self.enabled.recovery_code
+            &self.recovery_code
         }
     }
 
+    /// What a browser that cannot do the WebCrypto half is told. Shared by
+    /// both routes because it is the same failure: neither one has reached
+    /// the server or the keystore by the time it can happen.
+    const KEY_GENERATION_FAILED: &str = "This browser couldn't generate an encryption key.";
+
     /// Everything turning encryption on does before the server hears about
-    /// it: spec section 6.1's steps 1 to 3, plus step 6's keystore write,
-    /// which `crypto::enable` performs on the way through (see its doc).
+    /// it, on the route that has a PRF-capable passkey: spec section 6.1's
+    /// steps 1 to 3.
     ///
     /// Abandoning a `PendingEnable` — closing the tab on the code screen —
     /// costs nothing. `encrypted_at` is unset, so the next probe reports
-    /// `Disabled`, the keystore record is never consulted, and the code the
-    /// user may have saved simply opens nothing.
+    /// `Disabled`, and the code the user may have saved simply opens nothing.
     pub async fn begin_enable(user: &str) -> Result<PendingEnable, String> {
         // Captured here, before this ceremony's first await, not inside
         // `crypto::enable` — which does not run until the assertion below
@@ -1767,13 +1937,56 @@ mod ceremony {
             .await
             .map_err(flow::assertion_message)?;
 
-        let enabled = enable(&prf_output, user, forgets)
+        let Enabled {
+            session_key,
+            recovery_code,
+            passkey_wrap,
+            recovery_wrap,
+        } = enable(&prf_output, user, forgets)
             .await
-            .map_err(|_| "This browser couldn't generate an encryption key.".to_string())?;
+            .map_err(|_| KEY_GENERATION_FAILED.to_string())?;
 
         Ok(PendingEnable {
-            enabled,
-            credential_id,
+            session_key,
+            recovery_code,
+            passkey: passkey_wrap.map(|wrapped_key| PasskeyWrapDto {
+                credential_id,
+                wrapped_key,
+            }),
+            recovery_wrap,
+        })
+    }
+
+    /// The same pause, on the route with no passkey wrap at all (spec
+    /// section 6.1's second route).
+    ///
+    /// Shorter by an assertion, and that absence is the whole difference:
+    /// there is no credential to derive key material from, so `Forgets::now`
+    /// here really is the ceremony's first step rather than a capture made
+    /// after one. The code this leaves on screen is the account's only key,
+    /// which is why the card showing it says so in its own words — see
+    /// [`CodeKind`](super::CodeKind).
+    ///
+    /// The ceremony itself cannot be tested on the host: `enable_recovery_only`
+    /// reaches WebCrypto for the data key, the KEK and the wrap, and there is
+    /// no host equivalent and no wasm test runner in this project. What is
+    /// covered is the choice put in front of the user and the server's half.
+    pub async fn begin_enable_recovery_only(user: &str) -> Result<PendingEnable, String> {
+        let forgets = Forgets::now();
+        let Enabled {
+            session_key,
+            recovery_code,
+            passkey_wrap: _,
+            recovery_wrap,
+        } = enable_recovery_only(user, forgets)
+            .await
+            .map_err(|_| KEY_GENERATION_FAILED.to_string())?;
+
+        Ok(PendingEnable {
+            session_key,
+            recovery_code,
+            passkey: None,
+            recovery_wrap,
         })
     }
 
@@ -1791,11 +2004,13 @@ mod ceremony {
     /// so the message says how to find out and what each answer means.
     pub async fn commit_enable(pending: PendingEnable) -> Result<SessionKey, String> {
         let PendingEnable {
-            enabled,
-            credential_id,
+            session_key,
+            recovery_code: _,
+            passkey,
+            recovery_wrap,
         } = pending;
 
-        encryption_enable(enabled.passkey_wrap, credential_id, enabled.recovery_wrap)
+        encryption_enable(passkey, recovery_wrap)
             .await
             .map_err(|err| {
                 format!(
@@ -1807,7 +2022,7 @@ mod ceremony {
                 )
             })?;
 
-        Ok(enabled.session_key)
+        Ok(session_key)
     }
 
     /// What one migration pass did, and what it declined to touch.
@@ -1917,26 +2132,81 @@ mod tests {
         );
     }
 
-    /// The gate on the enable button. An account whose only passkeys are
-    /// PRF-incapable cannot complete the ceremony — the assertion returns no
-    /// key material — so offering it would end in a failure the user could
-    /// not act on.
+    /// Which of spec section 6.1's two routes an account gets, and it is the
+    /// account's capability that decides — not a preference.
+    ///
+    /// An account whose only passkeys are PRF-incapable cannot complete the
+    /// two-wrap ceremony at all: the assertion returns no key material. It
+    /// used to be refused outright and told to enrol a better passkey, which
+    /// is advice with nowhere to go when the authenticator in question never
+    /// implemented the extension — a browser extension with no PRF support
+    /// is the case this route exists for. What it gets instead is the
+    /// recovery-only route, whose cost is stated in its own words.
     #[test]
-    fn an_account_with_no_capable_passkey_cannot_enable() {
-        let none = Overview::default();
-        assert!(!none.has_capable_passkey(), "no passkeys at all");
+    fn the_route_on_offer_follows_what_the_accounts_passkeys_can_hold() {
+        assert_eq!(
+            EnableRoute::of(&Overview::default()),
+            EnableRoute::RecoveryOnly,
+            "an account with no passkeys at all still has a way to encrypt"
+        );
 
         let incapable = Overview {
-            routes: vec![classify(passkey("C", b"cred-c", false), &[])],
+            routes: vec![classify(passkey("Old token", b"cred-c", false), &[])],
             ..Overview::default()
         };
-        assert!(!incapable.has_capable_passkey());
+        assert_eq!(EnableRoute::of(&incapable), EnableRoute::RecoveryOnly);
 
+        // One capable passkey is enough, wrap or no wrap: enabling derives
+        // the wrap from a fresh assertion, so `NoKeyYet` is the state every
+        // account is in a moment before it turns encryption on.
         let capable = Overview {
-            routes: vec![classify(passkey("B", b"cred-b", true), &[])],
+            routes: vec![
+                classify(passkey("Old token", b"cred-c", false), &[]),
+                classify(passkey("Phone", b"cred-b", true), &[]),
+            ],
             ..Overview::default()
         };
-        assert!(capable.has_capable_passkey());
+        assert_eq!(EnableRoute::of(&capable), EnableRoute::PasskeyAndRecovery);
+    }
+
+    /// The two routes must not share a warning. Losing the code costs
+    /// everything on one of them and nothing on its own on the other, and a
+    /// user who read the two-wrap sentence over a one-wrap account has been
+    /// told they have slack they do not have.
+    #[test]
+    fn the_recovery_only_route_states_that_the_code_is_the_only_key() {
+        let only = EnableRoute::RecoveryOnly.words();
+        let both = EnableRoute::PasskeyAndRecovery.words();
+
+        assert!(
+            only.warning_heading.contains("only key"),
+            "the heading must name the code as the only key: {}",
+            only.warning_heading
+        );
+        assert!(
+            only.warning.contains("no second way in"),
+            "the warning must say there is nothing to fall back on: {}",
+            only.warning
+        );
+        assert!(
+            only.warning.contains("gone forever"),
+            "and must state the loss as loss, not hedge it: {}",
+            only.warning
+        );
+        assert!(
+            !only.warning.contains("every passkey"),
+            "the two-wrap wording implies a passkey could have saved them: {}",
+            only.warning
+        );
+        assert!(
+            !only.acknowledgement.contains("every passkey"),
+            "and so does the two-wrap acknowledgement: {}",
+            only.acknowledgement
+        );
+
+        assert_ne!(only.warning, both.warning);
+        assert_ne!(only.acknowledgement, both.acknowledgement);
+        assert_ne!(only.button, both.button);
     }
 
     fn pending(date: &str, body: &str) -> PendingRow {
@@ -2093,10 +2363,16 @@ mod tests {
     fn a_code_on_screen_outranks_the_account_state() {
         let unread = || panic!("the phase must not be read while a code is on screen");
         assert_eq!(
-            Screen::of(Mode::NewCode("K7M2".to_string()), unread),
+            Screen::of(
+                Mode::NewCode {
+                    code: "K7M2".to_string(),
+                    route: EnableRoute::RecoveryOnly,
+                },
+                unread,
+            ),
             Screen::Code {
                 code: "K7M2".to_string(),
-                kind: CodeKind::New,
+                kind: CodeKind::New(EnableRoute::RecoveryOnly),
             },
         );
         assert_eq!(
@@ -2221,14 +2497,38 @@ mod tests {
         assert!(!Openers::of(&nothing).recovery());
     }
 
-    /// The two cards say different things, and saying the wrong one is a
+    /// The code screens say different things, and saying the wrong one is a
     /// lie the user cannot check: "your previous code no longer works" over
     /// a first code would send somebody looking for a code they never had.
+    ///
+    /// The two *enable* screens are the pair that matters most. On the
+    /// two-wrap route the code is a backup behind a passkey; on the
+    /// recovery-only route it is the account, and a user shown the first
+    /// sentence over the second kind of code has been told they have a
+    /// fallback that does not exist.
     #[test]
     fn each_code_screen_carries_its_own_words() {
-        assert!(CodeKind::New.confirm().contains("turning on encryption"));
+        let with_passkey = CodeKind::New(EnableRoute::PasskeyAndRecovery);
+        let recovery_only = CodeKind::New(EnableRoute::RecoveryOnly);
+
+        assert!(with_passkey.confirm().contains("turning on encryption"));
+        assert!(recovery_only.confirm().contains("turning on encryption"));
         assert!(CodeKind::Reissued.intro().contains("no longer works"));
-        assert!(!CodeKind::New.intro().contains("no longer works"));
+        assert!(!with_passkey.intro().contains("no longer works"));
+
+        assert!(
+            with_passkey.intro().contains("if you lose every passkey"),
+            "the two-wrap code is a backup behind a passkey, and says so"
+        );
+        assert!(
+            !recovery_only.intro().contains("if you lose every passkey"),
+            "the recovery-only code must not be described as a passkey's backup"
+        );
+        assert!(
+            recovery_only.intro().contains("it is the key"),
+            "the recovery-only code must be named as the only key: {}",
+            recovery_only.intro()
+        );
     }
 
     /// Renders the whole panel the way the server would, with the context
@@ -2271,7 +2571,7 @@ mod tests {
                     overview=RwSignal::new(overview)
                     understood=RwSignal::new(understood)
                     busy=RwSignal::new(false)
-                    on_enable=|| {}
+                    on_enable=|_| {}
                 />
             }
             .to_html()
@@ -2545,17 +2845,24 @@ mod tests {
         );
     }
 
-    /// And once the list *is* in and holds nothing usable, the panel says so
-    /// rather than presenting a dead control with no explanation. The
-    /// ceremony would fail at its first assertion, and "the button does
-    /// nothing" is the least useful way to learn that.
+    /// And once the list *is* in and holds nothing PRF-capable, the panel
+    /// offers the recovery-only route rather than a dead control. This is
+    /// the case the second route was added for: an authenticator with no PRF
+    /// support — a browser extension that never implemented the extension,
+    /// say — makes the two-wrap ceremony permanently impossible, and the
+    /// account the old dead end left behind was a plaintext one.
     ///
-    /// Ticked here too, and for the same reason: an unticked box would shut
-    /// the button by itself and the `disabled` assertion would prove nothing
-    /// about the capability check it is aimed at.
+    /// Ticked, for the reason the test above gives: an unticked box would
+    /// shut the button by itself and the `disabled` assertion would prove
+    /// nothing about the check it is aimed at.
+    ///
+    /// The words are asserted here as well as in
+    /// [`the_recovery_only_route_states_that_the_code_is_the_only_key`],
+    /// because that test pins the constants and this one pins that the
+    /// section actually renders *these* constants for *this* account.
     #[cfg(feature = "ssr")]
     #[test]
-    fn an_account_with_no_usable_passkey_is_told_why_it_cannot_enable() {
+    fn an_account_with_no_capable_passkey_is_offered_the_recovery_only_route() {
         let html = render_enable(
             Fetched::Loaded(Overview {
                 routes: vec![classify(passkey("Old token", b"cred-c", false), &[])],
@@ -2564,12 +2871,24 @@ mod tests {
             true,
         );
         assert!(
-            html.contains(r#"<button type="button" disabled"#),
-            "an account with no capable passkey must not be offered the ceremony: {html}"
+            !html.contains(r#"<button type="button" disabled"#),
+            "an account with no capable passkey must be offered a route, not a dead end: {html}"
         );
-        assert!(html.contains("Encryption needs a passkey that can hold a key"));
+        assert!(html.contains("Turn on encryption with a recovery code only"));
+        assert!(
+            html.contains("Your recovery code will be the only key."),
+            "the panel must say the code is the only key: {html}"
+        );
+        assert!(
+            html.contains("no second way in and nothing to fall back on"),
+            "and that there is nothing behind it: {html}"
+        );
+        assert!(
+            !html.contains("losing every passkey and my recovery code"),
+            "the two-wrap acknowledgement claims a fallback this account has not got: {html}"
+        );
 
-        let usable = render_enable(
+        let capable = render_enable(
             Fetched::Loaded(Overview {
                 routes: vec![classify(passkey("Phone", b"cred-b", true), &[])],
                 ..Overview::default()
@@ -2577,8 +2896,12 @@ mod tests {
             true,
         );
         assert!(
-            !usable.contains("Encryption needs a passkey"),
-            "an account that can enable must not be told it cannot"
+            !capable.contains("Turn on encryption with a recovery code only"),
+            "an account that can hold a passkey wrap must not be offered the weaker route"
+        );
+        assert!(
+            capable.contains("There is no reset."),
+            "and must keep the two-wrap warning: {capable}"
         );
     }
 
@@ -2622,6 +2945,60 @@ mod tests {
                 "a probe that answered nothing must not render `{leaked}`"
             );
         }
+    }
+
+    /// The manage view for an account enabled by the recovery-only route,
+    /// which is now an ordinary account rather than a broken one: every
+    /// passkey row says it will never open the entries, or there are no rows
+    /// at all. A heading reading "What can unlock your entries" over nothing
+    /// but that would look like a failed load, so the section says what does
+    /// open the account and how that changes.
+    ///
+    /// The healthy account must not get the line — it would read as a
+    /// warning where there is nothing wrong.
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn an_account_only_its_recovery_code_opens_is_told_so() {
+        let only_the_code = "recovery code is the only thing that opens your entries";
+
+        let incapable = render_manage(
+            true,
+            Overview {
+                routes: vec![classify(passkey("Old token", b"cred-c", false), &[])],
+                has_recovery_wrap: true,
+                ..Overview::default()
+            },
+        );
+        assert!(
+            incapable.contains(only_the_code),
+            "an account no passkey can open must say what can: {incapable}"
+        );
+
+        let no_passkeys = render_manage(
+            true,
+            Overview {
+                has_recovery_wrap: true,
+                ..Overview::default()
+            },
+        );
+        assert!(
+            no_passkeys.contains(only_the_code),
+            "and so must one with no passkeys at all: {no_passkeys}"
+        );
+
+        let wraps = vec![passkey_wrap(b"cred-a")];
+        let healthy = render_manage(
+            true,
+            Overview {
+                routes: vec![classify(passkey("Laptop", b"cred-a", true), &wraps)],
+                has_recovery_wrap: true,
+                ..Overview::default()
+            },
+        );
+        assert!(
+            !healthy.contains(only_the_code),
+            "an account a passkey opens must not be told otherwise: {healthy}"
+        );
     }
 
     /// Never reached by a healthy account — `encryption_enable` writes the

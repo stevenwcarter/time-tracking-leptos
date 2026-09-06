@@ -9,7 +9,7 @@
 
 use leptos::prelude::*;
 
-use crate::dto::WrapDto;
+use crate::dto::{PasskeyWrapDto, WrapDto};
 
 /// Whether the signed-in account is encrypted, and which account that is.
 ///
@@ -61,16 +61,31 @@ pub async fn encryption_wraps() -> Result<Vec<WrapDto>, ServerFnError> {
 }
 
 /// Turns encryption on: one transaction that marks the account and inserts
-/// both starting wraps (spec section 6.1 step 4).
+/// its starting wraps (spec section 6.1 step 4).
+///
+/// `passkey` is optional and `recovery_wrap` is not, which is the asymmetry
+/// spec section 6.1's two routes have. An account with a PRF-capable passkey
+/// sends both and can open its key either way; an account whose
+/// authenticators cannot produce a PRF output — a browser extension with no
+/// PRF support, say — sends the recovery wrap alone and has exactly one way
+/// in, forever. There is no third case: a wrap the recovery code cannot open
+/// is an account nothing can rescue, so the recovery half is never optional.
+///
+/// The schema already permits the one-wrap shape without a migration:
+/// `entry_key_wrap.credential_id` is nullable and both unique indexes are
+/// partial, so zero passkey wraps beside one recovery wrap is a state it
+/// describes rather than tolerates.
 ///
 /// Errors if `encrypted_at` is already set, checked inside the same
 /// transaction as the writes rather than before it — a double-submit must
 /// see one consistent account state, not a check and a write that could
-/// straddle two different ones.
+/// straddle two different ones. That guard is on `encrypted_at` and not on
+/// the wraps, so it holds identically for both routes: a second call at a
+/// recovery-only account would otherwise be the *first* insert of a passkey
+/// wrap and collide with nothing.
 #[server(endpoint = "encryption/enable")]
 pub async fn encryption_enable(
-    passkey_wrap: Vec<u8>,
-    credential_id: Vec<u8>,
+    passkey: Option<PasskeyWrapDto>,
     recovery_wrap: Vec<u8>,
 ) -> Result<(), ServerFnError> {
     use diesel::prelude::*;
@@ -95,13 +110,15 @@ pub async fn encryption_enable(
                 return Ok(Err("Encryption is already enabled for this account."));
             }
             store::set_encrypted(conn, me.id)?;
-            store::insert_wrap(
-                conn,
-                me.id,
-                WrapKind::Passkey,
-                Some(&credential_id),
-                &passkey_wrap,
-            )?;
+            if let Some(passkey) = &passkey {
+                store::insert_wrap(
+                    conn,
+                    me.id,
+                    WrapKind::Passkey,
+                    Some(&passkey.credential_id),
+                    &passkey.wrapped_key,
+                )?;
+            }
             store::insert_wrap(conn, me.id, WrapKind::Recovery, None, &recovery_wrap)?;
             Ok(Ok(()))
         })

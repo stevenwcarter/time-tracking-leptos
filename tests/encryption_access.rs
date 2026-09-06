@@ -73,6 +73,189 @@ async fn enabling_twice_is_refused() {
     assert_eq!(alice.encryption_wraps().await.expect("wraps").len(), 2);
 }
 
+/// Spec section 6.1's second route. An owner whose browser extension does
+/// not implement the WebAuthn PRF extension can enrol passkeys all day and
+/// never get a `prf_capable` one, so the two-wrap route is closed to them
+/// permanently; the recovery code alone has to be able to turn encryption on.
+///
+/// Asserts the shape of what lands, not just that the call succeeded: the
+/// schema permits an account with one recovery wrap and no passkey wrap
+/// (`credential_id` is nullable and both unique indexes are partial), and
+/// this is what pins that the server actually writes that shape rather than
+/// a passkey wrap filed under a null credential.
+#[tokio::test]
+async fn enabling_without_a_passkey_wrap_leaves_one_recovery_wrap() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    alice
+        .encryption_enable_recovery_only(&[2; 40])
+        .await
+        .expect("a recovery code alone must be able to turn encryption on");
+
+    assert!(
+        alice.encryption_status().await.expect("status").enabled,
+        "the account must be marked encrypted"
+    );
+
+    let wraps = alice.encryption_wraps().await.expect("wraps");
+    assert_eq!(wraps.len(), 1, "exactly one wrap, got: {wraps:?}");
+    assert_eq!(wraps[0].kind, "recovery");
+    assert_eq!(wraps[0].credential_id, None);
+    assert_eq!(wraps[0].wrapped_key, vec![2; 40]);
+}
+
+/// The double-enable guard is on `encrypted_at`, not on the passkey wrap, so
+/// it has to hold from a recovery-only account too — where the second call
+/// would otherwise be the *first* insert of a passkey wrap and slip past
+/// nothing at all.
+#[tokio::test]
+async fn a_second_enable_is_refused_after_a_recovery_only_enable() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+    alice
+        .encryption_enable_recovery_only(&[2; 40])
+        .await
+        .expect("first enable");
+
+    let err = alice
+        .encryption_enable(&[3; 40], b"cred-1", &[4; 40])
+        .await
+        .expect_err("a second enable must be refused");
+    assert!(
+        err.contains("already enabled"),
+        "refusal must come from the encrypted_at guard, got: {err}"
+    );
+
+    let err = alice
+        .encryption_enable_recovery_only(&[5; 40])
+        .await
+        .expect_err("and so must a second recovery-only enable");
+    assert!(
+        err.contains("already enabled"),
+        "refusal must come from the encrypted_at guard, got: {err}"
+    );
+
+    let wraps = alice.encryption_wraps().await.expect("wraps");
+    assert_eq!(wraps.len(), 1, "a refused retry must have written nothing");
+    assert_eq!(wraps[0].wrapped_key, vec![2; 40]);
+}
+
+/// The upgrade path out of recovery-only, and the reason the route is not a
+/// one-way door: if the owner later gets hold of a PRF-capable passkey,
+/// `/account`'s existing "give this passkey a key" flow keys it from the
+/// recovery code — `add_passkey_route` already accepts `Opener::Recovery`.
+///
+/// This is the server half of that, which is the half a recovery-only
+/// account could plausibly have broken: `encryption_add_passkey_wrap`
+/// refuses an account that is not encrypted and a credential that already
+/// has a wrap, and neither refusal may fire here.
+#[tokio::test]
+async fn a_recovery_only_account_can_add_a_passkey_wrap_afterwards() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    let mut conn = app.pool.get().expect("checkout");
+    let uid = auth::user::find_or_create(&mut conn, "alice@example.com")
+        .expect("user")
+        .id;
+    let key = enrol_credential("alice@example.com");
+    let cred_id = key.cred_id().to_vec();
+    passkey::store::insert(&mut conn, uid, &key, true).expect("insert passkey");
+    drop(conn);
+
+    alice
+        .encryption_enable_recovery_only(&[2; 40])
+        .await
+        .expect("enable");
+    alice
+        .encryption_add_passkey_wrap(&cred_id, &[3; 40])
+        .await
+        .expect("a recovery-only account must still be able to key a passkey");
+
+    let wraps = alice.encryption_wraps().await.expect("wraps");
+    assert_eq!(wraps.len(), 2);
+    assert!(
+        wraps
+            .iter()
+            .any(|w| w.kind == "passkey" && w.credential_id.as_deref() == Some(cred_id.as_slice())),
+        "the new passkey wrap must be filed under its own credential: {wraps:?}"
+    );
+}
+
+/// Spec section 6.6's refusal, checked where it is vacuous. A recovery-only
+/// account has zero `kind = 'passkey'` wraps, so removing a passkey removes
+/// no unlock route and there is nothing to protect — refusing here would
+/// strand a credential the user cannot delete for a reason that does not
+/// apply to them.
+#[tokio::test]
+async fn a_keyless_passkey_on_a_recovery_only_account_can_still_be_deleted() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    let mut conn = app.pool.get().expect("checkout");
+    let uid = auth::user::find_or_create(&mut conn, "alice@example.com")
+        .expect("user")
+        .id;
+    let key = enrol_credential("alice@example.com");
+    let passkey_id = passkey::store::insert(&mut conn, uid, &key, false).expect("insert passkey");
+    drop(conn);
+
+    alice
+        .encryption_enable_recovery_only(&[2; 40])
+        .await
+        .expect("enable");
+
+    alice
+        .passkey_delete(passkey_id)
+        .await
+        .expect("a passkey that holds no wrap is not an unlock route to protect");
+
+    assert!(alice.passkey_list().await.expect("list").is_empty());
+    let wraps = alice.encryption_wraps().await.expect("wraps");
+    assert_eq!(wraps.len(), 1, "the recovery wrap must survive: {wraps:?}");
+    assert_eq!(wraps[0].kind, "recovery");
+}
+
+/// And the other side of the same check: the moment a recovery-only account
+/// gives a passkey a wrap, that wrap *is* the last passkey route and section
+/// 6.6 must start refusing. Without this, "vacuous on a recovery-only
+/// account" could be implemented as "off on a recovery-only account", and
+/// the refusal would stay off after the account stopped being one.
+#[tokio::test]
+async fn the_first_passkey_wrap_on_a_recovery_only_account_becomes_protected() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+
+    let mut conn = app.pool.get().expect("checkout");
+    let uid = auth::user::find_or_create(&mut conn, "alice@example.com")
+        .expect("user")
+        .id;
+    let key = enrol_credential("alice@example.com");
+    let cred_id = key.cred_id().to_vec();
+    let passkey_id = passkey::store::insert(&mut conn, uid, &key, true).expect("insert passkey");
+    drop(conn);
+
+    alice
+        .encryption_enable_recovery_only(&[2; 40])
+        .await
+        .expect("enable");
+    alice
+        .encryption_add_passkey_wrap(&cred_id, &[3; 40])
+        .await
+        .expect("add wrap");
+
+    let err = alice
+        .passkey_delete(passkey_id)
+        .await
+        .expect_err("the account's only passkey wrap must now be protected");
+    assert!(
+        err.contains("recovery"),
+        "refusal must point at the recovery code, got: {err}"
+    );
+    assert_eq!(alice.encryption_wraps().await.expect("wraps").len(), 2);
+}
+
 #[tokio::test]
 async fn status_reports_disabled_before_enabling_and_enabled_after() {
     let app = TestApp::new().await;

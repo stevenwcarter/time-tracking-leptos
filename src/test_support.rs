@@ -359,7 +359,8 @@ impl SessionClient {
         self.call("encryption/wraps", &[]).await
     }
 
-    /// Turns encryption on for this account.
+    /// Turns encryption on for this account with both wraps — the route an
+    /// account with a PRF-capable passkey takes.
     pub async fn encryption_enable(
         &self,
         passkey_wrap: &[u8],
@@ -369,12 +370,25 @@ impl SessionClient {
         self.call_bytes(
             "encryption/enable",
             &[
-                ("passkey_wrap", passkey_wrap),
-                ("credential_id", credential_id),
+                ("passkey[credential_id]", credential_id),
+                ("passkey[wrapped_key]", passkey_wrap),
                 ("recovery_wrap", recovery_wrap),
             ],
         )
         .await
+    }
+
+    /// Turns encryption on with the recovery wrap alone (spec section 6.1's
+    /// second route), by omitting the `passkey` field entirely rather than
+    /// sending it empty. That absence is what the server reads as "no
+    /// passkey wrap", so a test posting an empty field would be exercising a
+    /// different case than the browser produces.
+    pub async fn encryption_enable_recovery_only(
+        &self,
+        recovery_wrap: &[u8],
+    ) -> Result<(), String> {
+        self.call_bytes("encryption/enable", &[("recovery_wrap", recovery_wrap)])
+            .await
     }
 
     /// Adds a wrap for a newly enrolled passkey.
@@ -539,8 +553,14 @@ fn form_urlencode(raw: &str) -> String {
 /// `serde_qs` itself, not guessed: it does not percent-encode `[`/`]`
 /// because it appends them to the key *after* encoding the rest, and its own
 /// parser round-trips this exact shape.
+///
+/// `key` is a `serde_qs` field *path*, taken verbatim: a bare identifier for
+/// a top-level argument, or `outer[inner]` for a field of a nested struct
+/// (`encryption_enable`'s optional `passkey`). It is not percent-encoded,
+/// because `serde_qs` reads brackets as structure — a `%5B` would parse as
+/// part of a flat field name and the nested argument would go missing. Every
+/// caller passes ASCII identifiers, which need no encoding anyway.
 fn form_urlencode_byte_vec(key: &str, bytes: &[u8]) -> String {
-    let key = form_urlencode(key);
     bytes
         .iter()
         .enumerate()

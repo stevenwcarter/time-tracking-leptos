@@ -55,6 +55,31 @@ pub struct WrapDto {
     pub wrap_alg: String,
 }
 
+/// The passkey half of turning encryption on: a wrap and the credential it
+/// is filed under.
+///
+/// One value rather than two arguments because the pair is optional *as a
+/// pair*. Enabling has two routes (spec section 6.1): most accounts wrap the
+/// data key under a PRF-capable passkey and under the recovery code, but an
+/// account whose authenticators cannot produce a PRF output at all gets the
+/// recovery wrap alone. Two `Option` arguments would also make "a wrap with
+/// no credential to file it under" and "a credential id with nothing to
+/// store for it" expressible, and neither is a state the server could do
+/// anything sensible with — the first is the recovery wrap wearing the wrong
+/// `kind`, and the second writes nothing.
+///
+/// Distinct from [`WrapDto`], which is the *read* shape: that one carries
+/// the algorithm labels back to a client that has to decide whether this
+/// build can open the row, and its `credential_id` is optional because it
+/// describes recovery rows too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasskeyWrapDto {
+    /// The credential whose PRF output derives the key-encryption key.
+    pub credential_id: Vec<u8>,
+    /// The data key wrapped under that key-encryption key.
+    pub wrapped_key: Vec<u8>,
+}
+
 #[cfg(feature = "ssr")]
 impl From<crate::entry_key::store::WrapRow> for WrapDto {
     fn from(row: crate::entry_key::store::WrapRow) -> Self {

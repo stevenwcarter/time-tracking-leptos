@@ -34,8 +34,8 @@ use crate::dto::WrapDto;
 
 #[cfg(feature = "hydrate")]
 pub use self::ceremony::{
-    Enabled, Opener, SessionKey, UnlockError, add_passkey_route, enable, reissue_recovery,
-    unlock_with_prf, unlock_with_recovery,
+    Enabled, Opener, SessionKey, UnlockError, add_passkey_route, enable, enable_recovery_only,
+    reissue_recovery, unlock_with_prf, unlock_with_recovery,
 };
 
 thread_local! {
@@ -419,10 +419,12 @@ mod ceremony {
     /// Everything the enable ceremony produced.
     ///
     /// A struct rather than the tuple the plan sketched, because
-    /// `passkey_wrap` and `recovery_wrap` are both `Vec<u8>` and
-    /// `encryption_enable` takes them one after the other: swapping them at
+    /// `passkey_wrap` and `recovery_wrap` were both `Vec<u8>` and
+    /// `encryption_enable` took them one after the other: swapping them at
     /// the call site would compile, file each wrap under the other's route,
-    /// and leave the account openable by neither secret.
+    /// and leave the account openable by neither secret. The `Option` the
+    /// second route added now separates them by type as well, but the reason
+    /// the struct exists is the one above.
     pub struct Enabled {
         /// Unlocked, but **not** yet remembered on this device: nothing here
         /// touches the keystore, and the caller reaches it only by handing
@@ -430,10 +432,60 @@ mod ceremony {
         pub session_key: SessionKey,
         /// Shown once and never again (spec section 6.1 step 5).
         pub recovery_code: String,
-        /// The data key wrapped under the enrolling credential's KEK.
-        pub passkey_wrap: Vec<u8>,
-        /// The data key wrapped under the recovery code's KEK.
+        /// The data key wrapped under the enrolling credential's KEK, or
+        /// `None` on the recovery-code-only route — see
+        /// [`enable_recovery_only`].
+        pub passkey_wrap: Option<Vec<u8>>,
+        /// The data key wrapped under the recovery code's KEK. Never
+        /// optional: an account whose recovery code opens nothing is one no
+        /// lost passkey can be recovered from.
         pub recovery_wrap: Vec<u8>,
+    }
+
+    /// Generates the account's data key and wraps it under every route it is
+    /// going to have (spec section 6.1 steps 2 and 3).
+    ///
+    /// `prf_output` is `Some` on the ordinary route and `None` on the
+    /// recovery-code-only one; everything else about the two is identical,
+    /// which is why they share this rather than each minting a code and a
+    /// key of their own. The recovery wrap is produced unconditionally.
+    async fn enable_with(
+        prf_output: Option<&[u8]>,
+        user: &str,
+        forgets: Forgets,
+    ) -> Result<Enabled, CryptoError> {
+        let (recovery_code, code_bytes) = new_recovery_code()?;
+
+        let raw_key = subtle::generate_dek_extractable().await?;
+        let passkey_wrap = match prf_output {
+            Some(prf_output) => {
+                let passkey_kek = derive(WrapKind::Passkey, prf_output).await?;
+                Some(subtle::wrap_dek(&raw_key, &passkey_kek).await?)
+            }
+            None => None,
+        };
+        let recovery_kek = derive(WrapKind::Recovery, &code_bytes).await?;
+        let recovery_wrap = subtle::wrap_dek(&raw_key, &recovery_kek).await?;
+
+        // The extractable handle's whole life runs from `generate` above to
+        // the `drop` below: generated, wrapped once per route, read out, and
+        // released before the sealed key even exists. It cannot escape this
+        // function either — `Enabled` carries a `SessionKey`, and nothing can
+        // turn one of those back into a `RawDataKey` (invariant E5, spec
+        // section 4.3). Skipping the passkey wrap shortens that life; it does
+        // not change where it ends.
+        let key = {
+            let raw = subtle::export_raw(&raw_key).await?;
+            drop(raw_key);
+            subtle::import_dek_non_extractable(&raw).await?
+        };
+
+        Ok(Enabled {
+            session_key: SessionKey::held(user, key, forgets),
+            recovery_code,
+            passkey_wrap,
+            recovery_wrap,
+        })
     }
 
     /// Turns encryption on for an account (spec section 6.1).
@@ -466,32 +518,35 @@ mod ceremony {
         user: &str,
         forgets: Forgets,
     ) -> Result<Enabled, CryptoError> {
-        let (recovery_code, code_bytes) = new_recovery_code()?;
+        enable_with(Some(prf_output), user, forgets).await
+    }
 
-        let raw_key = subtle::generate_dek_extractable().await?;
-        let passkey_kek = derive(WrapKind::Passkey, prf_output).await?;
-        let recovery_kek = derive(WrapKind::Recovery, &code_bytes).await?;
-        let passkey_wrap = subtle::wrap_dek(&raw_key, &passkey_kek).await?;
-        let recovery_wrap = subtle::wrap_dek(&raw_key, &recovery_kek).await?;
-
-        // The extractable handle's whole life runs from `generate` above to
-        // the `drop` below: generated, wrapped once per route, read out, and
-        // released before the sealed key even exists. It cannot escape this
-        // function either — `Enabled` carries a `SessionKey`, and nothing can
-        // turn one of those back into a `RawDataKey` (invariant E5, spec
-        // section 4.3).
-        let key = {
-            let raw = subtle::export_raw(&raw_key).await?;
-            drop(raw_key);
-            subtle::import_dek_non_extractable(&raw).await?
-        };
-
-        Ok(Enabled {
-            session_key: SessionKey::held(user, key, forgets),
-            recovery_code,
-            passkey_wrap,
-            recovery_wrap,
-        })
+    /// Turns encryption on with the recovery code as the account's *only*
+    /// route to its data key (spec section 6.1's second route).
+    ///
+    /// For an account that cannot take [`enable`] at all: the PRF extension
+    /// is a browser-and-authenticator capability, and one that is missing is
+    /// missing permanently — an authenticator that does not implement it
+    /// will not start, so "enrol a better passkey first" is advice with
+    /// nowhere to go. The alternative to this route is not a safer account,
+    /// it is a plaintext one.
+    ///
+    /// The cost is real and belongs in the caller's copy, not softened here:
+    /// there is no second wrap and no passkey to fall back on, so losing the
+    /// code loses the entries outright. It is not a dead end, though — a
+    /// PRF-capable passkey enrolled later is keyed from the recovery code
+    /// through [`add_passkey_route`], the same path a user who recovered
+    /// from a total passkey loss takes (spec section 6.5).
+    ///
+    /// `forgets` is a parameter for consistency with [`enable`] rather than
+    /// out of need: this route runs no assertion, so the caller's first await
+    /// really is this call. Reading [`Forgets::now`] here would be correct
+    /// today and silently wrong the day a caller awaits something first.
+    pub async fn enable_recovery_only(
+        user: &str,
+        forgets: Forgets,
+    ) -> Result<Enabled, CryptoError> {
+        enable_with(None, user, forgets).await
     }
 
     /// Opens a wrap into a sealed key.
