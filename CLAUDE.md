@@ -37,9 +37,13 @@ Plain `cargo build`/`test` and `cargo leptos build` fight over the same target
 dir and mutually invalidate the cache. `cargo clippy`/`check` are safe.
 
 Integration tests live in `tests/` (`routes.rs`, `magic_link.rs`,
-`entry_access.rs`, `passkey_access.rs`, `encryption_access.rs`); the plain
-`Tests` command above already runs all of them, and `--test routes` above
-just narrows a run to one file while iterating.
+`entry_access.rs`, `passkey_access.rs`, `encryption_access.rs`,
+`passkey_quota.rs`); the plain `Tests` command above already runs all of
+them, and `--test routes` above just narrows a run to one file while
+iterating. `passkey_quota.rs` is deliberately alone in its binary: the rate
+limiters are process-wide statics keyed by client IP, no test request
+carries one, and that file exhausts a bucket — see its header before adding
+a second test to it.
 
 **Plain `cargo clippy --features ssr --no-default-features` does not lint
 everything.** Modules gated `#[cfg(any(feature = "hydrate", test))]` —

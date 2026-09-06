@@ -425,7 +425,7 @@ mod tests {
         for raw in [
             "We couldn't verify your passkey.",
             "Your sign-in session expired. Please retry.",
-            "Too many attempts. Please wait a minute.",
+            "Too many attempts. Please wait 30 seconds and try again.",
             "That passkey no longer exists.",
             "Not signed in",
         ] {

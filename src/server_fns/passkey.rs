@@ -169,12 +169,21 @@ pub async fn passkey_register_finish(
 /// SECURITY: an unregistered address and a registered one with no enrolled
 /// passkeys both fall through to the same generic error below. That equality
 /// — not any earlier check — is what stops account enumeration (invariant I6).
+///
+/// Phase 2 gave this endpoint a second kind of caller: every encryption
+/// ceremony asserts through it (`crypto::flow::assert_with_prf`), and adding
+/// a passkey to an encrypted account does so twice. Those callers hold a
+/// session, so they draw on [`rate_limit::PasskeyQuota::Ceremony`] rather
+/// than on the anonymous bucket sized for invariant I6 — otherwise a user
+/// who signs in, turns on encryption and adds a second passkey has spent
+/// four of five tokens on ordinary use, and the refusal lands mid-ceremony
+/// with the new credential already enrolled.
 #[server(endpoint = "passkey/login_start")]
 pub async fn passkey_login_start(email: Option<String>) -> Result<String, ServerFnError> {
     use crate::auth::user;
     use crate::passkey::state::{PasskeyState, encode, set_cookie_header};
     use crate::passkey::store;
-    use crate::rate_limit;
+    use crate::rate_limit::PasskeyQuota;
     use webauthn_rs::prelude::*;
 
     let ctx = super::require_ctx()?;
@@ -182,10 +191,16 @@ pub async fn passkey_login_start(email: Option<String>) -> Result<String, Server
         .client_ip
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    if !rate_limit::check_ip(&ip) {
-        return Err(super::server_err(
-            "Too many attempts. Please wait a minute.",
-        ));
+    // `require_user` and not `ctx.claims`: a token whose session was revoked
+    // is not a caller who has proved anything, and it is the same check
+    // every other authenticated endpoint makes.
+    let quota = if super::require_user().is_ok() {
+        PasskeyQuota::Ceremony
+    } else {
+        PasskeyQuota::SignIn
+    };
+    if !quota.check_ip(&ip) {
+        return Err(super::server_err(&quota.too_many()));
     }
 
     let mut conn = ctx
