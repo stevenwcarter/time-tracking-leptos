@@ -229,7 +229,16 @@ fn PasskeySection(
 
     view! {
         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
-            <A href="/" attr:class="text-sm text-blue-600 no-underline">"‹ Back to today"</A>
+            // Hidden during setup rather than shown: `/` resolves to the day
+            // view, and the gate that sent this account here bounces it
+            // straight back to `/account` on mount (`SetupGate`'s `Effect`).
+            // A gated account has exactly two real destinations — finish
+            // setup, or `SetupBanner`'s "sign out and use this device only"
+            // — and a link that flashes the page it claims to leave and
+            // lands back here is worse than no link at all.
+            {move || (!setup.get()).then(|| view! {
+                <A href="/" attr:class="text-sm text-blue-600 no-underline">"‹ Back to today"</A>
+            })}
             <PasskeyIntro email=email setup=setup/>
 
             // Bare `Suspend::new(...)`, not wrapped in an outer `move ||`:

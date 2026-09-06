@@ -147,6 +147,17 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
             .try_update_value(Generation::next)
             .unwrap_or_default();
 
+        // Gated exactly as the view below is (spec section 4.1): the render
+        // match checks `Writes::SetupRequired` before it ever looks at
+        // `totals`, so a read here would fetch a week only to have
+        // `SetupGate` hide it the instant it lands. `session` is already in
+        // hand from `state_untracked` above, so this costs no new
+        // subscription — the token bump above still invalidates whatever
+        // fetch was already in flight if this session just became gated.
+        if session.writes(backend) == Writes::SetupRequired {
+            return;
+        }
+
         // Back to "not loaded" before the new read starts, so a signed-out
         // reload never shows the previous backend's totals under this
         // week's heading.

@@ -160,6 +160,16 @@ fn DayView(date: NaiveDate) -> impl IntoView {
         <div class="min-h-screen bg-gray-50">
             <AppHeader date=Some(date)/>
             <div class="w-full max-w-7xl mx-auto px-4 py-8">
+                // Mounted unconditionally, above the gate below, and still
+                // correct after the two-step setup flow: its candidate list
+                // comes from a browser-only effect keyed on sign-in, and a
+                // gated session's `SetupGate` navigates to `/account` on
+                // mount before that fetch could complete or its banner
+                // render anything a gated visitor would see. Import is
+                // orthogonal to setup besides — it has just as much to offer
+                // a `Locked` or `Unreachable` session — so gating it here
+                // alongside the entry area would wrongly withhold it from
+                // those too.
                 <ImportBanner/>
                 // Spec section 4.1's gate comes first, and is asked of
                 // `EncryptionCtx` rather than re-derived here: "can this
@@ -324,10 +334,35 @@ mod tests {
     fn render_account_page(state: EncryptionState) -> String {
         // Constructing that `Resource` spawns, and spawning without a global
         // executor panics in a debug build — the same install
-        // `storage::hook`'s write-path tests do, and for the same reason.
-        // The pool is never run: the fetch would reach a server function
-        // with no `AppCtx` to answer from, and the fallback is what this
-        // renders either way.
+        // `storage::hook`'s write-path tests do, but *not* for the same
+        // reason: `spawn_local` (what `storage::hook` exercises) lands on a
+        // thread-local `LocalPool` that is genuinely inert until something
+        // calls `poll_local()`, which nothing here does. `Resource::new`'s
+        // fetcher future is `Send`, so it goes through `Executor::spawn`
+        // instead, and this backend's `spawn` dispatches straight to a real
+        // background `futures::executor::ThreadPool` — it runs regardless of
+        // whether anything ever polls it. (Traced through `reactive_graph`'s
+        // `spawn` and `any_spawner`'s `init_futures_executor`.)
+        //
+        // It is harmless here only because `passkey_list()` reaches
+        // `require_ctx()`, which returns a graceful `Err` on the missing
+        // `AppCtx` rather than panicking — so the fetch this spawns quietly
+        // fails and the fallback below is what actually renders either way.
+        // A future server function that panics instead of erroring would
+        // fail silently on that background thread, outside the per-test
+        // `catch_unwind` `cargo test` wraps around the calling thread: this
+        // test would keep passing while the thing it exercises died.
+        //
+        // Not asserted here that nothing panics: `any_spawner` hands back no
+        // join handle for the spawned future, so observing its outcome would
+        // mean racing a `sleep` against a `ThreadPool` worker thread, or
+        // installing a process-global panic hook that every other test in
+        // this binary shares — either risks flakiness or misattributing a
+        // panic from an unrelated, concurrently-running test. If this ever
+        // needs to be load-bearing rather than lucky, the fix is to give
+        // `render_account_page` a real `AppCtx` (as `render_at` does) so the
+        // fetch runs its real path instead of relying on `require_ctx()`'s
+        // graceful failure.
         let _ = any_spawner::Executor::init_futures_executor();
         let runtime = Owner::new();
         let html = runtime.with(move || {
@@ -456,6 +491,27 @@ mod tests {
         assert!(
             !set_up.contains("Sign out and use this device only"),
             "an account that is past the gate must not be offered its escape"
+        );
+    }
+
+    /// The other control on this page that claims to lead somewhere: unlike
+    /// the escape above, "Back to today" is not a route out of the gate at
+    /// all — `/` resolves to the day view, and `SetupGate` bounces a gated
+    /// account straight back to `/account` on mount. Offering it during
+    /// setup would read as a second way out that flashes and returns the
+    /// user where they started, so it must be gone until setup is done.
+    #[test]
+    fn the_setup_view_hides_the_link_that_would_only_bounce_back() {
+        let gated = render_account_page(EncryptionState::Disabled);
+        assert!(
+            !gated.contains("Back to today"),
+            "a link that only bounces back to this same page reads as a broken exit"
+        );
+
+        let set_up = render_account_page(EncryptionState::Locked);
+        assert!(
+            set_up.contains("Back to today"),
+            "an account past the gate has a real destination at `/`, and the link back to it"
         );
     }
 
@@ -627,6 +683,17 @@ mod tests {
     #[test]
     fn ssr_offers_an_editable_entry_area_when_signed_out() {
         let html = render_app();
+        // Positive control: every assertion below also holds if the entry
+        // area were missing entirely, which is exactly the over-gating
+        // regression this test's name promises to catch. This is the one
+        // difference from `a_signed_out_visitor_is_not_gated`, which asserts
+        // the same thing but renders `DayView` directly — this render goes
+        // through the full route table (`App` -> `Routes` -> `DayPage`),
+        // so it is worth keeping rather than deleting as a duplicate.
+        assert!(
+            html.contains("<textarea") && html.contains("></textarea>"),
+            "a signed-out visitor must be offered an entry area to edit"
+        );
         assert!(
             !html.contains("readonly"),
             "a signed-out visitor's session has nothing to probe for and \
