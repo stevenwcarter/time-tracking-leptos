@@ -86,33 +86,6 @@ async fn malformed_dates_and_wide_ranges_are_rejected() {
     );
 }
 
-/// The read half of the encryption migration pass (spec section 8): no date
-/// bounds, and scoped to the caller the same as every other read here.
-#[tokio::test]
-async fn entries_all_returns_every_row_for_the_caller_only() {
-    let app = TestApp::new().await;
-    let alice = signed_in_as(&app, "alice@example.com").await;
-    let mallory = signed_in_as(&app, "mallory@example.com").await;
-
-    alice.save_entry("2020-01-01", "old").await.expect("save");
-    alice
-        .save_entry("2026-09-04", "recent")
-        .await
-        .expect("save");
-    mallory
-        .save_entry("2026-09-04", "mallory-secret")
-        .await
-        .expect("save");
-
-    assert_eq!(
-        alice.entries_all().await.expect("all"),
-        vec![
-            ("2020-01-01".to_string(), "old".to_string()),
-            ("2026-09-04".to_string(), "recent".to_string()),
-        ]
-    );
-}
-
 #[tokio::test]
 async fn save_many_writes_every_entry_in_one_call() {
     let app = TestApp::new().await;
@@ -128,7 +101,10 @@ async fn save_many_writes_every_entry_in_one_call() {
         .expect("save many");
 
     assert_eq!(
-        alice.entries_all().await.expect("all"),
+        alice
+            .entries_in_range("2026-09-01", "2026-09-03")
+            .await
+            .expect("range"),
         vec![
             ("2026-09-01".to_string(), "one".to_string()),
             ("2026-09-02".to_string(), "two".to_string()),
@@ -140,13 +116,6 @@ async fn save_many_writes_every_entry_in_one_call() {
 /// One *call* applies wholly or not at all. Half a batch would leave the
 /// server holding rows the client has no way to enumerate — it sent a list
 /// and got back an error, with nothing saying where in the list it stopped.
-///
-/// Scoped to the call, deliberately, and not to the pass: since spec §8's
-/// amendment the migration is chunked, so earlier chunks that landed stay
-/// landed and a failed pass no longer claims otherwise. That costs the pass
-/// nothing (dispatch is per-row, invariant E3) and costs this property
-/// nothing either — it is the same guarantee `entry_save_many`'s own doc
-/// makes, at the same width.
 #[tokio::test]
 async fn save_many_is_atomic_when_one_entry_is_rejected() {
     let app = TestApp::new().await;
@@ -162,7 +131,11 @@ async fn save_many_is_atomic_when_one_entry_is_rejected() {
 
     assert!(result.is_err());
     assert!(
-        alice.entries_all().await.expect("all").is_empty(),
+        alice
+            .entries_in_range("2026-01-01", "2026-12-31")
+            .await
+            .expect("range")
+            .is_empty(),
         "the entries either side of the rejected one must not have landed"
     );
 }
@@ -183,7 +156,13 @@ async fn save_many_enforces_the_per_body_length_cap() {
         .await;
 
     assert!(result.is_err());
-    assert!(alice.entries_all().await.expect("all").is_empty());
+    assert!(
+        alice
+            .entries_in_range("2026-01-01", "2026-12-31")
+            .await
+            .expect("range")
+            .is_empty()
+    );
 }
 
 /// The per-body cap does not bound a batch: 256 KiB times "as many rows as
@@ -199,8 +178,9 @@ async fn save_many_enforces_the_per_body_length_cap() {
 /// write transaction open for as long as they take to apply.
 ///
 /// The 1.25 MiB half below therefore doubles as a guard on that framework
-/// limit: if it ever fell below what the client chunks at, this test fails in
-/// CI rather than the migration failing in production.
+/// limit: if it ever fell below what the storage seam's own `store_many`
+/// chunks at, this test fails in CI rather than the limit silently sitting
+/// below it in production.
 ///
 /// Refused before the transaction opens, so an oversized request never takes
 /// the write lock: the assertion that nothing landed is what would catch that
@@ -238,7 +218,11 @@ async fn save_many_caps_the_batch_as_well_as_each_body() {
     );
 
     assert!(
-        alice.entries_all().await.expect("all").is_empty(),
+        alice
+            .entries_in_range("2026-01-01", "2026-12-31")
+            .await
+            .expect("range")
+            .is_empty(),
         "a refused batch must write nothing at all"
     );
 }

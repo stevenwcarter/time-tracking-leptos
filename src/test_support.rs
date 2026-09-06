@@ -270,12 +270,6 @@ impl SessionClient {
             .await
     }
 
-    /// This client's every saved entry, across every date — the read half
-    /// of the encryption migration pass.
-    pub async fn entries_all(&self) -> Result<Vec<(String, String)>, String> {
-        self.call("entries/all", &[]).await
-    }
-
     /// Writes every `(date, body)` pair in one call — the bulk write half
     /// of the encryption migration pass, exercising `entry_save_many`'s
     /// one-transaction guarantee.
@@ -347,8 +341,7 @@ impl SessionClient {
         self.call("passkey/delete", &[("id", &id)]).await
     }
 
-    /// This client's encryption status: whether the account is encrypted,
-    /// and whether it looks worth checking for unmigrated entries.
+    /// This client's encryption status: whether the account is encrypted.
     pub async fn encryption_status(&self) -> Result<EncryptionStatus, String> {
         self.call("encryption/status", &[]).await
     }

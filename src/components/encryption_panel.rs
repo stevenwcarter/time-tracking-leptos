@@ -42,23 +42,12 @@ use crate::components::status::Status;
 use crate::crypto::KeySource;
 use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
 
-use chrono::NaiveDate;
 use leptos::either::{Either, EitherOf3, EitherOf7};
 
 #[cfg(any(feature = "hydrate", test))]
 use crate::crypto::choose_route;
 #[cfg(any(feature = "hydrate", test))]
-use crate::crypto::flow;
-#[cfg(any(feature = "hydrate", test))]
-use crate::date::{parse_iso, to_iso};
-#[cfg(any(feature = "hydrate", test))]
 use crate::dto::{PasskeyListItem, WrapDto};
-#[cfg(any(feature = "hydrate", test))]
-use crate::storage::envelope::{ReadPlan, plan_read};
-#[cfg(any(feature = "hydrate", test))]
-use crate::storage::{StorageError, StorageKey};
-#[cfg(any(feature = "hydrate", test))]
-use crate::webauthn_browser::server_refusal;
 
 #[cfg(feature = "hydrate")]
 use leptos::task::spawn_local;
@@ -66,7 +55,7 @@ use leptos::task::spawn_local;
 #[cfg(feature = "hydrate")]
 use crate::storage::Generation;
 #[cfg(feature = "hydrate")]
-use ceremony::{PendingEnable, Refresh};
+use ceremony::PendingEnable;
 
 /// What the account's encryption state means for this panel, with the key
 /// itself dropped.
@@ -202,88 +191,6 @@ fn classify(row: PasskeyListItem, wraps: &[WrapDto]) -> PasskeyRoute {
     }
 }
 
-/// One row the migration is going to re-write.
-///
-/// A struct rather than the `(String, String)` it arrived as, and the date
-/// is parsed on the way in. Both halves were `String` and the pass carries
-/// them together through a seal step before handing them to the storage
-/// seam: swapping them would have compiled, and would have filed every entry
-/// under a date made of its own text. Parsing here also means an
-/// uninterpretable date is caught by the pass, which can name it, rather
-/// than by `entry_save_many`, which refuses the whole batch over it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
-struct PendingRow {
-    date: NaiveDate,
-    /// The plaintext, already unwrapped from its v1 envelope.
-    body: String,
-}
-
-/// What one pass over `entries_all()` found, and so what the migration will
-/// and will not touch.
-///
-/// The server cannot produce this: answering "which rows are still
-/// plaintext" means reading each row's envelope version, which is parsing a
-/// body, which invariant E1 forbids outright. So the classification happens
-/// in the browser (spec section 8).
-///
-/// The two halves are separate because they need different handling and
-/// different words on screen. `pending` is work the pass does; `unreadable`
-/// is work it refuses to do, and reports instead.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
-struct MigrationPlan {
-    /// Every row still stored as v1, with the body ready to seal.
-    pending: Vec<PendingRow>,
-    /// The dates of rows this build could not interpret at all — named, not
-    /// counted. Guessing at one would destroy it, and skipping it silently
-    /// would leave it plaintext forever with nobody told which day it was.
-    unreadable: Vec<String>,
-}
-
-impl MigrationPlan {
-    /// Sorts `entries_all()`'s rows into the ones the migration must
-    /// re-write and the ones it must leave alone.
-    ///
-    /// Pure, and the only part of the migration a host test can reach —
-    /// sealing a body goes through WebCrypto, which has no host equivalent.
-    /// Dispatch is on each row's own envelope version, never on account
-    /// state, which is what makes the pass resumable: run it again and it
-    /// simply finds fewer v1 rows. A v2 row is left strictly alone rather
-    /// than re-sealed, because re-sealing means decrypting first and a bug
-    /// on that path destroys data (spec E3, section 8).
-    #[cfg(any(feature = "hydrate", test))]
-    fn of(rows: Vec<(String, String)>) -> Self {
-        let mut plan = Self::default();
-        for (date, raw) in rows {
-            // A date this build cannot read is as unreadable as a body it
-            // cannot parse, and belongs in the same list: the pass would
-            // otherwise have to guess which day the row is, and sending it
-            // on would have `entry_save_many` refuse — and roll back — the
-            // entire batch over the one row.
-            let Some(day) = parse_iso(&date) else {
-                plan.unreadable.push(date);
-                continue;
-            };
-            match plan_read(&raw) {
-                Ok(ReadPlan::Plaintext(body)) => plan.pending.push(PendingRow { date: day, body }),
-                Ok(ReadPlan::Sealed(_)) => {}
-                Err(_) => plan.unreadable.push(date),
-            }
-        }
-        plan
-    }
-
-    /// The pass's work, in the shape the storage seam takes.
-    #[cfg(feature = "hydrate")]
-    fn into_rows(self) -> Vec<(NaiveDate, String)> {
-        self.pending
-            .into_iter()
-            .map(|row| (row.date, row.body))
-            .collect()
-    }
-}
-
 /// Everything the panel fetches about the account in one go.
 #[derive(Clone, Default)]
 #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
@@ -291,11 +198,6 @@ struct Overview {
     routes: Vec<PasskeyRoute>,
     /// Whether a recovery wrap this build can open is on file.
     has_recovery_wrap: bool,
-    unencrypted_days: usize,
-    /// The dates of rows nothing here can read. Dates rather than a count:
-    /// this is the one thing on the panel the user has to act on by hand,
-    /// and "2 days couldn't be read" tells them nothing about which two.
-    unreadable_dates: Vec<String>,
 }
 
 impl Overview {
@@ -690,62 +592,6 @@ impl Screen {
     }
 }
 
-/// "1 day" / "2 days", so counts read as English.
-fn days(n: usize) -> String {
-    format!("{n} {}", if n == 1 { "day" } else { "days" })
-}
-
-/// What a failed migration pass leaves the user holding.
-///
-/// Out here rather than inside the `hydrate`-only `ceremony` module below
-/// precisely so it has a test: what it decides is the only thing a user gets
-/// to act on when a pass stops, and each of its three answers sends them
-/// somewhere different.
-///
-/// A seal failure names its day. One body this build cannot seal blocks the
-/// rest of the account's pass every time it is run, forever, and the only
-/// remedy is a person opening that day and editing what is in it — so a
-/// message that says "this browser couldn't encrypt your entries" points at
-/// the browser, which is not where the problem is. The date is recoverable
-/// because `store_many` keys the error by [`StorageKey::as_key`], and
-/// [`StorageKey::parse`] reads it back.
-///
-/// A refusal the server explained is repeated verbatim: `server_err`
-/// guarantees it carries no internal detail, and "that's too many entries in
-/// one request" is not a connection problem. Only a call that never got an
-/// answer earns the connection hint — see
-/// [`webauthn_browser::server_refusal`](crate::webauthn_browser::server_refusal).
-///
-/// Every message says what the pass left behind, because chunking means the
-/// answer is no longer "nothing": days sealed before the failure stay
-/// sealed.
-#[cfg(any(feature = "hydrate", test))]
-fn pass_failed(err: StorageError) -> String {
-    match err {
-        StorageError::Crypto { key, .. } => match StorageKey::parse(&key) {
-            Some(key) => format!(
-                "This browser couldn't encrypt the entry for {}, so the pass stopped there. \
-                 Days encrypted before it stayed encrypted. Open that day, check what's in \
-                 it, and try again.",
-                to_iso(key.date()),
-            ),
-            // Only reachable if the seam ever keys a `Crypto` error by
-            // something other than a storage key. Says less rather than
-            // guessing at a day.
-            None => "This browser couldn't encrypt one of your entries, so the pass stopped \
-                     there. Days encrypted before it stayed encrypted."
-                .to_string(),
-        },
-        StorageError::Server(message) => match server_refusal(&message) {
-            Some(refusal) => format!(
-                "{refusal}. Days encrypted before that stayed encrypted; try again to finish."
-            ),
-            None => flow::SERVER_UNREACHABLE.to_string(),
-        },
-        _ => flow::SERVER_UNREACHABLE.to_string(),
-    }
-}
-
 #[component]
 pub fn EncryptionPanel(
     /// Bumped by whoever changes the account's passkeys, and by this panel
@@ -768,14 +614,6 @@ pub fn EncryptionPanel(
     let overview = RwSignal::new(Fetched::default());
 
     let phase = Memo::new(move |_| Phase::of(&encryption.state()));
-
-    // Whether a migration pass is running. A `StoredValue` rather than a
-    // signal precisely because the overview effect below reads it and must
-    // not become its subscriber: this says "skip work that is about to be
-    // redone", and re-running the effect to learn that would be the very
-    // fetch it exists to avoid.
-    #[cfg(feature = "hydrate")]
-    let migrating = StoredValue::new(false);
 
     // Bridges the enable ceremony's two clicks: everything computed before
     // the server hears about it waits here while the recovery code is on
@@ -809,18 +647,9 @@ pub fn EncryptionPanel(
                 return;
             }
             let encrypted = phase.encrypted();
-            let refresh = Refresh {
-                encrypted,
-                // Enabling encryption wakes this effect and starts a
-                // migration from the same click, and that pass reads every
-                // row itself. Surveying them here too would be a second full
-                // `entries_all()` for numbers the pass replaces with better
-                // ones a moment later.
-                survey_entries: encrypted && !migrating.get_value(),
-            };
 
             spawn_local(async move {
-                let loaded = ceremony::load_overview(refresh).await;
+                let loaded = ceremony::load_overview(encrypted).await;
                 let is_current = generation
                     .try_with_value(|g| g.is_current(token))
                     .unwrap_or(false);
@@ -834,98 +663,6 @@ pub fn EncryptionPanel(
             });
         });
     }
-
-    // Re-encrypts whatever is left in the clear. Shared by the tail of the
-    // enable ceremony and the resume control, which are the same operation
-    // reached from two places — the second exists precisely because the
-    // first can be interrupted (spec section 8).
-    let run_migration = move || {
-        #[cfg(feature = "hydrate")]
-        {
-            busy.set(true);
-            // Set before the spawn, so the overview effect that the same
-            // click wakes — via the phase change enabling produces — sees it
-            // and skips its own survey of the rows this pass is about to
-            // re-write.
-            migrating.set_value(true);
-            status.set(Some(Status::Note(
-                "Encrypting the entries already saved…".to_string(),
-            )));
-            spawn_local(async move {
-                // The key is read here rather than carried in, so a lock or
-                // a sign-out that landed while this was queued is seen.
-                let state = encryption.state_untracked();
-                let outcome = match state.key() {
-                    // Sealing is one WebCrypto round trip per row, so a
-                    // large account spends a while here with nothing to
-                    // show for it. The callback lands between rows, on the
-                    // await that yields to the event loop, so the line on
-                    // screen actually moves.
-                    Some(key) => {
-                        ceremony::migrate(key, |at| {
-                            status.set(Some(Status::Note(format!(
-                                "Encrypting your entries… day {} of {}.",
-                                at.day, at.total,
-                            ))));
-                        })
-                        .await
-                    }
-                    None => Err("This device is locked, so nothing could be re-encrypted \
-                                 yet."
-                        .to_string()),
-                };
-                busy.set(false);
-                migrating.set_value(false);
-                let done = match outcome {
-                    Ok(done) => done,
-                    Err(message) => {
-                        // A pass is a sequence of chunks, not one
-                        // transaction, so a failure may have left some days
-                        // sealed and others not — and the counts on screen
-                        // were computed before any of it. `reload` is what
-                        // re-surveys them, and it is safe here because the
-                        // pass is over: `migrating` is already back to false,
-                        // so the effect it wakes does look at the rows.
-                        status.set(Some(Status::Problem(message)));
-                        reload.update(|n| *n += 1);
-                        return;
-                    }
-                };
-                // The pass has just surveyed every row in the account, so it
-                // knows the new numbers exactly — better than a refetch
-                // would, and without the third `entries_all()` a `reload`
-                // bump would have cost. Nothing about the account's passkeys
-                // changed here, which is the other thing `reload` refreshes.
-                overview.update(|fetched| {
-                    if let Fetched::Loaded(overview) = fetched {
-                        overview.unencrypted_days = 0;
-                        overview.unreadable_dates.clone_from(&done.unreadable);
-                    }
-                });
-                if done.unreadable.is_empty() {
-                    status.set(Some(Status::Note(match done.encrypted {
-                        0 => "Everything is already encrypted.".to_string(),
-                        count => format!("Encrypted {}.", days(count)),
-                    })));
-                    return;
-                }
-                // A row the pass could not read is the one outcome that
-                // needs the user, so it is reported as a problem even when
-                // the rest of the account went through — and by date,
-                // because "look at these two days" is the only action
-                // available to them.
-                let encrypted = match done.encrypted {
-                    0 => String::new(),
-                    count => format!("Encrypted {}. ", days(count)),
-                };
-                status.set(Some(Status::Problem(format!(
-                    "{encrypted}{} could not be read at all and stayed unencrypted: {}.",
-                    days(done.unreadable.len()),
-                    done.unreadable.join(", "),
-                ))));
-            });
-        }
-    };
 
     // `route` is decided by the section that rendered the button, not
     // re-derived here: the words the user just read and the ceremony that
@@ -1000,11 +737,8 @@ pub fn EncryptionPanel(
                         // neither published nor written to this device's
                         // keystore, rather than sealing the signed-out
                         // page's `localStorage` under it. Awaited because
-                        // the keystore write lives behind that check, and
-                        // because the migration below needs the key
-                        // published first.
+                        // the keystore write lives behind that check.
                         encryption.unlock(key).await;
-                        run_migration();
                     }
                     Err(message) => status.set(Some(Status::Problem(message))),
                 }
@@ -1195,7 +929,6 @@ pub fn EncryptionPanel(
                         busy=busy
                         on_lock=lock_now
                         on_reissue=start_reissue
-                        on_migrate=run_migration
                         on_give_key=start_give_key
                     />
                 }),
@@ -1356,7 +1089,6 @@ fn EnableSection(
             <ul class="list-disc pl-5 text-sm text-gray-600 mb-4 space-y-1">
                 <li>{move || words().first_step}</li>
                 <li>{move || words().code_step}</li>
-                <li>"Entries you've already saved are re-encrypted in place. Nothing is deleted."</li>
                 <li>{move || words().later_passkey}</li>
             </ul>
 
@@ -1387,7 +1119,7 @@ fn EnableSection(
 }
 
 /// The panel for an account that is already encrypted (spec sections 6.5,
-/// 6.6, 6.7 and 8).
+/// 6.6 and 6.7).
 #[component]
 fn ManageSection(
     unlocked: bool,
@@ -1395,7 +1127,6 @@ fn ManageSection(
     busy: RwSignal<bool>,
     on_lock: impl Fn() + Copy + Send + 'static,
     on_reissue: impl Fn() + Copy + Send + 'static,
-    on_migrate: impl Fn() + Copy + Send + 'static,
     on_give_key: impl Fn(String, Vec<u8>) + Copy + Send + 'static,
 ) -> impl IntoView {
     view! {
@@ -1475,44 +1206,6 @@ fn ManageSection(
                             <p class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-2">
                                 "No recovery code is on file for this account. If you lose the \
                                  passkeys above, your entries are gone. Generate one now."
-                            </p>
-                        })}
-                        {(overview.unencrypted_days > 0).then(|| view! {
-                            <div class="rounded border border-amber-200 bg-amber-50 p-3 mb-2">
-                                <p class="text-sm text-amber-900 mb-2">
-                                    {format!("{} still stored unencrypted.", days(overview.unencrypted_days))}
-                                </p>
-                                {if unlocked {
-                                    Either::Left(view! {
-                                        <button
-                                            type="button"
-                                            class="bg-amber-700 text-white text-sm font-semibold rounded px-3 py-1.5 hover:bg-amber-800 disabled:opacity-60"
-                                            disabled=move || busy.get()
-                                            on:click=move |_| on_migrate()
-                                        >
-                                            "Finish encrypting"
-                                        </button>
-                                    })
-                                } else {
-                                    Either::Right(view! {
-                                        <p class="text-sm text-amber-900">
-                                            "Unlock this device to finish."
-                                        </p>
-                                    })
-                                }}
-                            </div>
-                        })}
-                        // Named, not counted. This is the only thing on the
-                        // panel the user has to go and look at by hand, and
-                        // a bare number tells them nothing about where.
-                        {(!overview.unreadable_dates.is_empty()).then(|| view! {
-                            <p class="text-sm text-red-700 mb-2">
-                                {format!(
-                                    "{} could not be read at all, and nothing was changed \
-                                     there: {}.",
-                                    days(overview.unreadable_dates.len()),
-                                    overview.unreadable_dates.join(", "),
-                                )}
                             </p>
                         })}
                     </div>
@@ -1826,58 +1519,28 @@ fn RouteRow(
 /// Browser-only, like the rest of spec section 6.
 #[cfg(feature = "hydrate")]
 mod ceremony {
-    use super::{MigrationPlan, Overview, classify, pass_failed};
+    use super::{Overview, classify};
     use crate::crypto::flow::{self, PrfAssertion};
     use crate::crypto::{Enabled, Forgets, SessionKey, choose_route, enable, enable_recovery_only};
     use crate::dto::PasskeyWrapDto;
     use crate::server_fns::encryption::{encryption_enable, encryption_wraps};
-    use crate::server_fns::entries::entries_all;
     use crate::server_fns::passkey::passkey_list;
-    use crate::storage::{Progress, WriteKey, store_many};
-
-    /// What one refresh of the panel's overview should go and ask for.
-    ///
-    /// A named pair rather than two `bool` arguments, which a caller could
-    /// swap without the compiler minding. They ask for very different
-    /// amounts of data — a list of passkeys against every row in the account
-    /// — so swapping them would either skip the wraps the panel classifies
-    /// by, or pull the whole account down for nothing.
-    #[derive(Clone, Copy)]
-    pub struct Refresh {
-        /// Whether the account is encrypted, and so whether its wraps are
-        /// worth asking for at all.
-        pub encrypted: bool,
-        /// Whether to survey every row for un-migrated bodies. Skipped while
-        /// a migration is running: that pass reads the same rows and reports
-        /// better numbers a moment later, and enabling encryption starts
-        /// both from one click.
-        pub survey_entries: bool,
-    }
 
     /// Fetches everything the panel reports on.
     ///
-    /// `entries_all` is only called when the panel actually needs the count,
-    /// and only because there is no server-side answer to "how many rows are
-    /// still plaintext": producing one would mean the server parsing bodies,
-    /// which invariant E1 forbids (see `dto::EncryptionStatus`).
-    pub async fn load_overview(refresh: Refresh) -> Result<Overview, String> {
+    /// `encrypted` is whether the account is encrypted, and so whether its
+    /// wraps are worth asking for at all.
+    pub async fn load_overview(encrypted: bool) -> Result<Overview, String> {
         let rows = passkey_list().await.map_err(flow::server_unreachable)?;
-        let wraps = if refresh.encrypted {
+        let wraps = if encrypted {
             encryption_wraps().await.map_err(flow::server_unreachable)?
         } else {
             Vec::new()
-        };
-        let plan = if refresh.survey_entries {
-            MigrationPlan::of(entries_all().await.map_err(flow::server_unreachable)?)
-        } else {
-            MigrationPlan::default()
         };
 
         Ok(Overview {
             routes: rows.into_iter().map(|row| classify(row, &wraps)).collect(),
             has_recovery_wrap: choose_route(&wraps, None).is_some(),
-            unencrypted_days: plan.pending.len(),
-            unreadable_dates: plan.unreadable,
         })
     }
 
@@ -2024,58 +1687,12 @@ mod ceremony {
 
         Ok(session_key)
     }
-
-    /// What one migration pass did, and what it declined to touch.
-    pub struct MigrationOutcome {
-        /// How many days this pass re-wrote as v2.
-        pub encrypted: usize,
-        /// The dates it could not read, and so left exactly as they were.
-        /// Carried out rather than dropped: this is the pass's only chance
-        /// to tell anyone, and a later run will find the same rows and say
-        /// the same thing to nobody.
-        pub unreadable: Vec<String>,
-    }
-
-    /// Re-encrypts every row still stored as v1 (spec section 8), calling
-    /// `progress` as it reaches each row.
-    ///
-    /// Through the storage seam's [`store_many`], not around it: `WriteKey`
-    /// is what stops a session that cannot seal writing plaintext into an
-    /// encrypted account, and a pass with a write path of its own would be
-    /// the one place that guard did not apply (invariant E7).
-    ///
-    /// Resumable by construction, and by per-row dispatch rather than by
-    /// atomicity: `store_many` sends the pass in chunks, so a run that stops
-    /// partway leaves the chunks that landed sealed and fewer v1 rows for
-    /// the next run to find. A v2 row is never re-sent — re-sealing one
-    /// means decrypting it first, work with nothing to gain and data to
-    /// lose. Rows this build cannot read at all are not sent either, for the
-    /// same reason, and come back named in the outcome.
-    pub async fn migrate(
-        key: &SessionKey,
-        progress: impl Fn(Progress),
-    ) -> Result<MigrationOutcome, String> {
-        let rows = entries_all().await.map_err(flow::server_unreachable)?;
-        let plan = MigrationPlan::of(rows);
-        let unreadable = plan.unreadable.clone();
-        let encrypted = plan.pending.len();
-
-        store_many(plan.into_rows(), WriteKey::Sealed(key), progress)
-            .await
-            .map_err(pass_failed)?;
-
-        Ok(MigrationOutcome {
-            encrypted,
-            unreadable,
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::wire::{self, WrapKind};
-    use crate::storage::envelope::wrap_v1;
 
     fn passkey(name: &str, credential_id: &[u8], prf_capable: bool) -> PasskeyListItem {
         PasskeyListItem {
@@ -2209,143 +1826,6 @@ mod tests {
         assert_ne!(only.button, both.button);
     }
 
-    fn pending(date: &str, body: &str) -> PendingRow {
-        PendingRow {
-            date: parse_iso(date).expect("valid date"),
-            body: body.to_string(),
-        }
-    }
-
-    fn sealed_row(ciphertext: Vec<u8>) -> String {
-        wire::encode_v2(&wire::Sealed {
-            nonce: vec![0; wire::NONCE_LEN],
-            ciphertext,
-        })
-    }
-
-    /// The selection the migration acts on, and the count the panel reports
-    /// from it. A v2 row re-sent through the pass would be decrypted and
-    /// re-sealed for nothing, and a bug in that path destroys data — so
-    /// "already encrypted" must be excluded, not merely harmless.
-    #[test]
-    fn only_plaintext_rows_are_pending() {
-        let plan = MigrationPlan::of(vec![
-            ("2026-09-01".to_string(), wrap_v1("morning")),
-            ("2026-09-02".to_string(), sealed_row(vec![1, 2, 3])),
-            ("2026-09-03".to_string(), wrap_v1("")),
-        ]);
-
-        assert_eq!(
-            plan.pending,
-            vec![
-                pending("2026-09-01", "morning"),
-                // An empty body is a real saved state, not an absence, and
-                // leaving it as the account's one v1 row would keep the
-                // panel reporting unfinished work forever.
-                pending("2026-09-03", ""),
-            ]
-        );
-        assert!(plan.unreadable.is_empty());
-    }
-
-    /// A row nobody can interpret is named, not dropped and not reduced to
-    /// a number. Silently skipping it would leave it plaintext forever with
-    /// nothing to say so, and a count would tell the user something is
-    /// wrong without telling them where to look — the one outcome a
-    /// one-shot migration cannot recover from on a later run.
-    #[test]
-    fn an_unreadable_row_is_reported_rather_than_skipped() {
-        let plan = MigrationPlan::of(vec![
-            ("2026-09-01".to_string(), "not an envelope".to_string()),
-            (
-                "2026-09-02".to_string(),
-                r#"{"v":9,"alg":"future"}"#.to_string(),
-            ),
-            // A key this build cannot read as a date belongs in the same
-            // list: sending it on would have `entry_save_many` refuse — and
-            // roll back — the whole batch over the one row, so a readable
-            // body under an unreadable date is still work the pass must
-            // decline and name.
-            ("not-a-date".to_string(), wrap_v1("stranded")),
-            ("2026-09-03".to_string(), wrap_v1("real")),
-        ]);
-
-        assert_eq!(
-            plan.unreadable,
-            vec![
-                "2026-09-01".to_string(),
-                "2026-09-02".to_string(),
-                "not-a-date".to_string()
-            ]
-        );
-        assert_eq!(plan.pending, vec![pending("2026-09-03", "real")]);
-    }
-
-    /// The message a blocked account lives with. One body this build cannot
-    /// seal stops the pass every time it runs — for good, since nothing
-    /// retries differently — and the only remedy is a person opening that
-    /// day. Naming it is the difference between an action and a shrug.
-    #[test]
-    fn a_seal_failure_names_the_day_it_stopped_on() {
-        let message = pass_failed(StorageError::Crypto {
-            key: StorageKey::TimeEntry(parse_iso("2026-09-04").expect("valid date")).as_key(),
-            detail: "OperationError".to_string(),
-        });
-        assert!(
-            message.contains("2026-09-04"),
-            "the day is the only thing the user can act on: {message}"
-        );
-        assert!(
-            !message.contains("nothing was changed"),
-            "a chunked pass may already have sealed earlier days: {message}"
-        );
-    }
-
-    /// A refusal the server explained is not a connection problem, and
-    /// telling the user to check their network hides the sentence the server
-    /// was trying to give them — "that's too many entries in one request" is
-    /// not something a reconnect fixes.
-    #[test]
-    fn a_refusal_the_server_explained_is_repeated() {
-        let refused: ServerFnError =
-            ServerFnError::ServerError("That's too many entries in one request".to_string());
-        let message = pass_failed(StorageError::Server(refused.to_string()));
-        assert!(
-            message.contains("too many entries"),
-            "the server's own words must survive: {message}"
-        );
-        assert!(
-            !message.contains("Check your connection"),
-            "an answered request is not a connection failure: {message}"
-        );
-    }
-
-    /// The complement, and the reason the two are told apart at all: a call
-    /// that never landed has no sentence to repeat, so the connection hint
-    /// is the useful thing left to say.
-    #[test]
-    fn a_call_that_never_landed_gets_the_connection_hint() {
-        let dropped = pass_failed(StorageError::Server(
-            "error reaching server to call server function: offline".to_string(),
-        ));
-        assert_eq!(dropped, crate::crypto::flow::SERVER_UNREACHABLE);
-        assert_eq!(
-            pass_failed(StorageError::Unavailable),
-            crate::crypto::flow::SERVER_UNREACHABLE
-        );
-    }
-
-    /// Resumability at the boundary: an account with nothing left to do
-    /// reports nothing to do, so the panel stops offering a pass that would
-    /// re-write every row for no reason.
-    #[test]
-    fn an_account_with_no_plaintext_rows_needs_no_work() {
-        assert_eq!(MigrationPlan::of(Vec::new()), MigrationPlan::default());
-
-        let plan = MigrationPlan::of(vec![("2026-09-01".to_string(), sealed_row(vec![4]))]);
-        assert_eq!(plan, MigrationPlan::default());
-    }
-
     /// The precedence the whole recovery story hangs on. A code on screen
     /// has to outrank the account's state, and neither code-bearing mode
     /// lines up with a phase that would render it: `NewCode` is shown while
@@ -2451,7 +1931,6 @@ mod tests {
             // with no wrap of its own yet.
             routes: vec![classify(passkey("New phone", b"cred-b", true), &[])],
             has_recovery_wrap: true,
-            ..Overview::default()
         };
         assert_eq!(Openers::of(&recovered), Openers::RecoveryOnly);
         assert!(
@@ -2468,7 +1947,6 @@ mod tests {
                 classify(passkey("New phone", b"cred-b", true), &wraps),
             ],
             has_recovery_wrap: true,
-            ..Overview::default()
         };
         assert_eq!(Openers::of(&healthy), Openers::Either);
     }
@@ -2483,14 +1961,12 @@ mod tests {
         let no_code = Overview {
             routes: vec![classify(passkey("Laptop", b"cred-a", true), &wraps)],
             has_recovery_wrap: false,
-            ..Overview::default()
         };
         assert_eq!(Openers::of(&no_code), Openers::PasskeyOnly);
 
         let nothing = Overview {
             routes: vec![classify(passkey("New phone", b"cred-b", true), &wraps)],
             has_recovery_wrap: false,
-            ..Overview::default()
         };
         assert_eq!(Openers::of(&nothing), Openers::Nothing);
         assert!(!Openers::of(&nothing).passkey());
@@ -2591,7 +2067,6 @@ mod tests {
                     busy=RwSignal::new(false)
                     on_lock=|| {}
                     on_reissue=|| {}
-                    on_migrate=|| {}
                     on_give_key=|_, _| {}
                 />
             }
@@ -2631,7 +2106,6 @@ mod tests {
         let recovered = render_give_key(Fetched::Loaded(Overview {
             routes: vec![classify(passkey("New phone", b"cred-b", true), &[])],
             has_recovery_wrap: true,
-            ..Overview::default()
         }));
         assert!(recovered.contains("Use my recovery code"));
         assert!(
@@ -2646,7 +2120,6 @@ mod tests {
                 classify(passkey("New phone", b"cred-b", true), &wraps),
             ],
             has_recovery_wrap: true,
-            ..Overview::default()
         }));
         assert!(healthy.contains("Use another passkey"));
         assert!(healthy.contains("Use my recovery code"));
@@ -2694,7 +2167,6 @@ mod tests {
         let recovered = render_reissue(Fetched::Loaded(Overview {
             routes: vec![classify(passkey("New phone", b"cred-b", true), &[])],
             has_recovery_wrap: true,
-            ..Overview::default()
         }));
         assert!(recovered.contains("Use my current code"));
         assert!(
@@ -2706,7 +2178,6 @@ mod tests {
         let healthy = render_reissue(Fetched::Loaded(Overview {
             routes: vec![classify(passkey("Laptop", b"cred-a", true), &wraps)],
             has_recovery_wrap: true,
-            ..Overview::default()
         }));
         assert!(healthy.contains("Use a passkey"));
         assert!(healthy.contains("Use my current code"));
@@ -2802,6 +2273,10 @@ mod tests {
         assert!(
             html.contains("before encryption is switched on"),
             "the code is promised before the switch, because that is the order it runs in"
+        );
+        assert!(
+            !html.contains("re-encrypted in place"),
+            "there is no migration pass left to make that promise"
         );
     }
 
@@ -2966,7 +2441,6 @@ mod tests {
             Overview {
                 routes: vec![classify(passkey("Old token", b"cred-c", false), &[])],
                 has_recovery_wrap: true,
-                ..Overview::default()
             },
         );
         assert!(
@@ -2992,7 +2466,6 @@ mod tests {
             Overview {
                 routes: vec![classify(passkey("Laptop", b"cred-a", true), &wraps)],
                 has_recovery_wrap: true,
-                ..Overview::default()
             },
         );
         assert!(
@@ -3017,7 +2490,6 @@ mod tests {
             Overview {
                 routes: routes.clone(),
                 has_recovery_wrap: false,
-                ..Overview::default()
             },
         );
         assert!(missing.contains("No recovery code is on file for this account"));
@@ -3031,7 +2503,6 @@ mod tests {
             Overview {
                 routes,
                 has_recovery_wrap: true,
-                ..Overview::default()
             },
         );
         assert!(
@@ -3099,7 +2570,6 @@ mod tests {
                     classify(passkey("Old token", b"cred-c", false), &wraps),
                 ],
                 has_recovery_wrap: true,
-                ..Overview::default()
             },
         );
 
@@ -3117,70 +2587,37 @@ mod tests {
         );
     }
 
-    /// The resume control from spec section 8, and the one thing it depends
-    /// on: sealing needs the key, so a locked device is told what to do
-    /// rather than handed a button that cannot work. The count itself shows
-    /// either way — it is the answer to "is my data actually encrypted
-    /// yet", which a locked visitor may well be asking.
+    /// The migration pass is gone, and so is everything it used to report:
+    /// no count of unencrypted days, no resume control, no unreadable-row
+    /// warning, and none of the enable pitch's old promise to re-encrypt
+    /// entries already saved. Rendered both unlocked and locked, and with a
+    /// passkey on file, so this cannot pass by accident of an empty
+    /// `Overview` — a heading with nothing to say beneath it would be the
+    /// same failure the migration's removal must not leave behind.
     #[cfg(feature = "ssr")]
     #[test]
-    fn an_unfinished_migration_offers_a_resume_only_where_it_can_run() {
-        let pending = Overview {
+    fn the_manage_view_carries_no_migration_surface() {
+        let overview = Overview {
+            routes: vec![classify(passkey("Laptop", b"cred-a", true), &[])],
             has_recovery_wrap: true,
-            unencrypted_days: 3,
-            ..Overview::default()
         };
 
-        let unlocked = render_manage(true, pending.clone());
-        assert!(unlocked.contains("3 days still stored unencrypted"));
-        assert!(unlocked.contains("Finish encrypting"));
-
-        let locked = render_manage(false, pending);
-        assert!(locked.contains("3 days still stored unencrypted"));
-        assert!(
-            !locked.contains("Finish encrypting"),
-            "a locked device cannot seal anything and must not be offered the pass"
-        );
-        assert!(locked.contains("Unlock this device to finish"));
-    }
-
-    /// Spec section 8's report, at the view. A row that failed to read is a
-    /// one-time event with no automatic remedy: the pass will find it again
-    /// and again and change nothing. So the panel names the days rather
-    /// than counting them, which is the difference between the user being
-    /// able to go and look and the user only knowing that something,
-    /// somewhere, did not migrate.
-    #[cfg(feature = "ssr")]
-    #[test]
-    fn unreadable_days_are_named_not_counted() {
-        let html = render_manage(
-            true,
-            Overview {
-                has_recovery_wrap: true,
-                unreadable_dates: vec!["2026-09-01".to_string(), "2026-09-04".to_string()],
-                ..Overview::default()
-            },
-        );
-        assert!(html.contains("2 days could not be read"));
-        for date in ["2026-09-01", "2026-09-04"] {
-            assert!(html.contains(date), "`{date}` was reduced to a count");
+        for html in [
+            render_manage(true, overview.clone()),
+            render_manage(false, overview),
+        ] {
+            assert!(html.contains("What can unlock your entries"));
+            assert!(
+                html.contains("Laptop"),
+                "the heading must sit over real content: {html}"
+            );
+            for leaked in [
+                "still stored unencrypted",
+                "Finish encrypting",
+                "could not be read",
+            ] {
+                assert!(!html.contains(leaked), "migration copy leaked: `{leaked}`");
+            }
         }
-    }
-
-    /// A finished account is not nagged: no count, no resume control, and no
-    /// unreadable-row warning where there are none.
-    #[cfg(feature = "ssr")]
-    #[test]
-    fn a_finished_account_is_offered_no_migration() {
-        let html = render_manage(
-            true,
-            Overview {
-                has_recovery_wrap: true,
-                ..Overview::default()
-            },
-        );
-        assert!(!html.contains("still stored unencrypted"));
-        assert!(!html.contains("Finish encrypting"));
-        assert!(!html.contains("could not be read"));
     }
 }

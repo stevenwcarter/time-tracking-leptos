@@ -306,10 +306,7 @@ pub async fn add_passkey_key(user: &str, target: &[u8], source: KeySource) -> Re
 }
 
 /// A network or server failure unrelated to WebAuthn itself.
-///
-/// `test` as well as `hydrate`: the migration pass's `pass_failed` reaches
-/// for this, and it is host-tested.
-#[cfg(any(feature = "hydrate", test))]
+#[cfg(feature = "hydrate")]
 pub const SERVER_UNREACHABLE: &str =
     "Couldn't reach the server. Check your connection and try again.";
 

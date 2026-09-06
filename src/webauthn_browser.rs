@@ -33,10 +33,9 @@ const SERVER_FN_ERROR_PREFIX: &str = "error running server function: ";
 /// means the request never landed, where a connection hint is the more
 /// useful thing to say.
 ///
-/// Shared by [`friendly_error`] and by the callers that have no WebAuthn
-/// step to phrase a failure for (`crypto::flow::server_message`, the
-/// migration pass's `pass_failed`), so the one piece of knowledge about
-/// `ServerFnError`'s wire shape lives in one place.
+/// Shared by [`friendly_error`] and by callers that have no WebAuthn step to
+/// phrase a failure for (`crypto::flow::server_message`), so the one piece
+/// of knowledge about `ServerFnError`'s wire shape lives in one place.
 pub fn server_refusal(raw: &str) -> Option<&str> {
     raw.strip_prefix(SERVER_FN_ERROR_PREFIX)
 }

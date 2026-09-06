@@ -141,28 +141,6 @@ pub async fn entries_in_range(
         .collect())
 }
 
-/// Every entry the caller has ever saved, bodies included and uninterpreted,
-/// with no date bounds.
-///
-/// This exists to feed the encryption migration pass (spec section 8): the
-/// client needs every row to find which still carry a `v: 1` envelope, and
-/// answering that server-side would mean inspecting envelope versions —
-/// parsing bodies, which invariant E1 forbids outright.
-#[server(endpoint = "entries/all")]
-pub async fn entries_all() -> Result<Vec<(String, String)>, ServerFnError> {
-    use crate::date::to_iso;
-    use crate::entries::repo;
-    let (ctx, me) = super::require_user()?;
-    let mut conn = ctx
-        .conn()
-        .map_err(super::log_and_fail("conn", "Internal server error"))?;
-    Ok(repo::entries_all(&mut conn, me.id)
-        .map_err(super::log_and_fail("entries all", "Internal server error"))?
-        .into_iter()
-        .map(|(d, b)| (to_iso(d), b))
-        .collect())
-}
-
 /// The two ways the batch transaction in [`entry_save_many`] can fail: an
 /// expected, user-facing refusal (bad date, oversized body) versus an
 /// unexpected database error.

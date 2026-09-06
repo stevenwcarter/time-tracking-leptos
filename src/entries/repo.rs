@@ -97,22 +97,6 @@ pub fn entries_in_range(
         .collect())
 }
 
-/// Every entry the user has ever saved, bodies included and opaque, with
-/// no date bounds. See `server_fns::entries::entries_all`'s doc comment for
-/// why this deliberately has no range argument.
-pub fn entries_all(conn: &mut DbConn, user_id: i32) -> Result<Vec<(NaiveDate, String)>> {
-    let rows: Vec<(String, String)> = time_entry::table
-        .filter(time_entry::user_id.eq(user_id))
-        .order(time_entry::entry_date.asc())
-        .select((time_entry::entry_date, time_entry::body))
-        .load(conn)
-        .context("select all entries")?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(d, b)| parse_iso(&d).map(|d| (d, b)))
-        .collect())
-}
-
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
     use super::*;
@@ -222,24 +206,6 @@ mod tests {
         );
     }
 
-    /// No date bounds, unlike every other read here — see the function's own
-    /// doc comment for why.
-    #[test]
-    fn entries_all_returns_every_saved_entry_regardless_of_date() {
-        let pool = test_pool();
-        let mut conn = pool.get().expect("checkout");
-        let uid = user_id(&mut conn, "alice@example.com");
-        save(&mut conn, uid, d(2020, 1, 1), "old").expect("save");
-        save(&mut conn, uid, d(2026, 9, 4), "recent").expect("save");
-        assert_eq!(
-            entries_all(&mut conn, uid).expect("all"),
-            vec![
-                (d(2020, 1, 1), "old".to_string()),
-                (d(2026, 9, 4), "recent".to_string())
-            ]
-        );
-    }
-
     /// Pins invariant I7 for reads. Every query is scoped by user_id; a user
     /// must never observe another user's rows through any range or point read.
     #[test]
@@ -261,7 +227,6 @@ mod tests {
                 .expect("range")
                 .is_empty()
         );
-        assert!(entries_all(&mut conn, mallory).expect("all").is_empty());
     }
 
     /// A write by one user must not overwrite another's row for the same day.
