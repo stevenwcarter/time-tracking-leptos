@@ -58,10 +58,11 @@ pub enum ReadPlan {
 /// Decides what a stored string is, without needing a key.
 ///
 /// Dispatch is on the row's own `v`, never on whether the account has
-/// encryption enabled. That is what makes a half-finished migration safe to
-/// read rather than corrupting (spec E3): a background re-encryption pass
-/// can stop at any row, leaving an account with both shapes at once, and
-/// every row still reads correctly because each one carries its own answer.
+/// encryption enabled. That is what lets both shapes coexist safely rather
+/// than corrupting each other (spec E3), and both shapes do exist: the same
+/// reader serves `localStorage`, which is v1 by design, and the server,
+/// which now takes v2 alone. Every row reads correctly because each one
+/// carries its own answer.
 pub fn plan_read(raw: &str) -> Result<ReadPlan, EnvelopeError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| EnvelopeError::Malformed(e.to_string()))?;
@@ -110,9 +111,9 @@ pub fn wrap_v1(body: &str) -> String {
 ///
 /// The write half of the version dispatch, and the *only* place it is made:
 /// `None` writes v1, `Some` writes v2. The read half never consults this
-/// choice — it reads each row's own `v` (spec E3) — which is exactly what
-/// lets a half-migrated account keep working: new writes land as v2 while
-/// the rows the migration has not reached yet still read as v1.
+/// choice — it reads each row's own `v` (spec E3) — which is what lets one
+/// reader serve a device holding both shapes at once: `localStorage` rows
+/// written v1 by design, and an account's rows written v2.
 ///
 /// Browser-only, because sealing is: the plaintext branch could run
 /// anywhere, but a function that silently degrades to writing plaintext on a
@@ -158,10 +159,10 @@ mod tests {
         ));
     }
 
-    /// Spec E3. Dispatch is on the row's own version, never on account state.
-    /// A partially migrated account holds both shapes at once and every row
-    /// must read correctly — this is the whole reason the migration is
-    /// resumable.
+    /// Spec E3. Dispatch is on the row's own version, never on account
+    /// state. A device holds both shapes at once — v1 in `localStorage`, v2
+    /// in the account — and every row must read correctly whichever session
+    /// is asking.
     #[test]
     fn a_v1_row_reads_as_plaintext_even_when_v2_rows_exist() {
         let v1 = wrap_v1("11:45-12:15 code1");

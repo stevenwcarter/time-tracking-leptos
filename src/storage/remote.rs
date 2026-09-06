@@ -26,24 +26,6 @@ pub async fn store(key: StorageKey, envelope: &str) -> Result<(), StorageError> 
         .map_err(server_error)
 }
 
-/// Writes one chunk of days in one transaction, still envelope-wrapped.
-///
-/// The bulk half of the seam's [`store_many`](super::store_many), which
-/// calls this once per chunk: the endpoint applies `entry_save`'s own length
-/// cap to each body and rolls this chunk back if any row is refused. What
-/// makes the migration pass resumable across chunks is not that rollback but
-/// per-row envelope dispatch (spec E3) — a later pass simply finds fewer v1
-/// rows.
-pub async fn store_many(rows: Vec<(NaiveDate, String)>) -> Result<(), StorageError> {
-    entries::entry_save_many(
-        rows.into_iter()
-            .map(|(date, envelope)| (to_iso(date), envelope))
-            .collect(),
-    )
-    .await
-    .map_err(server_error)
-}
-
 pub async fn dates_with_entries(
     from: NaiveDate,
     to: NaiveDate,

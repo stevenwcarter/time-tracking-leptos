@@ -462,8 +462,8 @@ mod tests {
     /// session that still believes the account is unencrypted, which is what
     /// a tab left open across an enable elsewhere believes — hands the user
     /// an editable box whose first keystroke replaces that ciphertext with a
-    /// plaintext row. Nothing downstream would flag it: a v1 row is exactly
-    /// what an un-migrated account legitimately holds.
+    /// plaintext row. Nothing about the row itself would flag it: v1 is
+    /// exactly the shape a device with no account legitimately writes.
     ///
     /// Asserted against the empty value specifically, not merely "not the
     /// text", because empty is the answer that does the damage.

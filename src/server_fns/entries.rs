@@ -1,9 +1,13 @@
 //! Reading and writing one day's entry, and range queries.
 //!
 //! Bodies are **opaque** on this boundary in both directions. Nothing here
-//! parses, validates, or inspects an entry beyond a length cap — phase 2
-//! sends ciphertext through these same functions and the server will not
-//! hold the key (spec section 9.1).
+//! parses, validates, or inspects an entry beyond a length cap — what these
+//! functions carry is ciphertext and the server holds no key for it (spec
+//! section 9.1, invariant E1).
+//!
+//! The one precondition a write has to meet is therefore a property of the
+//! *account* rather than of the body: [`entry_save`] refuses unless
+//! `user.encrypted_at` is set (invariant E9).
 
 use leptos::prelude::*;
 
@@ -17,31 +21,6 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 /// a decade.
 #[cfg(feature = "ssr")]
 const MAX_RANGE_DAYS: i64 = 366;
-
-/// The most rows one bulk write may carry, and the most bytes across all of
-/// them.
-///
-/// The per-body cap alone does not bound a batch: 256 KiB times "however
-/// many rows the client sent" is not a limit, and every row is written
-/// inside one SQLite transaction on a single-process WAL database with a
-/// 5 s `busy_timeout`. The row count is the half nothing else bounds —
-/// tens of thousands of small rows fit inside any byte limit.
-///
-/// The byte cap is deliberately *below* the request-size limit the
-/// server-fn layer already imposes (a couple of MiB, at which a batch is
-/// rejected as `Deserialization: length limit exceeded`). That limit is
-/// somebody else's implementation detail and its message tells a user
-/// nothing, so this endpoint states its own bound and refuses in its own
-/// words before reaching it.
-///
-/// Both sit above what `storage::store_many` sends (100 rows, 512 KiB), so
-/// a migration that chunks the way this crate's own client does never meets
-/// either. What they refuse is a caller that does not.
-#[cfg(feature = "ssr")]
-const MAX_BATCH_ROWS: usize = 200;
-
-#[cfg(feature = "ssr")]
-const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "ssr")]
 fn parse_date(raw: &str) -> Result<chrono::NaiveDate, ServerFnError> {
@@ -78,9 +57,33 @@ pub async fn entry_load(date: String) -> Result<Option<String>, ServerFnError> {
 }
 
 /// Writes one day's body, replacing whatever was there.
+///
+/// Refused unless the account has encryption enabled — invariant E9, and
+/// the whole enforcement mechanism for it. The check reads
+/// `user.encrypted_at`, a property of the account *row*, and never the
+/// body: a server that opened the envelope to see which version it carried
+/// would be parsing an entry, which is precisely what invariant E1 forbids
+/// and the reason week totals are aggregated in the browser. Once that were
+/// acceptable, the next feature wanting to peek would have a precedent.
+///
+/// What the check buys: a correctly implemented client cannot store
+/// plaintext here. What it does not: a *modified* client can enable
+/// encryption and then post plaintext bodies anyway, and nothing on this
+/// side could tell without reading them — the very thing being prevented.
+/// That is the trust boundary the encryption design already records, noted
+/// here so nobody later mistakes the gap for an oversight and closes it by
+/// parsing.
+///
+/// Read in the same transaction as the write, so a save racing
+/// `encryption_enable` sees one consistent account state rather than a
+/// check and a write straddling two.
 #[server(endpoint = "entries/save")]
 pub async fn entry_save(date: String, body: String) -> Result<(), ServerFnError> {
+    use diesel::prelude::*;
+
     use crate::entries::repo;
+    use crate::entry_key::store;
+
     let (ctx, me) = super::require_user()?;
     let date = parse_date(&date)?;
     if body.len() > MAX_BODY_BYTES {
@@ -89,8 +92,25 @@ pub async fn entry_save(date: String, body: String) -> Result<(), ServerFnError>
     let mut conn = ctx
         .conn()
         .map_err(super::log_and_fail("conn", "Internal server error"))?;
-    repo::save(&mut conn, me.id, date, &body)
-        .map_err(super::log_and_fail("entry save", "Internal server error"))
+
+    // The inner `Result<(), &str>` is the outcome the caller sees: `Err` is
+    // an expected, user-facing refusal, never a bug worth logging. Diesel
+    // *commits* an `Ok(Err(..))` rather than rolling it back, which is safe
+    // here for the same reason it is in `encryption_enable`: the refusal is
+    // decided before this transaction has written anything.
+    let outcome = conn
+        .transaction::<Result<(), &'static str>, anyhow::Error, _>(|conn| {
+            if !store::is_encrypted(conn, me.id)? {
+                return Ok(Err(
+                    "Set up encryption on this account before saving entries.",
+                ));
+            }
+            repo::save(conn, me.id, date, &body)?;
+            Ok(Ok(()))
+        })
+        .map_err(super::log_and_fail("entry save", "Internal server error"))?;
+
+    outcome.map_err(super::server_err)
 }
 
 /// Which days in the range have an entry. Dates only — see the note on
@@ -139,90 +159,4 @@ pub async fn entries_in_range(
         .into_iter()
         .map(|(d, b)| (to_iso(d), b))
         .collect())
-}
-
-/// The two ways the batch transaction in [`entry_save_many`] can fail: an
-/// expected, user-facing refusal (bad date, oversized body) versus an
-/// unexpected database error.
-///
-/// Diesel's `transaction` needs one error type for the whole closure, and
-/// the two must stay distinguishable: reporting a refusal as `Ok(Err(..))`
-/// (the way `encryption_enable` reports its "already enabled" refusal)
-/// would have `transaction` **commit** the entries already written earlier
-/// in the same loop, since Diesel only rolls back on an `Err` return —
-/// `encryption_enable` gets away with `Ok(Err(..))` only because that check
-/// runs before any write. Reporting a refusal's message as a plain
-/// `anyhow::Error` string would go the other way and work, but a genuine
-/// `Db` error's message would then flow straight to the caller too,
-/// breaking `server_err`'s rule that a user-facing message never carries
-/// internal detail.
-#[cfg(feature = "ssr")]
-enum SaveManyError {
-    Refused(&'static str),
-    Db(anyhow::Error),
-}
-
-#[cfg(feature = "ssr")]
-impl From<diesel::result::Error> for SaveManyError {
-    fn from(err: diesel::result::Error) -> Self {
-        SaveManyError::Db(err.into())
-    }
-}
-
-/// Writes every `(date, body)` pair in one call, one transaction — the write
-/// half of the encryption migration pass (spec section 8). Applies
-/// `entry_save`'s own length cap to each body; a bulk endpoint that skipped
-/// it would be a way around the limit.
-///
-/// The batch as a whole is capped too, on both row count and total bytes,
-/// and *before* the transaction opens rather than inside it: refusing an
-/// oversized request should not first take the database's write lock. See
-/// [`MAX_BATCH_ROWS`].
-///
-/// Each entry is validated and written in the same pass through the loop,
-/// rather than validated up front and written in a second pass: only that
-/// ordering lets an entry rejected partway through undo the entries already
-/// written ahead of it in the same call, via the transaction's rollback.
-/// That rollback scopes one *call*; a migration pass is several of them, and
-/// spec section 8's per-row dispatch is what makes a pass that stops
-/// between calls resumable rather than half-broken.
-#[server(endpoint = "entries/save_many")]
-pub async fn entry_save_many(entries: Vec<(String, String)>) -> Result<(), ServerFnError> {
-    use diesel::prelude::*;
-
-    use crate::date::parse_iso;
-    use crate::entries::repo;
-
-    let (ctx, me) = super::require_user()?;
-
-    if entries.len() > MAX_BATCH_ROWS {
-        return Err(super::server_err("That's too many entries in one request"));
-    }
-    if entries.iter().map(|(_, body)| body.len()).sum::<usize>() > MAX_BATCH_BYTES {
-        return Err(super::server_err(
-            "That batch of entries is too large to save",
-        ));
-    }
-
-    let mut conn = ctx
-        .conn()
-        .map_err(super::log_and_fail("conn", "Internal server error"))?;
-
-    let result = conn.transaction::<(), SaveManyError, _>(|conn| {
-        for (date, body) in &entries {
-            let date = parse_iso(date).ok_or(SaveManyError::Refused("Invalid date"))?;
-            if body.len() > MAX_BODY_BYTES {
-                return Err(SaveManyError::Refused("That entry is too large to save"));
-            }
-            repo::save(conn, me.id, date, body).map_err(SaveManyError::Db)?;
-        }
-        Ok(())
-    });
-
-    result.map_err(|err| match err {
-        SaveManyError::Refused(msg) => super::server_err(msg),
-        SaveManyError::Db(err) => {
-            super::log_and_fail("entry save many", "Internal server error")(err)
-        }
-    })
 }

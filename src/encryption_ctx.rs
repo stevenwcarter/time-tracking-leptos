@@ -612,7 +612,7 @@ impl EncryptionCtx {
     /// elsewhere — a second tab, another device — goes on reporting
     /// [`EncryptionState::Disabled`] indefinitely. `Disabled` is
     /// [`crate::storage::WriteKey::Plaintext`] and mounts an editable entry
-    /// area, so every day the migration has already sealed reads back as
+    /// area, so every day sealed since reads back as
     /// [`crate::storage::StorageError::Locked`] and, if the seam collapsed
     /// that to "nothing saved", would be shown as an empty box the next
     /// keystroke overwrites for good.

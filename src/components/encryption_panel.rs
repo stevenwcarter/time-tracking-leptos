@@ -215,10 +215,10 @@ impl Overview {
 /// Three states rather than `Option<Overview>`, because the fetch has two
 /// ways of not producing one and only one of them is a spinner. The failure
 /// used to be written into `status` — the line every ceremony writes — which
-/// gave that line two writers, and they raced: a refresh failing during a
-/// migration painted over "Encrypting your entries… day 3 of 40", and the
-/// pass's next progress line painted over the failure. Keeping the fetch's
-/// own answer here leaves `status` with exactly one writer.
+/// gave that line two writers, and they raced: a refresh failing mid-ceremony
+/// painted over what the ceremony was saying, and the ceremony's next line
+/// painted over the failure. Keeping the fetch's own answer here leaves
+/// `status` with exactly one writer.
 #[derive(Clone, Default)]
 #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
 enum Fetched {
@@ -428,8 +428,8 @@ enum Mode {
     #[default]
     Idle,
     /// The code minted by the enable ceremony, held while the server still
-    /// knows nothing. Confirming it is what turns encryption on: the
-    /// server call, then the key, then the migration.
+    /// knows nothing. Confirming it is what turns encryption on: the server
+    /// call, and then the key into this device's keystore.
     ///
     /// The route travels with the code because the card's words depend on
     /// it, and by then the overview it was chosen from is no longer what the
@@ -958,7 +958,7 @@ pub fn EncryptionPanel(
 /// The last refresh's own failure, if it had one.
 ///
 /// Kept out of `status` so the ceremonies and the fetch cannot paint over
-/// each other mid-migration — see [`Fetched`] — and a component rather than
+/// each other mid-ceremony — see [`Fetched`] — and a component rather than
 /// an inline closure so a test can reach it: the signal behind it is
 /// internal to [`EncryptionPanel`], and the fetch that would set it lives in
 /// an `Effect`, which never runs on the host.
@@ -2513,8 +2513,8 @@ mod tests {
 
     /// The other thing `Fetched` exists for: a failed refresh has a sentence
     /// of its own, and it renders beside `status` rather than inside it, so
-    /// a migration's progress line and a refresh failure cannot paint over
-    /// each other. Nothing rendered this branch before.
+    /// a ceremony's line and a refresh failure cannot paint over each other.
+    /// Nothing rendered this branch before.
     #[cfg(feature = "ssr")]
     #[test]
     fn a_failed_refresh_is_reported_where_a_ceremony_cannot_paint_over_it() {

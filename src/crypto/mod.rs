@@ -494,8 +494,8 @@ mod ceremony {
     /// being enrolled; `user` is the signed-in identity the key belongs to.
     /// The caller shows the recovery code and waits for the user to confirm
     /// it, *then* sends the two wraps to `encryption_enable`, and then hands
-    /// the key to `EncryptionCtx::unlock` — which is where step 6's keystore
-    /// write happens — before running the migration.
+    /// the key to `EncryptionCtx::unlock`, which is where step 6's keystore
+    /// write happens.
     ///
     /// So as shipped, spec section 6.1's steps run 1 → 2 → 3 → 5 → 4 → 6:
     /// the caller holds step 5's code screen ahead of step 4's server call,

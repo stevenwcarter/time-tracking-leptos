@@ -19,8 +19,10 @@
 //! `Option<&SessionKey>`, [`store`] takes a [`WriteKey`], and both seal or
 //! open around the backend call, so no component ever learns that an entry
 //! body is anything but a string. With no key: read whatever each row says
-//! it is, and write v1. With one: write v2 and still read either — which is
-//! what lets a half-migrated account work at all (spec E3).
+//! it is, and write v1 — a write [`Backend::Local`] alone still has a route
+//! to, since the server refuses an entry from an account with no encryption
+//! (invariant E9). With one: write v2 and still read either, because
+//! dispatch is per row, on the row's own version (spec E3).
 //!
 //! The two directions take different types because "no key" means different
 //! things in each; [`WriteKey`] says why.
@@ -54,8 +56,6 @@ pub mod local;
 pub mod remote;
 
 use std::future::Future;
-#[cfg(feature = "hydrate")]
-use std::mem;
 
 use chrono::NaiveDate;
 #[cfg(any(feature = "hydrate", test))]
@@ -102,11 +102,10 @@ impl StorageKey {
     /// does not name a stored day.
     ///
     /// Needed because [`StorageError`] carries the key as the string the
-    /// backend saw, so a report built from one can only name the day it
-    /// belongs to by parsing it back. The migration pass is the caller that
-    /// cares: a body it cannot seal blocks that account's pass for good, and
-    /// "this browser couldn't encrypt your entries" points the user at their
-    /// browser instead of at the entry they could go and edit.
+    /// backend saw, so anything reporting one can only name the day it
+    /// belongs to by parsing it back. `local`'s key scan is the caller
+    /// today: it reads every `localStorage` key and keeps the ones that
+    /// name a stored day.
     pub fn parse(raw: &str) -> Option<Self> {
         let date = raw.strip_prefix(LEGACY_KEY)?.strip_prefix(':')?;
         parse_iso(date).map(StorageKey::TimeEntry)
@@ -125,37 +124,26 @@ pub enum Backend {
 /// What the seam should do with a body on the way out.
 ///
 /// Distinct from the read side's `Option<&SessionKey>` for one reason: on a
-/// write, "no key" is ambiguous and one of its two meanings is dangerous. An
-/// account with encryption off should write v1. An encrypted account whose
-/// device holds no key must write *nothing* — a v1 row there is a silent
-/// plaintext downgrade, and nothing downstream would ever flag it: the
-/// migration pass reads it as an ordinary un-migrated row and re-seals it,
-/// so the only trace is the window in which the body sat on the server in
-/// the clear. Reads have no such ambiguity — a row says which it is — which
-/// is why only this direction needs the extra state.
+/// write, "no key" is ambiguous and one of its two meanings is dangerous. A
+/// device with no account writes v1 into `localStorage`. An encrypted
+/// account whose device holds no key must write *nothing* — a v1 row there
+/// is a silent plaintext downgrade, and the row itself carries no trace of
+/// one, since v1 is exactly what a device with no account legitimately
+/// writes. Reads have no such ambiguity — a row says which it is — which is
+/// why only this direction needs the extra state.
 ///
 /// [`crate::encryption_ctx::EncryptionState::write_key`] is the one place
-/// that decides which of these an account is in.
+/// that decides which of these a session is in; [`write_target`] is the one
+/// place that decides what each means for the backend in hand.
 pub enum WriteKey<'a> {
-    /// The account has no encryption. Write v1.
+    /// No encryption in play. Write v1 — which, since the server stopped
+    /// accepting unencrypted entries, only [`Backend::Local`] can take.
     Plaintext,
     /// The account is encrypted and this session can seal. Write v2.
     Sealed(&'a SessionKey),
     /// The account is encrypted and this session cannot seal — locked, or
     /// not yet known to be either. Refuse.
     Locked,
-}
-
-/// Which row a bulk write is on, for whatever is reporting it.
-///
-/// A pair rather than two `usize` arguments, which a caller could swap
-/// without the compiler minding and which would then count backwards. `day`
-/// is the row being worked on, not the row finished — it is reported before
-/// the seal, so the first one is visible too.
-#[derive(Debug, Clone, Copy)]
-pub struct Progress {
-    pub day: usize,
-    pub total: usize,
 }
 
 /// Monotonic counter identifying the newest in-flight load.
@@ -216,6 +204,17 @@ pub enum StorageError {
     /// simply not unlocked yet.
     #[error("`{key}` is encrypted and this session holds no key for it")]
     Locked { key: String },
+    /// A server-backed write with nothing to seal it with: the account has
+    /// no encryption, and the server only stores entries for accounts that
+    /// do (invariant E9).
+    ///
+    /// Distinct from [`StorageError::Locked`], which is a *device* that
+    /// holds no key for an account that has one — retrying after an unlock
+    /// fixes that, and nothing fixes this but setting encryption up. The
+    /// server refuses the same write on the same grounds; refusing here as
+    /// well only means a save that could never land does not travel.
+    #[error("`{key}` cannot be stored: this account has no encryption set up")]
+    EncryptionRequired { key: String },
     /// The key was there and the operation still failed: a tampered or
     /// truncated row on a read, a WebCrypto failure on a write.
     ///
@@ -265,9 +264,9 @@ enum RowRead<'a, K> {
 ///
 /// Dispatch is on the row's own `v` and on nothing else — not on whether the
 /// account has encryption enabled, not on whether a key happens to be in
-/// hand (spec E3). A half-migrated account holds both shapes at once and can
-/// be interrupted again at any point, so each row has to carry its own
-/// answer.
+/// hand (spec E3). One reader serves both shapes: `localStorage` is v1 by
+/// design and an account's rows are v2, and the same device moves between
+/// the two on every sign-in, so each row has to carry its own answer.
 #[cfg(any(feature = "hydrate", test))]
 fn decide_row<'a, K>(
     raw: &str,
@@ -341,14 +340,11 @@ pub async fn load(
 
 /// Writes a value, replacing any previous one for that day.
 ///
-/// `session` picks the envelope version: [`WriteKey::Plaintext`] writes v1,
-/// [`WriteKey::Sealed`] seals and writes v2 (see [`envelope::wrap`]), and
-/// [`WriteKey::Locked`] writes nothing and fails with
-/// [`StorageError::Locked`]. Readers never consult that choice.
-///
-/// The refusal is decided here rather than in either `cfg` branch below, so
-/// it holds on every target and costs no backend call — a locked write is
-/// not a write that failed partway, it is one that never started.
+/// The backend and `session` together pick the envelope version and decide
+/// whether there is a write at all — see [`write_target`], which is where
+/// both refusals live. [`WriteKey::Sealed`] seals and writes v2 (see
+/// [`envelope::wrap`]); [`WriteKey::Plaintext`] writes v1, which only
+/// [`Backend::Local`] may take. Readers never consult that choice.
 ///
 /// A plain fn building the future by hand, not an `async fn`: `value` is
 /// copied into an owned `String` — and `session` resolved into an owned
@@ -363,29 +359,6 @@ pub async fn load(
 /// one: it declares that the returned future captures no lifetime at all,
 /// so moving either inside the block fails here instead of at some distant
 /// `spawn_local` (spec E4).
-/// Turns a [`WriteKey`] into "seal with this, or don't", refusing the one
-/// state that must never reach a backend.
-///
-/// **The single place the plaintext-downgrade refusal is made**, shared by
-/// [`store`] and [`store_many`]. A second write path that decided this for
-/// itself is exactly how the refusal gets lost: nothing downstream would
-/// notice an encrypted account taking v1 rows (invariant E7).
-///
-/// Owned rather than borrowed because [`store`] hands its future to
-/// `spawn_local`, which needs `'static`.
-fn sealing_key(key: StorageKey, session: WriteKey<'_>) -> Result<Option<SessionKey>, StorageError> {
-    match session {
-        WriteKey::Plaintext => Ok(None),
-        // `Option::cloned`, not a direct `session.clone()`: on a target
-        // where `SessionKey` is uninhabited this arm cannot be reached, and
-        // cloning the key itself would say so as an `unreachable_code`
-        // warning. Going through the `Option` keeps the expression's type
-        // inhabited and the arm silent.
-        WriteKey::Sealed(session) => Ok(Some(session).cloned()),
-        WriteKey::Locked => Err(StorageError::Locked { key: key.as_key() }),
-    }
-}
-
 pub fn store(
     backend: Backend,
     key: StorageKey,
@@ -393,120 +366,112 @@ pub fn store(
     session: WriteKey<'_>,
 ) -> impl Future<Output = Result<(), StorageError>> + use<> {
     let value = value.to_owned();
-    let sealing = sealing_key(key, session);
+    let target = write_target(backend, key, session);
     async move {
-        let session = sealing?;
+        let target = target?;
         #[cfg(feature = "hydrate")]
         {
-            let wrapped = envelope::wrap(&value, session.as_ref())
+            let wrapped = envelope::wrap(&value, target.sealing())
                 .await
                 .map_err(|err| StorageError::Crypto {
                     key: key.as_key(),
                     detail: err.to_string(),
                 })?;
-            match backend {
-                Backend::Local => local::store(key, &wrapped).await,
-                Backend::Remote => remote::store(key, &wrapped).await,
+            match target {
+                WriteTarget::Local => local::store(key, &wrapped).await,
+                WriteTarget::Remote(_) => remote::store(key, &wrapped).await,
             }
         }
         #[cfg(not(feature = "hydrate"))]
         {
-            let _ = (backend, key, value, session);
+            let _ = (key, value, target);
             Ok(())
         }
     }
 }
 
-/// How much one bulk write carries: at most this many rows, and at most this
-/// many bytes of sealed body across them.
+/// Where a write is going, and what it does to the body on the way.
 ///
-/// The pass is chunked rather than posted whole because the whole is
-/// unbounded — an account's entire history in one request holds one SQLite
-/// write transaction open for as long as it takes to apply, and the same
-/// reasoning that gives `entry_save` a per-body cap applies to the count.
-/// Per-row dispatch (spec E3) is what makes chunking cost nothing: each
-/// chunk is correct on its own, and a pass that stops between chunks leaves
-/// fewer v1 rows for the next one to find, which is exactly the
-/// resumability spec section 8 already relies on.
+/// One value rather than the `(Backend, WriteKey)` pair the caller holds,
+/// because one of those pairs must not exist: an unsealed write to
+/// [`Backend::Remote`] is the plaintext row the server now refuses outright
+/// (invariant E9), and invariant E7 already says nothing downstream would
+/// notice one. With the two resolved into a single value, `Remote` cannot
+/// be *reached* except through an arm that is carrying a key — a later edit
+/// to [`store`]'s dispatch cannot write a plaintext row to the server
+/// without inventing a variant to say so.
 ///
-/// Both bounds sit under `entry_save_many`'s own caps — and a chunk can
-/// exceed [`BATCH_BYTES`] only by the one oversized row it flushes for, so
-/// the widest chunk this can send is still well under them.
-#[cfg(feature = "hydrate")]
-const BATCH_ROWS: usize = 100;
+/// **Why the pair is resolved rather than refused by a signature.** Both
+/// halves are runtime values — the backend follows `AuthCtx::user`, the
+/// write key follows a probe of the account — so no call site holds them at
+/// compile time and no signature could reject the combination there. The
+/// type earns its keep on the other side of the check instead: everything
+/// after [`write_target`] is unable to express the pair at all.
+///
+/// Owned rather than borrowed because [`store`] hands its future to
+/// `spawn_local`, which needs `'static`.
+enum WriteTarget {
+    /// `localStorage`, always v1. Plaintext by design: the store belongs to
+    /// the device rather than to an account, and this is the mode the
+    /// signed-out visitor — and anyone who takes the "use this device only"
+    /// way out — lives in (spec section 1.2's non-goal).
+    Local,
+    /// The server, sealed under this session's key. There is deliberately
+    /// no unsealed arm.
+    Remote(SessionKey),
+}
 
-#[cfg(feature = "hydrate")]
-const BATCH_BYTES: usize = 512 * 1024;
-
-/// Seals a whole account's worth of days and writes them — the encryption
-/// migration pass of spec section 8.
-///
-/// Here rather than in the panel that runs it, because of what [`WriteKey`]
-/// guards. A pass that sealed its own bodies and posted them itself would be
-/// a second write path, and the first thing a second write path loses is the
-/// refusal: a locked session would rewrite a whole account as v1 with
-/// nothing downstream to notice (invariant E7). Going through
-/// [`sealing_key`] means that decision is made once, for the batch, before
-/// any row is touched.
-///
-/// Sent in chunks rather than as one request; see [`BATCH_ROWS`] for why,
-/// and for why that costs the pass nothing. What it *does* cost is the claim
-/// that a failed pass changed nothing: rows in chunks that already landed
-/// stay sealed, and a caller reporting the failure has to say so.
-///
-/// No `Backend`, deliberately. A signed-out device stores in `localStorage`,
-/// which is never encrypted (spec section 1.2), so there is no migration for
-/// it to run and no local bulk write to reach.
-///
-/// `progress` is called before each row is sealed, on the await that yields
-/// to the event loop, so a caller reporting it actually sees the count move.
-pub async fn store_many(
-    rows: Vec<(NaiveDate, String)>,
-    session: WriteKey<'_>,
-    progress: impl Fn(Progress),
-) -> Result<(), StorageError> {
-    let total = rows.len();
-    // An empty batch is a real outcome — a pass that found nothing left to
-    // do — and writing nothing needs no key at all.
-    let Some(&(first, _)) = rows.first() else {
-        return Ok(());
-    };
-    let sealing = sealing_key(StorageKey::TimeEntry(first), session)?;
-
+impl WriteTarget {
+    /// The key [`envelope::wrap`] should seal under, if any.
     #[cfg(feature = "hydrate")]
-    {
-        let mut batch: Vec<(NaiveDate, String)> = Vec::new();
-        let mut bytes = 0;
-        for (index, (date, body)) in rows.into_iter().enumerate() {
-            progress(Progress {
-                day: index + 1,
-                total,
-            });
-            let key = StorageKey::TimeEntry(date);
-            let wrapped = envelope::wrap(&body, sealing.as_ref())
-                .await
-                .map_err(|err| StorageError::Crypto {
-                    key: key.as_key(),
-                    detail: err.to_string(),
-                })?;
-            // Flushed before this row joins, not after, so a single body
-            // larger than the byte bound still travels — alone, in its own
-            // chunk — rather than being refused by a rule about batches.
-            if !batch.is_empty()
-                && (batch.len() >= BATCH_ROWS || bytes + wrapped.len() > BATCH_BYTES)
-            {
-                remote::store_many(mem::take(&mut batch)).await?;
-                bytes = 0;
-            }
-            bytes += wrapped.len();
-            batch.push((date, wrapped));
+    fn sealing(&self) -> Option<&SessionKey> {
+        match self {
+            WriteTarget::Local => None,
+            WriteTarget::Remote(session) => Some(session),
         }
-        remote::store_many(batch).await
     }
-    #[cfg(not(feature = "hydrate"))]
-    {
-        let _ = (rows, sealing, progress, total);
-        Ok(())
+}
+
+/// Pairs the backend with what the session can do, refusing the two
+/// combinations that must never reach a backend.
+///
+/// **The single place either write refusal is made**, shared by [`store`]
+/// and — through it — by [`clear`]. A second write path that decided this
+/// for itself is exactly how a refusal gets lost: nothing downstream would
+/// notice an encrypted account taking a v1 row (invariant E7), and nothing
+/// on this side would notice a plaintext body being posted to an account
+/// that cannot legally hold one (invariant E9).
+///
+/// The refusals are decided here rather than inside [`store`]'s `cfg`
+/// branches, so they hold on every target and cost no backend call — a
+/// refused write is not a write that failed partway, it is one that never
+/// started.
+fn write_target(
+    backend: Backend,
+    key: StorageKey,
+    session: WriteKey<'_>,
+) -> Result<WriteTarget, StorageError> {
+    let sealing = match session {
+        WriteKey::Plaintext => None,
+        // `Option::cloned`, not a direct `session.clone()`: on a target
+        // where `SessionKey` is uninhabited this arm cannot be reached, and
+        // cloning the key itself would say so as an `unreachable_code`
+        // warning. Going through the `Option` keeps the expression's type
+        // inhabited and the arm silent.
+        WriteKey::Sealed(session) => Some(session).cloned(),
+        WriteKey::Locked => return Err(StorageError::Locked { key: key.as_key() }),
+    };
+
+    match (backend, sealing) {
+        // `Local` writes v1 whatever the session holds. `localStorage` is
+        // never encrypted (spec section 1.2), and a row sealed there under a
+        // key the signed-out reader will not have is a row nothing can open
+        // again. The pairing barely arises — the backend follows
+        // `AuthCtx::user`, so a session holding a key is normally on
+        // `Remote` — but it needs an answer, and this is the safe one.
+        (Backend::Local, _) => Ok(WriteTarget::Local),
+        (Backend::Remote, Some(session)) => Ok(WriteTarget::Remote(session)),
+        (Backend::Remote, None) => Err(StorageError::EncryptionRequired { key: key.as_key() }),
     }
 }
 
@@ -519,7 +484,8 @@ pub async fn store_many(
 /// through would therefore put a v1 row into an encrypted account — the
 /// plaintext downgrade invariant E7 exists to prevent — so `Remote` goes
 /// through [`store`], which already refuses and already picks the envelope
-/// version.
+/// version. That inheritance carries invariant E9 too: a clear is a write,
+/// so an account with no encryption cannot make one either.
 ///
 /// `Local` removes the key rather than rewriting it, so it has no envelope
 /// to pick, but it refuses a locked session too: "can this session write?"
@@ -779,7 +745,7 @@ mod tests {
         assert_eq!(LEGACY_KEY, "time_entry");
     }
 
-    /// The round trip the migration's failure report depends on: a
+    /// The round trip any report of a failed day depends on: a
     /// `StorageError` carries the key as a string, and naming the day it
     /// belongs to means reading it back.
     #[test]
@@ -874,9 +840,9 @@ mod tests {
 
     /// The regression this guards against: a session that cannot seal must
     /// refuse the write, not fall back to writing the body in the clear.
-    /// A plaintext row in an encrypted account is invisible afterwards —
-    /// the migration pass would re-seal it as if it had always been an
-    /// un-migrated row, leaving nothing to say the body had been exposed.
+    /// A plaintext row in an encrypted account is invisible afterwards — a
+    /// v1 row is exactly what a device with no account legitimately writes,
+    /// so nothing about the row itself says the body had been exposed.
     ///
     /// Asserted on a target that cannot encrypt anything at all, which is
     /// the point: the refusal is decided before any backend or any
@@ -907,35 +873,42 @@ mod tests {
         }
     }
 
-    /// The same refusal as `store`, at the one other door into the write
-    /// path. The migration pass rewrites a whole account in one call, so a
-    /// locked session let through here would downgrade every row at once —
-    /// the widest possible version of invariant E7's failure, and the reason
-    /// the pass goes through this seam rather than sealing and posting on
-    /// its own.
+    /// Invariant E9's half of the seam: a body with nothing to seal it may
+    /// still go to `localStorage`, which is plaintext by design, and must
+    /// not go to the server, which no longer accepts one.
+    ///
+    /// The server refuses the same write on the same grounds — that is the
+    /// half that holds against a client which skips this one, and
+    /// `tests/entry_access.rs` is where it is pinned. This is what stops a
+    /// save that could never land from travelling at all, and it is asserted
+    /// on a target with no browser storage and no network precisely because
+    /// the decision is made before either could be reached.
     #[test]
-    fn a_locked_session_refuses_the_whole_migration_batch() {
-        let day = d(2026, 9, 1);
+    fn a_remote_write_with_no_key_is_refused_rather_than_sent_in_the_clear() {
+        let key = StorageKey::TimeEntry(d(2026, 9, 4));
         assert_eq!(
-            block_on(store_many(
-                vec![(day, "9-10 code1".to_string())],
-                WriteKey::Locked,
-                |_| {},
+            block_on(store(
+                Backend::Remote,
+                key,
+                "9-10 code1",
+                WriteKey::Plaintext
             )),
-            Err(StorageError::Locked {
-                key: StorageKey::TimeEntry(day).as_key()
-            })
+            Err(StorageError::EncryptionRequired { key: key.as_key() })
         );
-    }
-
-    /// An empty batch is a real outcome — a pass that found nothing left to
-    /// do — and writing nothing needs no key. Reporting it as a refusal
-    /// would turn "already finished" into an error on every re-run.
-    #[test]
-    fn an_empty_migration_batch_is_not_a_refusal() {
         assert_eq!(
-            block_on(store_many(Vec::new(), WriteKey::Locked, |_| {})),
-            Ok(())
+            block_on(clear(Backend::Remote, key, WriteKey::Plaintext)),
+            Err(StorageError::EncryptionRequired { key: key.as_key() }),
+            "clearing a day on `Remote` is a write of an empty body, not a delete"
+        );
+        assert_eq!(
+            block_on(store(
+                Backend::Local,
+                key,
+                "9-10 code1",
+                WriteKey::Plaintext
+            )),
+            Ok(()),
+            "`localStorage` keeps the plaintext route it is built on"
         );
     }
 
@@ -991,10 +964,11 @@ mod tests {
         assert!(matches!(read, RowRead::Plaintext(body) if body == "9-10 code1"));
     }
 
-    /// Spec E3, in the direction a migration makes real: an account that is
-    /// encrypted — and so holds a key — still has rows the migration has not
-    /// reached. Dispatching on the key rather than on the row's own `v`
-    /// would try to decrypt every one of them.
+    /// Spec E3, in the direction that costs data if it is lost: holding a
+    /// key must not make the reader assume every row was sealed under it.
+    /// Nothing writes a v1 row into an encrypted account any more — the
+    /// server refuses one outright (invariant E9) — but a row that predates
+    /// that rule still has to render rather than fail as a bad decrypt.
     #[test]
     fn a_plaintext_row_still_reads_as_plaintext_when_a_key_is_present() {
         let key = StorageKey::TimeEntry(d(2026, 9, 4));
@@ -1149,10 +1123,10 @@ mod tests {
         assert!(!opened.unopenable);
     }
 
-    /// A partially migrated account, at range width: both shapes in one
-    /// week, each decided on its own `v` (spec E3). The migration can stop
-    /// anywhere, so this is not a corner case — it is what every account
-    /// looks like between "enable" and "finished".
+    /// Both shapes in one week, each decided on its own `v` (spec E3), at
+    /// range width rather than one row at a time: the week view reads a
+    /// whole range in one call, so a single row of the older shape must cost
+    /// that row's content at worst, never the week's.
     #[test]
     fn a_mixed_v1_and_v2_range_decides_every_row_on_its_own_version() {
         let rows = vec![
@@ -1161,7 +1135,7 @@ mod tests {
             (d(2026, 9, 3), envelope::wrap_v1("b")),
         ];
         let decided = decide_rows(rows, Some(&SESSION)).rows;
-        assert_eq!(decided.len(), 3, "a half-migrated range must lose no rows");
+        assert_eq!(decided.len(), 3, "a mixed-version range must lose no rows");
         assert!(matches!(&decided[0].1, RowRead::Plaintext(b) if b == "a"));
         assert!(
             matches!(&decided[1].1, RowRead::Sealed(k, s) if **k == SESSION && s.ciphertext == vec![7])
