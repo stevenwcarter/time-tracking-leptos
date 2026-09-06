@@ -189,3 +189,46 @@ async fn an_encrypted_account_may_store_any_string_at_all() {
         Some("9-10 code1".to_string())
     );
 }
+
+/// The 256 KiB per-body cap. Nothing else exercises it any more: the bulk
+/// endpoint that carried the crate's only test for it went with the
+/// plaintext migration, leaving `entry_save`'s own check as the last one
+/// standing and, until this test, unguarded.
+///
+/// Encryption is enabled first on purpose. `entry_save` checks the size
+/// before it checks the account (deliberately — see the note there), so an
+/// un-enabled account would be refused for the other reason entirely and
+/// this test would pass against a build with no cap at all.
+///
+/// Both sides of the boundary, because "refuses something" is not the claim:
+/// a cap that refused every body would satisfy the first assertion alone.
+#[tokio::test]
+async fn entry_save_refuses_a_body_over_the_length_cap() {
+    let app = TestApp::new().await;
+    let alice = signed_in_as(&app, "alice@example.com").await;
+    enable_encryption(&alice).await;
+
+    let at_cap = "x".repeat(256 * 1024);
+    alice
+        .save_entry("2026-09-04", &at_cap)
+        .await
+        .expect("a body exactly at the cap is not over it");
+    assert_eq!(
+        alice.load_entry("2026-09-04").await.expect("load"),
+        Some(at_cap)
+    );
+
+    let refused = alice
+        .save_entry("2026-09-05", &"x".repeat(256 * 1024 + 1))
+        .await
+        .expect_err("a body past the cap must not be stored");
+    assert!(
+        refused.contains("too large"),
+        "the refusal must name the size, not the account: {refused}"
+    );
+    assert_eq!(
+        alice.load_entry("2026-09-05").await.expect("load"),
+        None,
+        "a refused save must leave nothing behind"
+    );
+}

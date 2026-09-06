@@ -86,6 +86,12 @@ pub async fn entry_save(date: String, body: String) -> Result<(), ServerFnError>
 
     let (ctx, me) = super::require_user()?;
     let date = parse_date(&date)?;
+    // Ahead of the encryption check, and so ahead of even taking a
+    // connection. Deliberate rather than incidental: the size refusal is a
+    // property of this request alone and outlives fixing the account — an
+    // oversized body would be refused again the moment encryption were set
+    // up — so it is the more useful of the two to report first, and it
+    // costs no round trip to report.
     if body.len() > MAX_BODY_BYTES {
         return Err(super::server_err("That entry is too large to save"));
     }
