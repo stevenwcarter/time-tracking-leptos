@@ -21,9 +21,28 @@ Taken with the project owner on 2026-09-05:
 1. **Unlock is passkey PRF; the backup is a one-time recovery code.** No
    passphrase. The recovery code is shown once, at enable, and is the only
    way back in if every passkey is lost.
+
+   **Amended during implementation: that is the ordinary account, not every
+   account.** Enabling has two routes (§6.1), and on the second the recovery
+   code is not a backup for passkey PRF — it is the whole of it. An account
+   whose authenticators do not implement the PRF extension gets one wrap,
+   derived from the code alone, and unlocks by typing it once per device
+   (after which the key is held non-extractably in IndexedDB exactly as
+   decision 3 describes, so there is no repeated typing). What the two routes
+   cost is set out in §6.1; the short version is that losing the code is
+   survivable on the first route and total on the second.
 2. **Encryption is offered when the first PRF-capable passkey is enrolled**,
    not mandatory and not a separate setting. Accounts with no passkey stay
    plaintext and keep working. Accepting re-encrypts all existing rows.
+
+   **Amended for the same reason.** A PRF-capable passkey is what *offers*
+   the two-wrap route; it is no longer what gates encryption existing at all.
+   An account with no capable passkey is offered the recovery-only route
+   instead of being told to go and enrol one — advice with nowhere to go,
+   since PRF support is a property of the authenticator and a browser
+   extension that never implemented it will not start on request. The
+   alternative the old dead end actually produced was not a safer account, it
+   was a plaintext one.
 3. **Unlock is once per device.** The data key is kept as a
    **non-extractable** `CryptoKey` in IndexedDB, so reloads and restarts do
    not re-prompt.
@@ -232,15 +251,71 @@ Triggered from `/account` immediately after a passkey is enrolled with
 `prf_capable = true`. The panel states plainly what is about to happen and
 that the recovery code is the only backup.
 
+**Amended during implementation: enabling has two routes.** The steps below
+describe the first and remain accurate for it. Which route an account gets is
+decided by the account, not chosen by the user — the second exists only where
+the first is impossible.
+
+| | Passkey + recovery | Recovery only |
+|---|---|---|
+| Offered when | at least one enrolled credential reported `prf_capable` | none did |
+| Steps | 1 → 2 → 3 → 5 → 4 → 6, as below | the same, minus step 1 and the passkey half of step 3 |
+| Wraps written | `passkey` (one row, under the asserting credential) and `recovery` | `recovery` only |
+| Authenticator prompts | one, at step 1 | none |
+| Unlock | the passkey, in the same gesture as sign-in (§6.2); the code as backup | the code, typed once per device, then held in the keystore (§7.3) |
+| Losing the recovery code | survivable while any keyed passkey remains | **total and immediate** — nothing else opens the account |
+| Losing every passkey | survivable with the code | not applicable; no passkey holds a key |
+
+The forcing case for the second route is that PRF support is a property of
+the browser and the authenticator, not a setting. The project owner's
+password-manager extension does not implement the WebAuthn PRF extension, so
+`prf_capable` is correctly `false` for every credential it can enrol and the
+two-wrap route is closed to that account permanently. What the panel used to
+do there — disable the button and say "add a passkey that can hold a key" —
+was advice with nowhere to go, and the account it left behind was a plaintext
+one. Offering one wrap is strictly better than offering none.
+
+Three things it does **not** change:
+
+- **No migration.** `entry_key_wrap.credential_id` is already nullable and
+  both unique indexes are already partial (§5.2), so one recovery wrap beside
+  zero passkey wraps is a shape the schema describes rather than tolerates.
+- **The recovery wrap stays mandatory.** `encryption_enable` takes the
+  passkey half as one optional value — a wrap and the credential it is filed
+  under, together, so neither can arrive without the other — and the recovery
+  wrap as a required one. The double-enable guard is on `encrypted_at`, not
+  on the wraps, so it refuses a second call from either route.
+- **§6.6's refusal.** The server refuses to delete the last `kind =
+  'passkey'` wrap while encrypted. On a recovery-only account there are zero
+  of those and the credential being deleted holds none, so the refusal is
+  vacuous — correctly: removing a keyless passkey removes no unlock route.
+  It starts applying the moment that account is given its first passkey wrap.
+
+Nor is the second route a dead end. A PRF-capable passkey enrolled later is
+keyed from the recovery code through `/account`'s existing "give this passkey
+an unlock key" flow, which already accepts `Opener::Recovery` — the same path
+§6.5 gives a user who lost every passkey and got back in with their code.
+
+The panel's copy differs between the routes and must keep differing. The
+two-wrap warning describes a loss that takes two mistakes ("if you lose every
+passkey **and** your recovery code"); the recovery-only warning describes one
+("your recovery code will be the only key"). A user who reads the first
+sentence and ends up with a one-wrap account has been told they have slack
+they do not have, which is why the words hang off the route value rather than
+off the section that renders them, and why the code screen carries the route
+too — the last screen before the account becomes unrecoverable is the wrong
+place to describe the code as a passkey's backup.
+
 1. Client asserts with PRF eval (§7.1) to obtain the PRF output for the new
    credential. **This is a second WebAuthn prompt** — creation does not
    return PRF output, only whether PRF is available.
 2. Generate the DEK (extractable) and a 160-bit recovery code.
 3. Derive both KEKs; wrap the DEK twice.
-4. `encryption_enable(passkey_wrap, credential_id, recovery_wrap)` — one
-   server call, one transaction: sets `user.encrypted_at` and inserts both
-   wrap rows. Fails if `encrypted_at` is already set. **Runs after step 5**
-   — see the amendments below.
+4. `encryption_enable(passkey, recovery_wrap)` — one server call, one
+   transaction: sets `user.encrypted_at` and inserts the wrap rows. `passkey`
+   is the wrap and its credential id as one optional value, `None` on the
+   recovery-only route. Fails if `encrypted_at` is already set. **Runs after
+   step 5** — see the amendments below.
 5. Show the recovery code. The user must actively confirm they have saved it
    before the dialog closes; there is a "copy" control, and the code is never
    shown again. **Runs before step 4.**
@@ -587,7 +662,7 @@ Every one of these moves opaque blobs. None can derive a DEK.
 |---|---|---|
 | `encryption_status` | `() -> Result<EncryptionStatus>` | `{ account: String, enabled: bool }`. Cheap; called on every post-hydration probe. The address is returned so the probe can check that the session cookie still names the account the tab is showing (E8). `/account` derives its pending-migration count from its own `entries_all` call rather than a server-computed hint. |
 | `encryption_wraps` | `() -> Result<Vec<WrapRow>>` | The signed-in user's wraps: `kind`, `credential_id`, `wrapped_key`, `kdf`, `wrap_alg`. |
-| `encryption_enable` | `(passkey_wrap: Vec<u8>, credential_id: Vec<u8>, recovery_wrap: Vec<u8>) -> Result<()>` | One transaction: sets `encrypted_at`, inserts both rows. Errors if already enabled. |
+| `encryption_enable` | `(passkey: Option<PasskeyWrapDto>, recovery_wrap: Vec<u8>) -> Result<()>` | One transaction: sets `encrypted_at`, inserts one row per wrap sent. Errors if already enabled. `PasskeyWrapDto` is `{ credential_id, wrapped_key }` — one optional value rather than two optional arguments, so a wrap cannot arrive with nothing to file it under. `None` is §6.1's recovery-only route; the recovery wrap is never optional. |
 | `encryption_add_passkey_wrap` | `(credential_id: Vec<u8>, wrapped_key: Vec<u8>) -> Result<()>` | §6.5. Rejects a credential that is not the caller's, an account that is not encrypted, and a credential that already has a wrap — the last so a race between two tabs is a sentence rather than a unique-index violation surfacing as "Internal server error". |
 | `encryption_replace_recovery_wrap` | `(wrapped_key: Vec<u8>) -> Result<()>` | §6.4's re-issue. Replaces the single recovery row. Idempotent for a given wrap — resubmitting the stored one succeeds without touching it — so a client whose response was lost can safely retry (§12). |
 | `entries_all` | `() -> Result<Vec<(String, String)>>` | §8. Opaque strings. |
@@ -737,8 +812,21 @@ supposed to land, so it grew as those rulings were made:
    seam. Then check the residual the same latch creates: the second tab gets
    **one** re-probe per page load, so a reload is what recovers it.
 
-Items 4 to 6 have no automated coverage at all and 8's and 9's automated
-halves stop at the seam, so this list is their only guard.
+10. **Enable by the recovery-only route** (§6.1), on an account whose only
+    passkeys reported `prf_capable = false` — or with no passkeys at all.
+    Confirm the panel offers it rather than a dead control, that the warning
+    and the code screen both say the code is the *only* key, that no
+    authenticator prompt appears, and that the entries come back after a
+    reload and after a lock. Then enrol a PRF-capable passkey and give it a
+    key **from the recovery code**, confirming the account stops being
+    recovery-only.
+
+Items 4 to 6 and 10 have no automated coverage of the ceremony at all — every
+one of them reaches WebCrypto or the authenticator, which has no host
+equivalent and no wasm runner here — and 8's and 9's automated halves stop at
+the seam. What *is* automated around item 10 is the choice put in front of the
+user (the panel's SSR tests) and the server's half (`tests/encryption_access.rs`);
+the wrapping itself is on this list and nowhere else.
 
 ## 11. Invariants this feature depends on
 

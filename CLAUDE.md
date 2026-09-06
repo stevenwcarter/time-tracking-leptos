@@ -6,14 +6,13 @@ data lives only in the browser's `localStorage` and never reaches the server.
 Signed-in users' entries are stored server-side in SQLite, and **whether an
 operator can read them depends on the account**:
 
-- **Encryption off** — every account by default, and the only possibility for
-  an account with no PRF-capable passkey. Bodies are stored as plaintext in a
-  `{"v":1,"alg":"none",…}` envelope. An operator with database access can
-  read them.
-- **Encryption on** — opt-in, offered once a PRF-capable passkey is enrolled.
-  Bodies are stored as `{"v":2,"alg":"a256gcm",…}` ciphertext under an
-  AES-256-GCM key the server never holds and cannot derive. An operator with
-  database access reads nothing but wrapped blobs.
+- **Encryption off** — every account by default. Bodies are stored as
+  plaintext in a `{"v":1,"alg":"none",…}` envelope. An operator with database
+  access can read them.
+- **Encryption on** — opt-in, offered to every account. Bodies are stored as
+  `{"v":2,"alg":"a256gcm",…}` ciphertext under an AES-256-GCM key the server
+  never holds and cannot derive. An operator with database access reads
+  nothing but wrapped blobs.
 
 Neither statement generalizes to the other kind of account, and a single
 account can be **mid-migration** — enabling re-writes existing rows one pass
@@ -191,19 +190,46 @@ client-side after fetching all of them — a server-side aggregation or a
 server-side version scan is exactly what encryption breaks.
 
 **The key hierarchy.** A per-account AES-256-GCM data key (DEK) is generated
-in the browser and wrapped (AES-KW) under two independently derived KEKs:
-one from a passkey's WebAuthn PRF output, one from a 160-bit recovery code.
-Both derivations are HKDF-SHA256 over a fixed `APP_SALT` with a per-route
-`info` string. The server stores only the two 40-byte wrapped blobs.
-Unwrapped, the DEK is held as a **non-extractable** `CryptoKey` in IndexedDB
-(database `tt-keys`, store `keys`, id `dek`), so unlock is once per device
-rather than once per page.
+in the browser and wrapped (AES-KW) under independently derived KEKs: one
+from a passkey's WebAuthn PRF output, one from a 160-bit recovery code. Both
+derivations are HKDF-SHA256 over a fixed `APP_SALT` with a per-route `info`
+string. The server stores only the 40-byte wrapped blobs. Unwrapped, the DEK
+is held as a **non-extractable** `CryptoKey` in IndexedDB (database
+`tt-keys`, store `keys`, id `dek`), so unlock is once per device rather than
+once per page.
+
+**Enabling has two routes** (spec §6.1), and the account's own capability
+picks one — it is not a user preference:
+
+| | Passkey + recovery | Recovery only |
+|---|---|---|
+| Offered when | some enrolled credential reported `prf_capable` | none did |
+| Wraps written | `passkey` + `recovery` | `recovery` only |
+| Unlock | passkey, in the sign-in gesture; code as backup | the code, typed once per device |
+| Losing the code | survivable while a keyed passkey remains | **total** |
+
+The second route exists because PRF support is a property of the browser and
+the authenticator, not a setting: a password-manager extension that never
+implemented the extension makes the first route permanently impossible, and
+what the old dead end ("add a passkey that can hold a key") actually produced
+was a plaintext account. **No migration was needed** —
+`entry_key_wrap.credential_id` is nullable and both unique indexes are
+partial. A recovery-only account stops being one as soon as a PRF-capable
+passkey is given a key from the code, through `/account`'s existing
+give-a-key flow. §6.6's "don't delete the last passkey wrap" refusal is
+vacuous while there are zero of them and starts applying at the first.
 
 **Consequences worth knowing before touching any of it:**
 
 - The recovery code is shown **once**, at enable. Losing every passkey *and*
-  the code makes that account's entries unreadable permanently, by everyone.
-  There is no operator recourse; that is the feature working.
+  the code makes that account's entries unreadable permanently, by everyone
+  — or losing the code alone, on the recovery-only route. There is no
+  operator recourse; that is the feature working. **The panel's two warnings
+  are deliberately different sentences and must stay that way**: a user shown
+  the two-wrap wording over a one-wrap account has been told they have a
+  fallback they do not have. The words hang off `EnableRoute`, not off the
+  section rendering them, and the code screen carries the route for the same
+  reason.
 - Adding a passkey to an encrypted account costs **three** authenticator
   interactions (create the new credential; open an *existing* route to
   re-derive the raw DEK — a passkey assertion, or the recovery code; assert

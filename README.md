@@ -76,8 +76,8 @@ changes where entries are stored, and nothing else about how the app is used:
 - The first time you sign in on a device that already has local entries, a
   banner offers to import them; days that already exist on the server are
   left untouched either way, so importing twice is safe.
-- `/account` manages passkeys: add one, rename it, or remove it — and, once
-  you have a passkey that supports it, turns on encryption (below).
+- `/account` manages passkeys: add one, rename it, or remove it — and turns
+  on encryption (below).
 - Signing out returns you to the `localStorage` backend. Nothing already
   saved on the server is deleted.
 
@@ -116,19 +116,34 @@ can turn that off.
 
 **What enabling encryption does.** Your browser generates a key, encrypts
 every entry with it, and sends the server only ciphertext. The key never
-leaves your browser — the server stores two *wrapped* copies of it that it
-has no way to open. From then on the server holds the encrypted text, which
+leaves your browser — the server stores *wrapped* copies of it that it has no
+way to open. From then on the server holds the encrypted text, which
 day each entry belongs to, and roughly how long it is; it cannot read a word
 of any entry, and neither can anyone with a copy of the database, a backup,
 or a court order served on whoever hosts it.
 
-**How to turn it on.** `/account` offers it once you have enrolled a passkey
-whose authenticator supports the WebAuthn PRF extension — most modern
-platform authenticators and security keys do. Accounts without one keep
-working exactly as before, unencrypted. Enabling re-encrypts the entries you
-already have, in one pass you can watch; if it is interrupted, `/account`
-tells you how many days are left and offers to finish. Nothing becomes
-unreadable in the meantime.
+**How to turn it on.** `/account` offers it, by one of two routes, and which
+one you get depends on your passkeys rather than on a choice you make:
+
+- **A passkey and a recovery code**, if you have enrolled a passkey whose
+  authenticator supports the WebAuthn PRF extension — most modern platform
+  authenticators and security keys do. The passkey unlocks your entries in
+  the same gesture as signing in, and the code is a backup behind it.
+- **A recovery code alone**, if none of them do. Some password-manager
+  browser extensions have not implemented the extension the key is derived
+  from, and that is not something a setting can turn on. This route still
+  encrypts your entries; you unlock by typing the code once per browser,
+  after which that browser remembers it like any other. The difference is
+  what the code is worth: there is no passkey behind it, so **losing it loses
+  your entries outright.** The panel says so in those words before you start.
+
+Either way, enabling re-encrypts the entries you already have, in one pass
+you can watch; if it is interrupted, `/account` tells you how many days are
+left and offers to finish. Nothing becomes unreadable in the meantime.
+
+The second route is not a dead end. If you later enrol a passkey that *can*
+hold a key, `/account` will give it one using your recovery code, and from
+then on that passkey unlocks your entries too.
 
 **Your recovery code is shown once, and it is the only backup.** Enabling
 generates a 32-character code and shows it to you on a screen you have to
@@ -136,7 +151,8 @@ confirm before it closes. It is never shown again. Write it down or put it in
 a password manager *before* clicking through — the code is what gets you back
 in on a browser your passkey cannot reach, or after your passkey is gone.
 
-> **If you lose every passkey and the recovery code, your entries are gone,
+> **If you lose every passkey and the recovery code — or just the code, if
+> that is the only key your account has — your entries are gone,
 > permanently.** Not locked, not recoverable by support, not restorable from
 > a backup — the ciphertext is still there and no key on earth opens it. That
 > is exactly what "the server cannot read your entries" costs, and it is not
@@ -187,9 +203,8 @@ Signed-out users' time-tracking data is never sent to the server: it lives
 only in `localStorage`. **Signed-in users' entries are stored server-side, and
 whether that storage is readable by the operator depends on the account.** An
 account that has enabled encryption (above) stores ciphertext under a key the
-server never holds; an account that has not — the default, and the only
-option for an account with no PRF-capable passkey — stores plaintext that
-anyone with database access can read. Both shapes coexist, and so do both
+server never holds; an account that has not — the default — stores plaintext
+that anyone with database access can read. Both shapes coexist, and so do both
 within a single account while its migration pass runs: each stored row
 carries its own version tag and is read according to that tag, which is what
 makes a half-migrated account a normal state rather than a broken one.
