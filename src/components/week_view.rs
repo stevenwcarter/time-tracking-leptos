@@ -76,9 +76,9 @@ pub fn aggregate(rows: &[(NaiveDate, String)]) -> WeekTotals {
 /// failure — the same "loaded and empty beats stuck blank" tradeoff
 /// `hook::loaded_value` makes for a single day.
 ///
-/// A failed range read is not sealed: nothing was read, so nothing was found
-/// sealed either, and claiming otherwise would have a dropped request move
-/// the account's encryption state.
+/// A failed range read is neither sealed nor unopenable: nothing was read,
+/// so nothing was found to be either, and claiming otherwise would have a
+/// dropped request move the account's encryption state.
 fn loaded_rows(read: Result<RangeRead, StorageError>) -> RangeRead {
     match read {
         Ok(read) => read,
@@ -176,6 +176,15 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
             // and puts the unlock prompt up instead.
             if read.sealed {
                 encryption.sealed_row_seen();
+            }
+            // The other way a week comes back short, and the one that
+            // reads as a light week rather than an empty one: a session
+            // holding another account's key opens none of its rows. The
+            // totals above are published either way — they are what this
+            // session could actually read — and the re-probe, if it
+            // happens at all, moves the state that gates them.
+            if read.unopenable {
+                let _ = encryption.unopenable_row_seen();
             }
         });
     });
@@ -398,31 +407,46 @@ mod tests {
         let read = RangeRead {
             rows: vec![(d(2026, 9, 1), "9-10 code1".to_string())],
             sealed: false,
+            unopenable: false,
         };
         assert_eq!(loaded_rows(Ok(read.clone())), read);
     }
 
-    /// Both halves, and the second is the one that matters: a sealed row is
-    /// evidence about the *session*, and it has to survive the collapse that
-    /// throws the failure away, or a week of sealed days goes on rendering
-    /// as an empty week.
+    /// Both halves, and the second is the one that matters: a row this
+    /// session could not read is evidence about the *session*, and it has to
+    /// survive the collapse that throws the failure away, or a week of
+    /// unreadable days goes on rendering as an empty one.
+    ///
+    /// Both flags, because they are the two different ways that happens — no
+    /// key at all, and the wrong account's key — and each is carried
+    /// independently of the rows beside it.
     #[test]
-    fn a_sealed_row_survives_the_collapse() {
+    fn a_row_this_session_could_not_read_survives_the_collapse() {
         let read = RangeRead {
             rows: vec![(d(2026, 9, 1), "9-10 code1".to_string())],
             sealed: true,
+            unopenable: false,
         };
         assert!(loaded_rows(Ok(read)).sealed);
+
+        let read = RangeRead {
+            rows: vec![(d(2026, 9, 1), "9-10 code1".to_string())],
+            sealed: false,
+            unopenable: true,
+        };
+        assert!(loaded_rows(Ok(read)).unopenable);
     }
 
-    /// A read that never happened found nothing sealed either: reporting one
-    /// would let a dropped request move the account's encryption state.
+    /// A read that never happened found nothing sealed or unopenable
+    /// either: reporting one would let a dropped request move the account's
+    /// encryption state — and, for the second flag, spend the page load's
+    /// one re-probe on nothing.
     #[test]
     fn a_failed_range_read_becomes_empty() {
         let read = loaded_rows(Err(StorageError::Unavailable));
         assert_eq!(read.rows, Vec::new());
         assert!(
-            !read.sealed,
+            !read.sealed && !read.unopenable,
             "a failed read learned nothing about the account"
         );
     }

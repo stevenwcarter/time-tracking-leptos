@@ -640,6 +640,23 @@ fn decide_rows<'a, K>(
     DecidedRows { rows, sealed }
 }
 
+/// What one pass of [`open_rows`] made of the rows [`decide_rows`] handed
+/// it.
+///
+/// [`DecidedRows`] one layer down, and the flag travels for a weaker version
+/// of the same reason. A row that will not open is usually a fact about that
+/// row — but a session whose key belongs to another account fails this way
+/// on *every* row it reads, while still believing it is unlocked, so it is
+/// evidence worth carrying rather than only logging (see
+/// [`crate::encryption_ctx::EncryptionCtx::unopenable_row_seen`], which is
+/// what decides whether it means anything).
+#[cfg(any(feature = "hydrate", test))]
+struct OpenedRows {
+    rows: Vec<(NaiveDate, String)>,
+    /// Whether at least one row refused to open under the key it was given.
+    unopenable: bool,
+}
+
 /// Opens every decided row, dropping (and logging) the ones that will not
 /// open.
 ///
@@ -650,20 +667,22 @@ fn decide_rows<'a, K>(
 /// stand-in opener puts that within reach of `cargo test`; only the one
 /// `SubtleCrypto` call stays out of it.
 #[cfg(any(feature = "hydrate", test))]
-async fn open_rows<'a, K, F, Fut>(
-    rows: Vec<(NaiveDate, RowRead<'a, K>)>,
-    open: F,
-) -> Vec<(NaiveDate, String)>
+async fn open_rows<'a, K, F, Fut>(rows: Vec<(NaiveDate, RowRead<'a, K>)>, open: F) -> OpenedRows
 where
     F: Fn(RowRead<'a, K>, StorageKey) -> Fut,
     Fut: Future<Output = Result<String, StorageError>>,
 {
     let mut bodies = Vec::new();
+    let mut unopenable = false;
     for (date, read) in rows {
         let opened = open(read, StorageKey::TimeEntry(date)).await;
+        unopenable |= matches!(opened, Err(StorageError::Crypto { .. }));
         bodies.extend(keep_row(date, opened));
     }
-    bodies
+    OpenedRows {
+        rows: bodies,
+        unopenable,
+    }
 }
 
 /// Every stored body a range read could open, and whether it had to leave
@@ -679,6 +698,9 @@ pub struct RangeRead {
     /// Whether at least one row in the range was sealed against this
     /// session. See [`DecidedRows`].
     pub sealed: bool,
+    /// Whether at least one row refused to open under the key this session
+    /// *does* hold. See [`OpenedRows`].
+    pub unopenable: bool,
 }
 
 /// Every stored body in `[from, to]`, unwrapped and opened. Feeds the week
@@ -705,9 +727,11 @@ pub async fn bodies_in_range(
             Backend::Remote => remote::bodies_in_range(from, to).await?,
         };
         let decided = decide_rows(raw, session);
+        let opened = open_rows(decided.rows, open_row).await;
         Ok(RangeRead {
-            rows: open_rows(decided.rows, open_row).await,
+            rows: opened.rows,
             sealed: decided.sealed,
+            unopenable: opened.unopenable,
         })
     }
     #[cfg(not(feature = "hydrate"))]
@@ -1065,6 +1089,11 @@ mod tests {
     /// row that decoded fine and then would not *open* must cost its own day
     /// and nothing more. The `decide_rows` assertion first is what places the
     /// loss in the second pass — all three rows survive the first.
+    ///
+    /// The flag is asserted alongside, and it is not the same claim as the
+    /// rows: dropping a day is the right blast radius, but a *silently*
+    /// dropped day is what makes a wrong-account week read as a light one.
+    /// Only the flag can tell the caller the difference.
     #[test]
     fn a_row_that_will_not_open_costs_only_its_own_day() {
         let rows = vec![
@@ -1083,31 +1112,41 @@ mod tests {
             "a session holding a key met no sealed row, whatever the opener then did"
         );
 
+        let opened = block_on(open_rows(decided.rows, open_or_fail));
         assert_eq!(
-            block_on(open_rows(decided.rows, open_or_fail)),
+            opened.rows,
             vec![
                 (d(2026, 9, 1), "a".to_string()),
                 (d(2026, 9, 3), "b".to_string())
             ],
             "the unopenable day must be dropped, not the whole week"
         );
+        assert!(
+            opened.unopenable,
+            "a row that would not open under this session's own key must be reported, not \
+             only dropped: every row of another account's week fails exactly this way"
+        );
     }
 
     /// The complement, and the reason the rule is "skip", not "swallow":
-    /// with nothing failing, every row still has to come out.
+    /// with nothing failing, every row still has to come out — and nothing
+    /// is reported unopenable, or an ordinary week would spend the page
+    /// load's one re-probe.
     #[test]
     fn every_row_that_opens_is_kept() {
         let rows = vec![
             (d(2026, 9, 1), envelope::wrap_v1("a")),
             (d(2026, 9, 2), envelope::wrap_v1("b")),
         ];
+        let opened = block_on(open_rows(decide_rows(rows, None::<&u8>).rows, open_or_fail));
         assert_eq!(
-            block_on(open_rows(decide_rows(rows, None::<&u8>).rows, open_or_fail)),
+            opened.rows,
             vec![
                 (d(2026, 9, 1), "a".to_string()),
                 (d(2026, 9, 2), "b".to_string())
             ]
         );
+        assert!(!opened.unopenable);
     }
 
     /// A partially migrated account, at range width: both shapes in one

@@ -105,8 +105,20 @@ impl Persistent {
 
 /// What a finished read leaves the day showing.
 ///
-/// Two outcomes rather than a `String`, because one read failure must not
-/// be shown as "nothing saved": see [`loaded_value`].
+/// More outcomes than a `String`, because two read failures must not be
+/// shown as "nothing saved": see [`loaded_value`].
+///
+/// **Neither failure variant refuses a write on its own**, and it is worth
+/// being exact about that, because the opposite belief is what would invite
+/// narrowing or dropping the report below. Both leave the value at `None`,
+/// which renders blank — and a blank textarea in a session where
+/// [`Writes::Accepted`] holds is still typeable and still overwrites the
+/// stored row. All these variants buy is that the user is not *told* the day
+/// is empty. The refusal comes entirely from the context moving the state
+/// (`EncryptionCtx::sealed_row_seen`,
+/// `EncryptionCtx::unopenable_row_seen`), which is what makes
+/// `EncryptionState::write_key` answer `Locked` and what fires `DayView`'s
+/// gate.
 #[derive(Debug, PartialEq, Eq)]
 enum Loaded {
     /// The text to publish — found, genuinely empty, or a failure it is safe
@@ -115,6 +127,9 @@ enum Loaded {
     /// The row is sealed and this session holds no key for it. There is
     /// content here and the user cannot be shown it.
     Sealed,
+    /// The row did not open under the key this session holds. Usually a
+    /// damaged row — but see [`loaded_value`] for the case where it is not.
+    Unopenable,
 }
 
 /// Collapses a storage read into the loaded state.
@@ -137,12 +152,28 @@ enum Loaded {
 /// off the session state while the evidence is in the row: when the state is
 /// stale the gate does not fire, which is precisely when this matters (see
 /// [`EncryptionCtx::sealed_row_seen`]).
+///
+/// [`StorageError::Crypto`] is the *ambiguous* member of the same family,
+/// and it is separated for the same reason one step along. It normally means
+/// what it says — this row is damaged — and rendering a damaged row as an
+/// empty, editable day is right, since retyping it is the only remedy there
+/// is. But a session that holds a key for the *wrong account*, because a
+/// second tab signed in as somebody else, fails exactly this way on every
+/// row it reads, and it is `Unlocked` throughout: collapsing that to an
+/// empty box hands the user somebody else's day to overwrite, sealed under a
+/// key that account will never hold. The row cannot say which case it is, so
+/// the answer is not to guess but to look again — once
+/// ([`EncryptionCtx::unopenable_row_seen`]).
 fn loaded_value(read: Result<Option<String>, StorageError>) -> Loaded {
     match read {
         Ok(value) => Loaded::Value(value.unwrap_or_default()),
         Err(StorageError::Locked { key }) => {
             error!("`{key}` is sealed and this session holds no key for it");
             Loaded::Sealed
+        }
+        Err(err @ StorageError::Crypto { .. }) => {
+            error!("a stored row would not open under this session's key: {err}");
+            Loaded::Unopenable
         }
         Err(err) => {
             error!("failed to load persisted value, treating as empty: {err}");
@@ -252,6 +283,19 @@ pub fn use_persistent(key: Signal<StorageKey>, backend: Signal<Backend>) -> Pers
                 // does, the gate above swaps this day for the unlock
                 // prompt, and an unlock re-runs this load with a key.
                 Loaded::Sealed => encryption.sealed_row_seen(),
+                // The same report, and then the difference: a row that
+                // would not open is only *possible* evidence, so when the
+                // context declines to act on it — a genuinely damaged row,
+                // or the page load's one re-probe already spent — the day
+                // is published empty rather than left blank forever. A
+                // re-probe that did start publishes a state that re-runs
+                // this load anyway, so publishing here would only paint
+                // "No projects found" over the gap.
+                Loaded::Unopenable => {
+                    if !encryption.unopenable_row_seen() {
+                        set_value.set(Some(String::new()));
+                    }
+                }
             }
         });
     });
@@ -409,8 +453,9 @@ mod tests {
         );
     }
 
-    /// The one read failure that must not be shown as "nothing saved", and
-    /// the only data-destroying path either half of this seam has.
+    /// The read failure that must never be shown as "nothing saved" — the
+    /// unconditional half of the two data-destroying paths this seam has
+    /// (the other is the test below).
     ///
     /// A sealed row means the day *has* content. Collapsing it to an empty
     /// string renders "No projects found" over real ciphertext, and — on a
@@ -431,6 +476,33 @@ mod tests {
             sealed,
             Loaded::Sealed,
             "a row this session cannot open must not read as an empty day"
+        );
+    }
+
+    /// The sibling path, and the one this round closes: a row that would not
+    /// open must reach the context as evidence rather than be collapsed into
+    /// an empty day on the spot.
+    ///
+    /// The wrong-account tab — a second tab having signed in as somebody
+    /// else — is `Unlocked` throughout, so `Writes::Accepted` holds and the
+    /// box it renders is editable. Collapsing this to an empty string is
+    /// what turns the next keystroke into somebody else's day, sealed under
+    /// a key their account will never hold.
+    ///
+    /// Asserted against the empty value specifically, for the reason the
+    /// test above gives: empty is the answer that does the damage. Whether
+    /// the day is *then* rendered empty is the context's call, not this
+    /// function's — see `use_persistent`.
+    #[test]
+    fn a_row_that_will_not_open_is_never_shown_as_nothing_saved() {
+        let unopenable = loaded_value(Err(StorageError::Crypto {
+            key: StorageKey::TimeEntry(date(4)).as_key(),
+            detail: "OperationError".to_string(),
+        }));
+        assert_eq!(
+            unopenable,
+            Loaded::Unopenable,
+            "a row this session's key would not open must not read as an empty day"
         );
     }
 
