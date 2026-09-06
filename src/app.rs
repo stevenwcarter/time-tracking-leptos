@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use leptos::either::Either;
+use leptos::either::{Either, EitherOf3};
 use leptos::prelude::*;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::components::{Route, Router, Routes};
@@ -10,12 +10,13 @@ use crate::auth_ctx::{AuthCtx, USER_META, initial_user};
 use crate::components::account_page::AccountPage;
 use crate::components::header::AppHeader;
 use crate::components::import_banner::ImportBanner;
+use crate::components::setup_gate::SetupGate;
 use crate::components::time_display::TimeDisplay;
 use crate::components::time_entry_area::TimeEntryArea;
 use crate::components::unlock::{UnlockPrompt, UnlockReason};
 use crate::components::week_view::WeekView;
 use crate::date::parse_iso;
-use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
+use crate::encryption_ctx::{EncryptionCtx, EncryptionState, Writes};
 use crate::storage::StorageKey;
 use crate::storage::hook::use_persistent;
 
@@ -149,28 +150,42 @@ fn DayView(date: NaiveDate) -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
     let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
     let key = Signal::derive(move || StorageKey::TimeEntry(date));
-    let entry = use_persistent(key, auth.backend());
+    // Bound once and shared with the gate below, so the backend the entry
+    // is stored through and the backend the gate asks about cannot be two
+    // different derivations of the same fact.
+    let backend = auth.backend();
+    let entry = use_persistent(key, backend);
 
     view! {
         <div class="min-h-screen bg-gray-50">
             <AppHeader date=Some(date)/>
             <div class="w-full max-w-7xl mx-auto px-4 py-8">
                 <ImportBanner/>
-                // The gate spec section 7.4 requires: only a state the user
-                // has to act on swaps in the prompt. `Unknown` and
-                // `Disabled` both render the entry area in its ordinary
-                // state rather than blanking it, and the server renders one
-                // or the other for every visitor — `Unknown` for a
-                // signed-in one (invariant E2), `Disabled` for a signed-out
-                // one, which needs no probe to reach (see `encryption_ctx`'s
-                // header) — so blanking either would remove the entry area
-                // from every server-rendered page, not just a locked one.
-                // The cost of *not* blanking is narrower: a locked session
-                // sees the same shell for the width of the post-hydration
-                // probe before this swaps it for the prompt, since a
-                // `Locked` read fails the same way `hook::loaded_value` maps
-                // any other one — a brief flash on a rare path, not a
-                // permanent wrong answer.
+                // Spec section 4.1's gate comes first, and is asked of
+                // `EncryptionCtx` rather than re-derived here: "can this
+                // session store anything" is the question that object
+                // answers everywhere else, and pairing a state with a
+                // backend by hand would put a copy of the same reasoning in
+                // the week view and on `/account` too. `SetupRequired`
+                // needs the probe's answer *and* `Backend::Remote`, so the
+                // server can no more render this arm than it can `Locked`:
+                // it seeds a signed-in visitor at `Unknown` (invariant E2)
+                // and a signed-out one at `Backend::Local`, where the same
+                // `Disabled` writes plaintext and is not gated at all.
+                //
+                // The remaining arms are spec section 7.4's gate, and only
+                // a state the user has to act on swaps in the prompt.
+                // `Unknown`, `Unlocked` and a signed-out `Disabled` all
+                // render the entry area in its ordinary state rather than
+                // blanking it, and the server renders one of the first and
+                // last for every visitor, so blanking either would remove
+                // the entry area from every server-rendered page rather
+                // than only from a locked one. The cost of *not* blanking
+                // is narrower: a locked session sees the same shell for the
+                // width of the post-hydration probe before this swaps it
+                // for the prompt, since a `Locked` read fails the same way
+                // `hook::loaded_value` maps any other one — a brief flash
+                // on a rare path, not a permanent wrong answer.
                 //
                 // Mounted is not the same as editable. `Unknown` is
                 // `WriteKey::Locked`, so `TimeEntryArea` renders a signed-in
@@ -187,16 +202,20 @@ fn DayView(date: NaiveDate) -> impl IntoView {
                 // refused. Leaving the entry area mounted there would invite
                 // exactly the typing that cannot be saved. The server never
                 // reaches it, so E2 is untouched.
-                {move || match encryption.state() {
-                    EncryptionState::Locked => {
-                        Either::Right(view! { <UnlockPrompt reason=UnlockReason::Locked/> })
+                {move || match (encryption.writes(backend.get()), encryption.state()) {
+                    (Writes::SetupRequired, _) => EitherOf3::C(view! { <SetupGate/> }),
+                    (_, EncryptionState::Locked) => {
+                        EitherOf3::B(view! { <UnlockPrompt reason=UnlockReason::Locked/> })
                     }
-                    EncryptionState::Unreachable => {
-                        Either::Right(view! { <UnlockPrompt reason=UnlockReason::Unreachable/> })
+                    (_, EncryptionState::Unreachable) => {
+                        EitherOf3::B(view! { <UnlockPrompt reason=UnlockReason::Unreachable/> })
                     }
-                    EncryptionState::Unknown
-                    | EncryptionState::Disabled
-                    | EncryptionState::Unlocked(_) => Either::Left(view! {
+                    (
+                        _,
+                        EncryptionState::Unknown
+                        | EncryptionState::Disabled
+                        | EncryptionState::Unlocked(_),
+                    ) => EitherOf3::A(view! {
                         <div class="flex flex-col md:flex-row gap-6 w-full">
                             <TimeEntryArea entry=entry/>
                             <TimeDisplay entry=entry/>
@@ -263,22 +282,61 @@ mod tests {
     /// never produces anything but `Unknown` under `ssr` (invariant E2), so
     /// there is no other way to reach `Locked` here at all.
     ///
-    /// `DayView` reads `AuthCtx` directly (for `auth.backend()`) and, deeper
-    /// in, `AppHeader`'s `AccountMenu`/`DatePicker` do too — both need a
-    /// signed-in identity for their own rendering, independent of the gate
-    /// this test exists to pin. Wrapped in a bare `<Router>` (no `<Routes>`):
-    /// `AppHeader`'s `<A>` needs router context to resolve its `href` or it
-    /// panics, but nothing here navigates, so no route table is required.
-    fn render_day_view(state: EncryptionState) -> String {
+    /// `signed_in_as` is a parameter rather than a constant because it is
+    /// half of spec section 4.1's gate: the identity decides
+    /// `auth.backend()`, and the same `EncryptionState::Disabled` is
+    /// ordinary local mode on `Local` and a hard stop on `Remote`. Deeper
+    /// in, `AppHeader`'s `AccountMenu`/`DatePicker` read the same context
+    /// for their own rendering, which is independent of either gate.
+    ///
+    /// Wrapped in a bare `<Router>` (no `<Routes>`): `AppHeader`'s `<A>`
+    /// needs router context to resolve its `href` or it panics, but nothing
+    /// here navigates, so no route table is required.
+    fn render_day_view_for(signed_in_as: Option<&str>, state: EncryptionState) -> String {
         let runtime = Owner::new();
         let date = crate::date::parse_iso("2026-09-04").expect("valid date");
+        let user = signed_in_as.map(str::to_string);
         let html = runtime.with(move || {
             provide_context(RequestUrl::new("/2026-09-04"));
+            provide_context(AuthCtx {
+                user: RwSignal::new(user),
+            });
+            provide_context(EncryptionCtx::for_state(state));
+            view! { <Router><DayView date=date/></Router> }.to_html()
+        });
+        runtime.cleanup();
+        html
+    }
+
+    /// The signed-in case, which is what every gate below is about except
+    /// the one that exists to prove signed-out visitors were left alone.
+    fn render_day_view(state: EncryptionState) -> String {
+        render_day_view_for(Some("alice@example.com"), state)
+    }
+
+    /// Renders `/account` the same way, since that is where the gate sends
+    /// an account it stops — and so the only place its escape hatch can be
+    /// checked for.
+    ///
+    /// `AccountPage`'s passkey list is a `Resource` inside a `<Suspense>`;
+    /// under `.to_html()` that renders its fallback, which is all this needs
+    /// — the banner is above it and does not wait on anything.
+    fn render_account_page(state: EncryptionState) -> String {
+        // Constructing that `Resource` spawns, and spawning without a global
+        // executor panics in a debug build — the same install
+        // `storage::hook`'s write-path tests do, and for the same reason.
+        // The pool is never run: the fetch would reach a server function
+        // with no `AppCtx` to answer from, and the fallback is what this
+        // renders either way.
+        let _ = any_spawner::Executor::init_futures_executor();
+        let runtime = Owner::new();
+        let html = runtime.with(move || {
+            provide_context(RequestUrl::new("/account"));
             provide_context(AuthCtx {
                 user: RwSignal::new(Some("alice@example.com".to_string())),
             });
             provide_context(EncryptionCtx::for_state(state));
-            view! { <Router><DayView date=date/></Router> }.to_html()
+            view! { <Router><AccountPage/></Router> }.to_html()
         });
         runtime.cleanup();
         html
@@ -327,15 +385,21 @@ mod tests {
     /// The gate's other half: every other state still mounts the entry
     /// area, exactly as it did before this gate existed (spec 7.4's
     /// correction — `Unknown` is not a second reason to hide it).
+    ///
+    /// `Disabled` is here as a *signed-out* visitor, and that is spec
+    /// section 4.1 rather than a convenience: the same state signed in is
+    /// an account the server refuses every write from, which
+    /// `a_signed_in_account_without_encryption_gets_no_entry_area` pins on
+    /// the other side.
     #[test]
     fn day_view_shows_the_entry_area_when_not_locked() {
-        for state in [
-            EncryptionState::Unknown,
-            EncryptionState::Disabled,
+        for (user, state) in [
+            (Some("alice@example.com"), EncryptionState::Unknown),
+            (None, EncryptionState::Disabled),
             // `Unlocked` needs a `SessionKey`, uninhabited on the host — its
             // arm is covered by `encryption_ctx`'s own tests instead.
         ] {
-            let html = render_day_view(state);
+            let html = render_day_view_for(user, state);
             assert!(
                 html.contains("<textarea") && html.contains("></textarea>"),
                 "a non-locked session must still mount the entry area"
@@ -345,6 +409,73 @@ mod tests {
                 "a non-locked session must not render the unlock prompt"
             );
         }
+    }
+
+    /// A signed-in account with no encryption must not be shown a writing
+    /// surface (spec section 4.1). The previous branch spent a whole fix
+    /// round establishing why: an editable box that silently refuses to
+    /// save is worse than no box, because the user types, nothing persists,
+    /// and nothing says so.
+    ///
+    /// Both halves are asserted. Removing the box without saying where to
+    /// go would swap a silent failure for a blank page, which is the other
+    /// way to get this wrong.
+    #[test]
+    fn a_signed_in_account_without_encryption_gets_no_entry_area() {
+        let html = render_day_view(EncryptionState::Disabled);
+        assert!(
+            !html.contains("<textarea"),
+            "an account the server refuses every write from must not be \
+             offered somewhere to type"
+        );
+        assert!(
+            html.contains("Set up encryption"),
+            "a gate that does not say what to do next reads as a broken page"
+        );
+    }
+
+    /// The escape has to be *visible* on the setup view, not merely
+    /// reachable: without it the gate reads as a lock-out to anyone who
+    /// signed in on a borrowed machine, and the honest fact is that local
+    /// mode works completely — it just stores nothing on the server (spec
+    /// section 4.1).
+    ///
+    /// Asserted in both directions. An escape offered to an account that is
+    /// already set up is not the same feature: it would sit permanently
+    /// beside the passkey controls, inviting a sign-out nobody was gated
+    /// into.
+    #[test]
+    fn the_gate_offers_a_way_back_to_local_mode() {
+        let gated = render_account_page(EncryptionState::Disabled);
+        assert!(
+            gated.contains("Sign out and use this device only"),
+            "the setup view must offer the way back to local mode"
+        );
+
+        let set_up = render_account_page(EncryptionState::Locked);
+        assert!(
+            !set_up.contains("Sign out and use this device only"),
+            "an account that is past the gate must not be offered its escape"
+        );
+    }
+
+    /// Signed out is untouched, and this is the assertion that stops the
+    /// gate over-reaching. `Backend::Local` is never encrypted (spec section
+    /// 1.2), so `Disabled` there is not a conclusion about an account at all
+    /// — it is ordinary, fully working local mode, and the very mode the
+    /// escape hatch above falls back to. Gating it would lock the app's
+    /// main page for its main-page majority.
+    #[test]
+    fn a_signed_out_visitor_is_not_gated() {
+        let html = render_day_view_for(None, EncryptionState::Disabled);
+        assert!(
+            html.contains("<textarea") && !html.contains("readonly"),
+            "a signed-out visitor's box must be editable, not gated"
+        );
+        assert!(
+            !html.contains("Set up encryption"),
+            "a visitor with no account has nothing to set up"
+        );
     }
 
     /// The window this exists to close: `Unknown` mounts the entry area —
@@ -370,7 +501,10 @@ mod tests {
             "a greyed-out box with no explanation reads as broken: {waiting}"
         );
 
-        let saving = render_day_view(EncryptionState::Disabled);
+        // Signed out, because a signed-in `Disabled` no longer reaches the
+        // entry area at all (spec section 4.1) — and because local mode is
+        // the state where a save genuinely does land with no key involved.
+        let saving = render_day_view_for(None, EncryptionState::Disabled);
         assert!(
             !saving.contains("readonly"),
             "a session that can save must hand over an editable box"

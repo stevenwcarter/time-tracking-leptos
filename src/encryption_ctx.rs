@@ -63,7 +63,7 @@ use crate::auth_ctx::AuthCtx;
 use crate::crypto::SessionKey;
 #[cfg(any(feature = "hydrate", test))]
 use crate::dto::EncryptionStatus;
-use crate::storage::WriteKey;
+use crate::storage::{Backend, WriteKey};
 
 #[cfg(feature = "hydrate")]
 use crate::server_fns::encryption::encryption_status;
@@ -196,26 +196,56 @@ impl EncryptionState {
         }
     }
 
-    /// Whether a save made right now would be stored, for the view.
+    /// Whether a save made right now would be stored, and if not, whether
+    /// the user can do anything about it.
     ///
     /// Reads the decision back out of [`write_key`](Self::write_key) rather
     /// than repeating the match, so the entry area cannot invite a keystroke
     /// the seam then refuses. See [`Writes`].
-    pub fn writes(&self) -> Writes {
-        match self.write_key() {
-            WriteKey::Plaintext | WriteKey::Sealed(_) => Writes::Accepted,
-            WriteKey::Locked => Writes::Refused,
+    ///
+    /// # Why this takes the backend
+    ///
+    /// [`Disabled`](Self::Disabled) answers two opposite questions depending
+    /// on where the write is going, and only one of them is a refusal.
+    /// `localStorage` is never encrypted (spec section 1.2), so a signed-out
+    /// visitor's plaintext write is exactly right — that is the fully
+    /// working mode the gate's escape hatch falls back to. The server stores
+    /// entries only for accounts that have encryption (invariant E9), so the
+    /// same state on [`Backend::Remote`] is a write that cannot land, and
+    /// the day and week views must not offer a surface for it (spec section
+    /// 4.1).
+    ///
+    /// The backend is a parameter rather than a second pair of
+    /// [`EncryptionState`] variants because `storage::write_target` — the
+    /// seam this mirrors — decides on exactly the pair
+    /// `(Backend, WriteKey)`, and a mirror taking fewer inputs than the
+    /// decision it reflects is reflecting something narrower than it claims.
+    /// Every caller already holds the backend — as a field on
+    /// [`crate::storage::hook::Persistent`], and as `AuthCtx::backend()` at
+    /// the three gates — so nothing is saved by hiding it. Splitting the
+    /// state instead would mean deriving that same fact a second time, out
+    /// of the probe, and two derivations of one fact can lag each other
+    /// where one cannot.
+    pub fn writes(&self, backend: Backend) -> Writes {
+        match (backend, self.write_key()) {
+            // Checked before the backend, exactly as `write_target` does:
+            // a session that cannot seal refuses wherever it is writing.
+            (_, WriteKey::Locked) => Writes::Refused,
+            (Backend::Local, _) => Writes::Accepted,
+            (Backend::Remote, WriteKey::Sealed(_)) => Writes::Accepted,
+            (Backend::Remote, WriteKey::Plaintext) => Writes::SetupRequired,
         }
     }
 }
 
-/// Whether a save made right now would be stored.
+/// Whether a save made right now would be stored, and if not, whose problem
+/// that is.
 ///
 /// The write side's counterpart to [`KeyIdentity`], and the answer the entry
 /// area renders itself from. It is derived from
-/// [`write_key`](EncryptionState::write_key) rather than matched on the
-/// state again, so the box the user can type into and the call that refuses
-/// the keystroke cannot come to disagree.
+/// [`write_key`](EncryptionState::write_key) and the backend rather than
+/// matched on the state again, so the box the user can type into and the
+/// call that refuses the keystroke cannot come to disagree.
 ///
 /// It exists because the disagreement is silent. For a signed-in visitor the
 /// server renders `Unknown` (invariant E2) and so does the client's first
@@ -227,11 +257,22 @@ impl EncryptionState {
 /// module's header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Writes {
-    /// The account has no encryption, or this device holds the key.
+    /// This device can seal, or the write is going somewhere that needs no
+    /// sealing. A save lands.
     Accepted,
     /// Nothing is known about the account's encryption yet, or this device
-    /// cannot seal. A save would be refused.
+    /// holds no key for it. A save would be refused, and only a probe
+    /// answering or an unlock changes that.
     Refused,
+    /// The account has no encryption, and the server stores entries only
+    /// for accounts that do (invariant E9).
+    ///
+    /// A refusal like [`Refused`](Self::Refused), and told apart from it
+    /// because it is the one the *user* can clear and the only one with
+    /// somewhere to send them. This is spec section 4.1's gate: the day and
+    /// week views mount `SetupGate` instead of their content, rather than a
+    /// writing surface every save would be dropped from.
+    SetupRequired,
 }
 
 /// Which key a read would use, reduced to something a `Memo` can compare.
@@ -758,10 +799,13 @@ impl EncryptionCtx {
     /// Whether a save made right now would be stored, tracked.
     ///
     /// Tracked because the answer changes under the user: the probe
-    /// resolving is what turns a page that cannot save into one that can,
-    /// with no other event to redraw on.
-    pub fn writes(self) -> Writes {
-        self.state.get().writes()
+    /// resolving is what turns a page that cannot save into one that can —
+    /// or into one that has to be set up first — with no other event to
+    /// redraw on. The backend is taken rather than read back out of
+    /// `AuthCtx`, both because this context does not hold one off the
+    /// browser and for the reason [`EncryptionState::writes`] gives.
+    pub fn writes(self, backend: Backend) -> Writes {
+        self.state.get().writes(backend)
     }
 
     /// Which key a read would use, tracked — the narrow dependency the
@@ -1071,19 +1115,51 @@ mod tests {
     /// keystroke the save then refused — which is precisely the silence
     /// `Writes` exists to end.
     ///
+    /// A session that cannot seal is refused on *either* backend, which is
+    /// the ordering `write_target` also uses: it returns `Locked` before it
+    /// so much as looks at where the write was going.
+    ///
     /// `Unlocked` is absent because it needs a `SessionKey`, uninhabited on
     /// the host; its arm is the one `write_key` and `writes` share by
     /// construction, since the second reads the first.
     #[test]
     fn what_the_view_shows_matches_what_a_write_would_do() {
-        for state in [
-            EncryptionState::Unknown,
-            EncryptionState::Unreachable,
-            EncryptionState::Locked,
-        ] {
-            assert_eq!(state.writes(), Writes::Refused);
+        for backend in [Backend::Local, Backend::Remote] {
+            for state in [
+                EncryptionState::Unknown,
+                EncryptionState::Unreachable,
+                EncryptionState::Locked,
+            ] {
+                assert_eq!(state.writes(backend), Writes::Refused);
+            }
         }
-        assert_eq!(EncryptionState::Disabled.writes(), Writes::Accepted);
+    }
+
+    /// The half spec section 4.1 turns on, and the reason `writes` takes a
+    /// backend at all: `Disabled` is the ordinary working state of a
+    /// signed-out visitor and a hard stop for a signed-in one, and nothing
+    /// about the state alone tells the two apart.
+    ///
+    /// Both directions are asserted because both failures are silent and
+    /// opposite. Answering `Accepted` on `Remote` restores the defect the
+    /// gate exists to prevent — a box that takes keystrokes the server then
+    /// drops, since the account cannot legally hold a row (invariant E9).
+    /// Answering `SetupRequired` on `Local` locks every signed-out visitor
+    /// out of the app's main page, and out of the very mode the gate's
+    /// escape hatch falls back to.
+    #[test]
+    fn the_same_state_saves_locally_and_needs_setup_on_the_server() {
+        assert_eq!(
+            EncryptionState::Disabled.writes(Backend::Local),
+            Writes::Accepted,
+            "`localStorage` is never encrypted, so there is nothing to set up"
+        );
+        assert_eq!(
+            EncryptionState::Disabled.writes(Backend::Remote),
+            Writes::SetupRequired,
+            "the server stores nothing for an account without encryption, so \
+             the user has to be sent somewhere rather than merely refused"
+        );
     }
 
     // `EncryptionState::key` has no host test of its own, deliberately. The

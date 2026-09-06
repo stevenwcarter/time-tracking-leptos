@@ -59,8 +59,14 @@ impl Persistent {
     /// editor that reads the session from anywhere else can come to invite a
     /// keystroke this `Persistent` then refuses, and the refusal is silent
     /// (see [`Writes`]).
+    ///
+    /// The backend comes from this `Persistent`'s own signal rather than
+    /// from a second read of `AuthCtx`, so the pair asked about here is
+    /// exactly the pair [`set`](Self::set) will hand to the seam. Tracked,
+    /// like the state: signing out flips the backend in place, and the
+    /// answer with it.
     pub fn writes(self) -> Writes {
-        self.encryption.writes()
+        self.encryption.writes(self.backend.get())
     }
 
     /// Updates the value and writes it through to storage.

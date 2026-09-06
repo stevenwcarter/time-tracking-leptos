@@ -19,9 +19,10 @@ use leptos_router::components::A;
 use crate::auth_ctx::{AuthCtx, forget_device_key, sign_out};
 use crate::components::encryption_panel::EncryptionPanel;
 use crate::components::header::AppHeader;
+use crate::components::setup_gate::SetupBanner;
 use crate::components::status::Status;
 use crate::dto::PasskeyListItem;
-use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
+use crate::encryption_ctx::{EncryptionCtx, EncryptionState, Writes};
 use crate::server_fns::passkey::{passkey_delete, passkey_list, passkey_rename};
 use crate::server_fns::session::sign_out_everywhere;
 
@@ -47,6 +48,8 @@ fn passkey_error(e: ServerFnError) -> Status {
 #[component]
 pub fn AccountPage() -> impl IntoView {
     let auth = use_context::<AuthCtx>().expect("AuthCtx provided by App");
+    let encryption = use_context::<EncryptionCtx>().expect("EncryptionCtx provided by App");
+    let backend = auth.backend();
     // Lifted here rather than owned by either section, because both write it
     // and both read it: the passkey list bumps it after an add or a remove,
     // and the encryption panel bumps it after keying a credential.
@@ -70,6 +73,15 @@ pub fn AccountPage() -> impl IntoView {
                         </div>
                     }),
                     Some(email) => Either::Right(view! {
+                        // This page is where spec section 4.1's gate sends
+                        // an account that cannot store anything, so it has
+                        // to open by saying why — a user who was moved here
+                        // did not ask to be. Asked of `EncryptionCtx` with
+                        // the same call the day and week views gate on, so
+                        // the banner cannot appear on a page they let
+                        // through, or stay away from one they do not.
+                        {move || (encryption.writes(backend.get()) == Writes::SetupRequired)
+                            .then(|| view! { <SetupBanner/> })}
                         <PasskeySection email=email reload=reload/>
                         <EncryptionPanel reload=reload/>
                     }),

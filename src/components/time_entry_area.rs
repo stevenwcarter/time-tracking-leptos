@@ -30,7 +30,16 @@ pub fn TimeEntryArea(entry: Persistent) -> impl IntoView {
     // signed-in visitor — and the whole point is that the box is visibly
     // not-yet-editable for it, instead of taking keystrokes
     // `Persistent::set` silently refuses.
-    let refusing = move || entry.writes() == Writes::Refused;
+    //
+    // Written as "anything but `Accepted`" rather than as a match on one
+    // named refusal, so a refusal this pane was not written for still greys
+    // the box out instead of defaulting it open.
+    // `Writes::SetupRequired` never actually arrives here — the day and week
+    // views mount `SetupGate` in place of the entry area for it (spec
+    // section 4.1) — but "would this be stored" is the only property this
+    // pane cares about, and it should not have to be told about each new
+    // reason the answer is no.
+    let refusing = move || entry.writes() != Writes::Accepted;
 
     view! {
         <div class="w-full md:w-1/2 bg-white rounded-lg shadow-sm border border-gray-200">

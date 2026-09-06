@@ -6,7 +6,7 @@
 //! survive it (spec section 9.1).
 
 use chrono::{Days, NaiveDate};
-use leptos::either::{Either, EitherOf3};
+use leptos::either::{Either, EitherOf4};
 use leptos::logging::error;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -17,9 +17,10 @@ use time_tracking_parser::{Time, parse_time_tracking_data};
 
 use crate::auth_ctx::AuthCtx;
 use crate::components::header::AppHeader;
+use crate::components::setup_gate::SetupGate;
 use crate::components::unlock::{UnlockPrompt, UnlockReason};
 use crate::date::{parse_iso, to_iso, week_bounds};
-use crate::encryption_ctx::{EncryptionCtx, EncryptionState};
+use crate::encryption_ctx::{EncryptionCtx, EncryptionState, Writes};
 use crate::storage::hook::session_identity;
 use crate::storage::{Backend, Generation, RangeRead, StorageError, bodies_in_range};
 
@@ -213,14 +214,25 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
                     </div>
                 </div>
 
-                // Gated the same way `DayView` gates the entry area, and for
-                // the same reason (spec section 7.4): only a state the user
-                // has to act on swaps in the prompt. `Unknown` falls through
-                // to the ordinary loading/empty states below, exactly as it
-                // did before this gate existed — the server is always
-                // `Unknown` (invariant E2), so treating it as a reason to
-                // hide the totals shell would remove this page's chrome for
-                // every visitor, not just a locked one. A genuinely `Locked`
+                // Gated exactly as `DayView` is, arm for arm, because a
+                // second copy of either decision is how the two pages come
+                // to disagree about the same session.
+                //
+                // Spec section 4.1's gate leads, and reading this page is
+                // not the exception it might look like: everything it links
+                // to is a surface that cannot save, so leaving it reachable
+                // would be a route around the gate rather than a carve-out
+                // from it. The account has nothing stored to summarise in
+                // any case — the server refuses its every write (invariant
+                // E9).
+                //
+                // The rest is spec section 7.4: only a state the user has to
+                // act on swaps in the prompt. `Unknown` falls through to the
+                // ordinary loading/empty states below, exactly as it did
+                // before this gate existed — the server is always `Unknown`
+                // (invariant E2), so treating it as a reason to hide the
+                // totals shell would remove this page's chrome for every
+                // visitor, not just a locked one. A genuinely `Locked`
                 // session still gets there in the end: its range read comes
                 // back with every row unreadable, `loaded_rows` turns that
                 // into an empty week, and this arm replaces that empty week
@@ -228,24 +240,27 @@ fn WeekBody(anchor: NaiveDate, backend: Signal<Backend>) -> impl IntoView {
                 // brief flash of "Nothing logged", not a permanent wrong
                 // answer. `Unreachable` joins `Locked` for the reason
                 // `DayView`'s gate spells out: only the user can end it.
-                {move || match (encryption.state(), totals.get()) {
-                    (EncryptionState::Locked, _) => {
-                        EitherOf3::C(view! { <UnlockPrompt reason=UnlockReason::Locked/> })
+                {move || match (encryption.writes(backend.get()), encryption.state(), totals.get()) {
+                    (Writes::SetupRequired, _, _) => {
+                        EitherOf4::D(view! { <SetupGate/> })
                     }
-                    (EncryptionState::Unreachable, _) => {
-                        EitherOf3::C(view! { <UnlockPrompt reason=UnlockReason::Unreachable/> })
+                    (_, EncryptionState::Locked, _) => {
+                        EitherOf4::C(view! { <UnlockPrompt reason=UnlockReason::Locked/> })
                     }
-                    (_, None) => EitherOf3::A(view! {
+                    (_, EncryptionState::Unreachable, _) => {
+                        EitherOf4::C(view! { <UnlockPrompt reason=UnlockReason::Unreachable/> })
+                    }
+                    (_, _, None) => EitherOf4::A(view! {
                         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
                             <p class="value-slot"></p>
                         </div>
                     }),
-                    (_, Some(t)) if t.per_day.is_empty() => EitherOf3::A(view! {
+                    (_, _, Some(t)) if t.per_day.is_empty() => EitherOf4::A(view! {
                         <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
                             <p class="text-sm text-gray-500">"Nothing logged this week."</p>
                         </div>
                     }),
-                    (_, Some(t)) => EitherOf3::B(view! { <WeekTables totals=t/> }),
+                    (_, _, Some(t)) => EitherOf4::B(view! { <WeekTables totals=t/> }),
                 }}
             </main>
         </div>
@@ -475,7 +490,7 @@ mod gate_tests {
     /// navigates, so no route table is required. `backend` is passed
     /// directly rather than read from `AuthCtx`, since `WeekBody` — unlike
     /// `WeekView`, its param-parsing wrapper — takes it as a plain argument.
-    fn render_week_body(state: EncryptionState) -> String {
+    fn render_week_body_for(backend: Backend, state: EncryptionState) -> String {
         let runtime = Owner::new();
         let anchor = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let html = runtime.with(move || {
@@ -484,11 +499,19 @@ mod gate_tests {
                 user: RwSignal::new(Some("alice@example.com".to_string())),
             });
             provide_context(EncryptionCtx::for_state(state));
-            let backend = Signal::derive(|| Backend::Local);
+            let backend = Signal::derive(move || backend);
             view! { <Router><WeekBody anchor=anchor backend=backend/></Router> }.to_html()
         });
         runtime.cleanup();
         html
+    }
+
+    /// `Backend::Local` for the state gates, which are about the session's
+    /// key rather than about where its rows live: those two arms answer the
+    /// same way on either backend, and choosing the one that spec section
+    /// 4.1's gate never fires on keeps each test to a single subject.
+    fn render_week_body(state: EncryptionState) -> String {
+        render_week_body_for(Backend::Local, state)
     }
 
     /// The primary case: `Locked` must swap the totals shell for the unlock
@@ -544,5 +567,34 @@ mod gate_tests {
                 "a non-locked session must not render the unlock prompt"
             );
         }
+    }
+
+    /// Spec section 4.1's gate, on the page it would otherwise be a route
+    /// around. Reading a week is not an exception to "the day and week views
+    /// are unreachable": every day it links to is a surface that cannot
+    /// save, and the account has nothing stored to summarise anyway, since
+    /// the server refuses its every write (invariant E9).
+    ///
+    /// The `Backend::Local` half is the guard against over-reaching, and
+    /// it is the same state — a signed-out visitor's week must still
+    /// render.
+    #[test]
+    fn week_body_is_gated_for_an_account_without_encryption() {
+        let gated = render_week_body_for(Backend::Remote, EncryptionState::Disabled);
+        assert!(
+            gated.contains("Set up encryption"),
+            "an account that cannot store anything must be sent to setup"
+        );
+        assert!(
+            !gated.contains("value-slot"),
+            "the totals shell must not mount behind the gate"
+        );
+
+        let local = render_week_body_for(Backend::Local, EncryptionState::Disabled);
+        assert!(
+            local.contains("value-slot") && !local.contains("Set up encryption"),
+            "a signed-out visitor's week is not gated — `localStorage` is \
+             never encrypted"
+        );
     }
 }
