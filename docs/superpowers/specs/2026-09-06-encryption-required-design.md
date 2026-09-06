@@ -300,7 +300,7 @@ reintroduce it.
 | Situation | Behaviour |
 |---|---|
 | Signed in, no encryption, tries to reach the day view | Routed to setup. No editable surface is rendered. |
-| Signed in, no encryption, a stale client posts an entry anyway | Server refuses on `encrypted_at`. The client surfaces it as "set up encryption first", not a generic error. |
+| Signed in, no encryption, a stale client posts an entry anyway | Server refuses on `encrypted_at`. Nothing *renders* that refusal — `StorageError::EncryptionRequired` is logged and no more — because §4.1's gate delivers the outcome instead: the day and week views are replaced by `SetupGate` and the session is moved to `/account`, so it is off the surfaces that would produce the refusal before it can. The one control left live under any `Writes` is `ImportBanner`'s Import button, whose report counts the days that landed and says nothing about encryption. |
 | Enrols a passkey that turns out not to be PRF-capable | Encryption offered on the encryption-key route, with the reason stated and the authenticator named where known. The passkey still works for signing in — which is why it was worth enrolling. |
 | Declines the passkey entirely | Encryption-key route, same as above. Sign-in continues to use magic links. |
 | Wants out | "Sign out and use this device only" returns to local mode, which is fully functional and stores nothing server-side. |

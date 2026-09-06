@@ -72,15 +72,27 @@ cargo-leptos release.
 This release changed a value stored in the `entry_key_wrap` table by editing
 an already-shipped migration in place instead of adding a new one, which is
 safe only if no database has run the old version. A database that survives
-will still hold the old value; the migration will not re-run, nothing will
-report an error, and the effect is that **every encrypted account stops being
-able to unlock, permanently.** The key that would decrypt those entries can
-no longer be located, so there is no repair and no support recourse.
+will still hold the old value; the migration will not re-run, and the key
+that would decrypt each affected account's entries can no longer be located.
+There is no repair and no support recourse for that, so **the server refuses
+to start rather than serve it.**
 
-Every other assumption this build makes fails loudly and is fixed by
-re-running something. This one does not. If a database ever has to survive
-the change, it needs a real forward migration that rewrites the stored value
-— not a second in-place edit.
+After migrations and before it binds a port, the process counts
+`entry_key_wrap` rows carrying a `kind` this build cannot parse. If it finds
+any it logs one `ERROR` line — naming the count and this rename — and exits
+with status 1.
+
+**In production that shows up as a crash-looping deploy, not as a running app
+with broken accounts.** A container platform restarts the process, watches it
+exit at once, and reports a failing health check or a restart back-off; the
+only explanation is that one log line, in the logs of a container that keeps
+dying. Read it before concluding the build is bad. It is the check doing its
+job, and the fix is the wipe this release requires — never hand-editing the
+rows it names, each of which is the only route to an account's data key.
+
+The check finds nothing on a wiped database, and costs one query. If a
+database ever has to survive the change, it needs a real forward migration
+that rewrites the stored value — not a second in-place edit.
 
 ## Accounts
 

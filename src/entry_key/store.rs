@@ -278,7 +278,21 @@ fn all_wrap_kinds(conn: &mut DbConn) -> Result<Vec<String>> {
 /// so every route to the account's data key disappears behind one "Internal
 /// server error", on whichever request happens to ask first, with no
 /// explanation reaching anyone of why. This turns that into one refusal to
-/// boot, naming the problem instead.
+/// boot, naming the problem instead — which a container platform shows as a
+/// crash-looping deploy, so the error line below is the only thing that
+/// explains one.
+///
+/// **It detects rows, not schema.** A surviving database that ran the
+/// migration but never had an account enable encryption has nothing to scan,
+/// so it boots — still carrying `idx_entry_key_wrap_one_recovery` and never
+/// having gained `idx_entry_key_wrap_one_encryption_key`. No wrap is at risk
+/// there, since none exists, but that database has permanently lost the
+/// schema-level "one encryption-key wrap per account" constraint that
+/// `a_second_encryption_key_wrap_is_rejected` pins against a freshly
+/// migrated one. Closing that too would mean asking `sqlite_master` for the
+/// index beside this scan; it is left out because the deployment contract is
+/// "wipe or do not deploy", and this check exists for the sub-case that
+/// costs data rather than as a general schema audit.
 pub fn ensure_wrap_kinds_parseable(conn: &mut DbConn) -> Result<(), String> {
     let kinds = all_wrap_kinds(conn).map_err(|e| e.to_string())?;
     match unparseable_kinds_problem(&kinds) {

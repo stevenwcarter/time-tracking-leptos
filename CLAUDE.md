@@ -203,9 +203,8 @@ opting.** Server-side storage is now encrypted or it does not happen.
 > ### Deploying this build requires an empty database
 >
 > **The production database must be deleted before this build is deployed.**
-> This is the one assumption in the branch whose failure is silent and
-> unrecoverable — everything else here fails loudly and is fixed by re-running
-> something.
+> Deploying against a surviving one is unrecoverable, so the server refuses to
+> start instead of running that way — see the boot check below.
 >
 > The rename changed the stored `entry_key_wrap.kind` value from `'recovery'`
 > to `'encryption_key'`, and it did so by **editing a shipped migration in
@@ -213,11 +212,27 @@ opting.** Server-side storage is now encrypted or it does not happen.
 > run `2026-09-05-000001_entry_key`, so Diesel will not re-run it: the rows
 > keep saying `'recovery'`, `idx_entry_key_wrap_one_encryption_key`'s
 > predicate never matches them, and `WrapKind::parse` returns `None` for
-> every one. The wrap holding that account's data key becomes unfindable.
-> Nothing errors at deploy time and nothing errors at startup; the symptom is
-> every encrypted account failing to unlock, looking exactly like corruption.
-> There is no recovery, because the key that would decrypt the entries is the
+> every one. The wrap holding that account's data key becomes unfindable, and
+> there is no recovery, because the key that would decrypt the entries is the
 > one that can no longer be located.
+>
+> **This fails loudly, at boot.** `entry_key::store::ensure_wrap_kinds_parseable`
+> runs from `test_support::router` after migrations and before the listener
+> binds: it counts rows whose `kind` this build cannot parse and, if any
+> exist, logs one `tracing::error!` naming the count and the rename, then
+> `std::process::exit(1)`. The operational symptom is therefore a
+> **crash-looping deploy** — a process that never serves a request — rather
+> than a live app whose encrypted accounts silently fail to unlock. Anyone
+> debugging a restart loop on this release should read that log line before
+> suspecting the build.
+>
+> What it does *not* catch: a surviving database that ran the migration but
+> never had an account enable encryption has no rows to scan, so it boots.
+> Nothing is at risk there — no wraps exist — but that database keeps
+> `idx_entry_key_wrap_one_recovery` and never gains
+> `idx_entry_key_wrap_one_encryption_key`, so it has lost the schema-level
+> "one encryption-key wrap per account" constraint for good. The wipe is the
+> requirement; the check is a backstop for the case that costs data.
 >
 > If a database ever *does* have to survive this change, the fix is a real
 > forward migration (`UPDATE entry_key_wrap SET kind = 'encryption_key' WHERE
