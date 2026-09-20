@@ -19,26 +19,53 @@ on:
 jobs:
   rust-build:
     runs-on: ubuntu-latest
+    env:
+      # The registry host is a repo variable now (a hostname is not a
+      # credential, and masking it renders every push line as `***`). The
+      # secret of the same name stays as a fallback.
+      REGISTRY: ${{ vars.DOCKER_REGISTRY || secrets.DOCKER_REGISTRY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      # The registry is reached over Tailscale, not its public
+      # Cloudflare-proxied hostname: Bot Fight Mode 403s `docker login` (it is
+      # zone-wide and cannot be scoped to a host or path), and the free plan's
+      # 100 MB body cap 413s any layer above it, since `docker push` sends each
+      # blob as one unchunked PUT. The OAuth client registers an ephemeral
+      # `tag:ci` node that Tailscale reaps when the job ends.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          # The registry is a Tailscale Service, whose virtual IP lives only in
+          # MagicDNS. `tailscale up` accepts DNS by default and the action adds
+          # no flags of its own, but pin it: without it the name never resolves.
+          args: --accept-dns=true
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ secrets.DOCKER_REGISTRY }}/time-tracking-leptos
+            ${{ env.REGISTRY }}/time-tracking-leptos
           tags: |
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+      # `network=host` is load-bearing: the registry cache export below needs
+      # the docker-container driver, and that container's embedded resolver
+      # will not forward to the host's loopback systemd-resolved stub — it
+      # falls back to public DNS, where the tailnet name does not exist.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
       - name: Login to Docker registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.DOCKER_REGISTRY }}
+          registry: ${{ env.REGISTRY }}
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Build and push docker image
@@ -49,6 +76,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ secrets.DOCKER_REGISTRY }}/time-tracking-leptos:buildcache
-          cache-to: type=registry,ref=${{ secrets.DOCKER_REGISTRY }}/time-tracking-leptos:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/time-tracking-leptos:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/time-tracking-leptos:buildcache,mode=max
 
