@@ -24,6 +24,13 @@ jobs:
       # credential, and masking it renders every push line as `***`). The
       # secret of the same name stays as a fallback.
       REGISTRY: ${{ vars.DOCKER_REGISTRY || secrets.DOCKER_REGISTRY }}
+      # The name the deployed container was created from
+      # (docker.javapl.us/time-tracking-leptos:main), which is what Watchtower
+      # matches its `?image=` list against — see the notify step.
+      PUBLIC_REGISTRY: ${{ vars.DOCKER_PUBLIC_REGISTRY || vars.DOCKER_REGISTRY || secrets.DOCKER_REGISTRY }}
+      # `secrets` is not a context `if:` can read, so resolve it here and gate
+      # on the env value, as the sibling repos do for the registry.
+      HAS_WATCHTOWER: ${{ secrets.WATCHTOWER_HTTP_API_TOKEN != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -78,4 +85,33 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/time-tracking-leptos:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/time-tracking-leptos:buildcache,mode=max
-
+      - name: Trigger Watchtower update
+        # Notify Watchtower to pull the exact image:tag refs we just pushed and
+        # redeploy any container running them. Passes every tag from the
+        # metadata step as a comma-separated ?image= list so Watchtower scopes
+        # the update to this image instead of scanning every container it
+        # watches.
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          WATCHTOWER_HTTP_API_TOKEN: ${{ secrets.WATCHTOWER_HTTP_API_TOKEN }}
+          # Tailnet origin: Bot Fight Mode would 403 this curl on the public
+          # hostname just as readily as it does `docker login`.
+          WATCHTOWER_URL: ${{ vars.WATCHTOWER_URL || 'https://watchtower.javapl.us' }}
+        run: |
+          if [ "$HAS_WATCHTOWER" != "true" ]; then
+            echo "::warning::WATCHTOWER_HTTP_API_TOKEN is not set — pushed the image but did NOT trigger a redeploy."
+            exit 0
+          fi
+          # The image NAMES stay public even though the push went to the
+          # tailnet: the container is deployed as
+          # docker.javapl.us/time-tracking-leptos:main and Watchtower matches
+          # `?image=` against that ref literally, so a tailnet-prefixed list
+          # would match nothing, return 200 and update nothing.
+          images=$(printf '%s\n' "$IMAGE_TAGS" \
+            | grep -v '^[[:space:]]*$' \
+            | sed "s|^${REGISTRY}/|${PUBLIC_REGISTRY}/|" \
+            | paste -sd, -)
+          echo "Notifying Watchtower to update: $images"
+          curl -fsS --retry 3 --retry-delay 5 --retry-connrefused -X POST \
+            -H "Authorization: Bearer ${WATCHTOWER_HTTP_API_TOKEN}" \
+            "${WATCHTOWER_URL}/v1/update?image=${images}"
